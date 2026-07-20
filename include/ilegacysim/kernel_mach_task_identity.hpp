@@ -17,6 +17,7 @@ inline constexpr std::uint32_t initial_thread_self_name = 0x203U;
 inline constexpr std::uint32_t initial_host_self_name = 0x303U;
 inline constexpr std::uint32_t initial_bootstrap_name = 0x503U;
 inline constexpr std::uint32_t initial_clock_name = 0x603U;
+inline constexpr std::uint32_t initial_calendar_clock_name = 0x613U;
 inline constexpr std::uint32_t initial_io_master_name = 0x703U;
 inline constexpr std::uint32_t initial_io_registry_options_name = 0x713U;
 

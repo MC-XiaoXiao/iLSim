@@ -50,6 +50,8 @@ struct ProcessContext {
   std::uint32_t host_port{mach_task_identity::initial_host_self_name};
   std::uint32_t bootstrap_port{mach_task_identity::initial_bootstrap_name};
   std::uint32_t clock_port{mach_task_identity::initial_clock_name};
+  std::uint32_t calendar_clock_port{
+      mach_task_identity::initial_calendar_clock_name};
   std::uint32_t io_master_port{mach_task_identity::initial_io_master_name};
   std::uint32_t io_registry_options_port{
       mach_task_identity::initial_io_registry_options_name};
@@ -170,6 +172,7 @@ struct PendingTimer {
   std::uint64_t deadline{};
   PendingTimerKind kind{PendingTimerKind::MachWaitUntil};
   std::optional<std::uint32_t> wakeup_time_address;
+  bool calendar_clock{};
 };
 
 // A local stream endpoint is an open file description, not an fd.  dup(2),
@@ -332,6 +335,7 @@ struct KernelSharedState {
   };
   struct ClockAlarm {
     std::uint64_t deadline{};
+    std::uint64_t alarm_time{};
     std::uint32_t alarm_type{};
     std::uint32_t reply_object{};
   };

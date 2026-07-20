@@ -9,20 +9,18 @@
 namespace ilegacysim::bsd_support {
 namespace {
 
-constexpr std::uint32_t firmware_epoch_seconds = 1'180'000'000U;
 constexpr std::uint64_t hfs_nanoseconds_per_second = 1'000'000'000ULL;
 
 } // namespace
 
 hfs::Timestamp guest_filesystem_timestamp(const VirtualClock &clock) {
-  const auto elapsed = clock.now();
-  const auto seconds = static_cast<std::uint64_t>(firmware_epoch_seconds) +
-                       elapsed / hfs_nanoseconds_per_second;
+  const auto wall_time = clock.wall_time();
+  const auto seconds = wall_time / hfs_nanoseconds_per_second;
   return hfs::Timestamp{
       static_cast<std::int32_t>(std::min<std::uint64_t>(
           seconds, static_cast<std::uint64_t>(
                        std::numeric_limits<std::int32_t>::max()))),
-      static_cast<std::int32_t>(elapsed % hfs_nanoseconds_per_second)};
+      static_cast<std::int32_t>(wall_time % hfs_nanoseconds_per_second)};
 }
 
 std::uint32_t darwin_filesystem_error(const std::error_code &error,

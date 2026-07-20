@@ -7,6 +7,8 @@ namespace ilegacysim::darwin::mach::clock {
 // XNU 792.24.17 osfmk/mach/clock_types.h and kern/syscall_sw.c.
 constexpr std::uint32_t sleep_trap = 62;
 constexpr std::uint32_t null_clock_name = 0;
+constexpr std::uint32_t system_clock_id = 0;
+constexpr std::uint32_t calendar_clock_id = 1;
 constexpr std::uint32_t time_absolute = 0;
 constexpr std::uint32_t time_relative = 1;
 constexpr std::uint32_t maximum_sleep_type = time_relative;

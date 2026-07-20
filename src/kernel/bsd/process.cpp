@@ -305,25 +305,14 @@ void CompatibilityKernel::dispatch_bsd_process(Cpu &cpu, std::uint32_t number) {
     }
     return;
   case 116: { // gettimeofday
-    constexpr std::uint32_t firmware_epoch = 1'180'000'000U;
-    const auto absolute_time = shared_state_->clock.now();
-    if (registers[0] != 0 &&
-        (!memory_.write32(registers[0],
-                          firmware_epoch +
-                              static_cast<std::uint32_t>(absolute_time /
-                                                         1'000'000'000ULL)) ||
-         !memory_.write32(registers[0] + 4,
-                          static_cast<std::uint32_t>(
-                              (absolute_time / 1'000ULL) % 1'000'000ULL)))) {
-      bsd_error(cpu, bsd_support::bad_address);
-      return;
-    }
-    if (registers[1] != 0 && (!memory_.write32(registers[1], 0) ||
-                              !memory_.write32(registers[1] + 4, 0))) {
-      bsd_error(cpu, bsd_support::bad_address);
-      return;
-    }
-    bsd_success(cpu, 0);
+    const auto wall_time = shared_state_->clock.wall_time();
+    // iPhone OS 1.0's ARM libSystem wrapper preserves the timeval pointer in
+    // r3, invokes syscall 116, then stores the two return registers into it.
+    // Returning zero here makes libc overwrite the result with Unix epoch 0.
+    bsd_success(cpu,
+                static_cast<std::uint32_t>(wall_time / 1'000'000'000ULL),
+                static_cast<std::uint32_t>(
+                    (wall_time / 1'000ULL) % 1'000'000ULL));
     return;
   }
   case 147: // setsid
@@ -423,9 +412,7 @@ void CompatibilityKernel::dispatch_bsd_process(Cpu &cpu, std::uint32_t number) {
       if (registers[3] != 0) {
         timeout_interval = requested;
       } else {
-        constexpr std::uint64_t firmware_epoch_ns =
-            1'180'000'000ULL * 1'000'000'000ULL;
-        const auto now = firmware_epoch_ns + shared_state_->clock.now();
+        const auto now = shared_state_->clock.wall_time();
         timeout_interval = requested > now ? requested - now : 0;
       }
     }

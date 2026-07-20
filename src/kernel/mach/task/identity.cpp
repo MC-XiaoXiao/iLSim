@@ -26,6 +26,7 @@ bool initialize_root(KernelSharedState &state, ProcessContext &process) {
   process.host_port = initial_host_self_name;
   process.bootstrap_port = initial_bootstrap_name;
   process.clock_port = initial_clock_name;
+  process.calendar_clock_port = initial_calendar_clock_name;
   process.io_master_port = initial_io_master_name;
   process.io_registry_options_port = initial_io_registry_options_name;
 
@@ -54,6 +55,8 @@ bool initialize_root(KernelSharedState &state, ProcessContext &process) {
   state.task_special_ports[task_object][4] = bootstrap_object;
   return install_kernel_send_port(state, process, process.host_port) &&
          install_kernel_send_port(state, process, process.clock_port) &&
+         install_kernel_send_port(state, process,
+                                  process.calendar_clock_port) &&
          install_kernel_send_port(state, process, process.io_master_port) &&
          install_kernel_send_port(state, process,
                                   process.io_registry_options_port);
@@ -107,7 +110,8 @@ bool inherit_child(KernelSharedState &state, const ProcessContext &parent,
   }
 
   for (const auto special :
-       {child.host_port, child.clock_port, child.io_master_port,
+       {child.host_port, child.clock_port, child.calendar_clock_port,
+        child.io_master_port,
         child.io_registry_options_port}) {
     if (!install_kernel_send_port(state, child, special)) {
       return false;

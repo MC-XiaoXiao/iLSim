@@ -49,11 +49,20 @@ std::uint32_t write_reply(
     return 0;
 }
 
-bool valid_clock_locked(
+std::optional<std::uint32_t> clock_id_locked(
     const KernelSharedState& state, const ProcessContext& process,
     std::uint32_t remote_port) {
-    return state.mach_namespaces.resolve(process.pid, remote_port).value_or(0) ==
-           process.clock_port;
+    const auto object = state.mach_namespaces.resolve(process.pid, remote_port);
+    if (!object) return std::nullopt;
+    if (object == state.mach_namespaces.resolve(process.pid,
+                                                process.clock_port)) {
+        return darwin::mach::clock::system_clock_id;
+    }
+    if (object == state.mach_namespaces.resolve(
+                      process.pid, process.calendar_clock_port)) {
+        return darwin::mach::clock::calendar_clock_id;
+    }
+    return std::nullopt;
 }
 
 std::optional<std::uint32_t> resolve_receive_locked(
@@ -81,25 +90,27 @@ std::optional<std::uint32_t> handle_clock_mach_request(
         constexpr auto success_size = output.reply_offset + output.wire_size;
         constexpr auto error_size = darwin::mig_wire::simple_reply_payload_base;
         if (receive_size < success_size) return mach_rcv_too_large;
-        bool valid = false;
+        std::optional<std::uint32_t> clock_id;
         {
             std::lock_guard lock{state.mach_mutex};
-            valid = valid_clock_locked(state, process, remote_port);
+            clock_id = clock_id_locked(state, process, remote_port);
         }
-        const auto result = valid ? darwin::mach::success
-                                  : darwin::mach::invalid_argument;
-        const auto reply_size = valid ? success_size : error_size;
-        const auto now = state.clock.now();
+        const auto result = clock_id ? darwin::mach::success
+                                     : darwin::mach::invalid_argument;
+        const auto reply_size = clock_id ? success_size : error_size;
+        const auto now = clock_id == darwin::mach::clock::calendar_clock_id
+                             ? state.clock.wall_time()
+                             : state.clock.now();
         const std::array<std::uint32_t,
                          success_size / sizeof(std::uint32_t)> reply{
             move_send_once_bits, reply_size, local_port, 0, 0,
             message_id + mig_reply_id_delta, 0, 1, result,
-            valid ? static_cast<std::uint32_t>(
-                        now / darwin::mach::clock::nanoseconds_per_second)
-                  : 0U,
-            valid ? static_cast<std::uint32_t>(
-                        now % darwin::mach::clock::nanoseconds_per_second)
-                  : 0U,
+            clock_id ? static_cast<std::uint32_t>(
+                           now / darwin::mach::clock::nanoseconds_per_second)
+                     : 0U,
+            clock_id ? static_cast<std::uint32_t>(
+                           now % darwin::mach::clock::nanoseconds_per_second)
+                     : 0U,
         };
         return write_reply(
             memory, message_address, reply,
@@ -119,7 +130,7 @@ std::optional<std::uint32_t> handle_clock_mach_request(
         bool valid = false;
         {
             std::lock_guard lock{state.mach_mutex};
-            valid = valid_clock_locked(state, process, remote_port);
+            valid = clock_id_locked(state, process, remote_port).has_value();
         }
         auto result = valid ? darwin::mach::success
                             : darwin::mach::invalid_argument;
@@ -175,35 +186,52 @@ std::optional<std::uint32_t> handle_clock_mach_request(
         std::lock_guard lock{state.mach_mutex};
         const auto reply_object = resolve_receive_locked(state, process,
                                                          reply_name);
-        if (!valid_clock_locked(state, process, remote_port)) {
+        const auto clock_id = clock_id_locked(state, process, remote_port);
+        if (!clock_id) {
             result = darwin::mach::invalid_argument;
         } else if (disposition != make_send_once_disposition || !reply_object) {
             result = darwin::mach::invalid_capability;
         } else {
-            const auto now = state.clock.now();
+            const auto monotonic_now = state.clock.now();
+            const auto clock_now =
+                clock_id == darwin::mach::clock::calendar_clock_id
+                    ? state.clock.wall_time()
+                    : monotonic_now;
             const auto valid_time =
                 alarm_type <= darwin::mach::clock::time_relative &&
                 nanoseconds < darwin::mach::clock::nanoseconds_per_second;
-            auto deadline = static_cast<std::uint64_t>(seconds) *
-                                darwin::mach::clock::nanoseconds_per_second +
-                            nanoseconds;
+            const auto requested =
+                static_cast<std::uint64_t>(seconds) *
+                    darwin::mach::clock::nanoseconds_per_second +
+                nanoseconds;
+            auto alarm_time = requested;
             if (valid_time &&
                 alarm_type == darwin::mach::clock::time_relative) {
-                deadline = deadline >
-                                   std::numeric_limits<std::uint64_t>::max() - now
-                               ? std::numeric_limits<std::uint64_t>::max()
-                               : now + deadline;
+                alarm_time = requested >
+                                     std::numeric_limits<std::uint64_t>::max() -
+                                         clock_now
+                                 ? std::numeric_limits<std::uint64_t>::max()
+                                 : clock_now + requested;
             }
-            if (!valid_time || deadline <= now) {
+            const auto remaining = alarm_time > clock_now
+                                       ? alarm_time - clock_now
+                                       : 0;
+            const auto deadline =
+                remaining > std::numeric_limits<std::uint64_t>::max() -
+                                monotonic_now
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : monotonic_now + remaining;
+            if (!valid_time || alarm_time <= clock_now) {
                 enqueue_clock_alarm_reply_locked(
                     state, *reply_object,
                     valid_time ? darwin::mach::success
                                : darwin::mach::invalid_value,
-                    alarm_type, now);
+                    alarm_type, clock_now);
             } else {
                 state.clock_alarms.emplace(
                     state.next_clock_alarm++, KernelSharedState::ClockAlarm{
-                                                  deadline, alarm_type,
+                                                  deadline, alarm_time,
+                                                  alarm_type,
                                                   *reply_object});
             }
         }
@@ -275,7 +303,7 @@ void deliver_due_clock_alarms_locked(
         }
         enqueue_clock_alarm_reply_locked(
             state, alarm->second.reply_object, darwin::mach::success,
-            alarm->second.alarm_type, alarm->second.deadline);
+            alarm->second.alarm_type, alarm->second.alarm_time);
         alarm = state.clock_alarms.erase(alarm);
     }
 }

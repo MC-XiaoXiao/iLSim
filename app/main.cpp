@@ -297,6 +297,30 @@ std::optional<std::string> option(const std::vector<std::string> &args,
   return std::nullopt;
 }
 
+std::optional<std::string>
+host_timezone_name(const std::filesystem::path &rootfs) {
+  std::error_code error;
+  const auto localtime = std::filesystem::read_symlink("/etc/localtime", error);
+  if (error)
+    return std::nullopt;
+  const auto path = localtime.generic_string();
+  constexpr std::string_view marker{"zoneinfo/"};
+  const auto marker_position = path.rfind(marker);
+  if (marker_position == std::string::npos)
+    return std::nullopt;
+  const auto name = path.substr(marker_position + marker.size());
+  if (name.empty() || name.starts_with('/') ||
+      name.find("..") != std::string::npos) {
+    return std::nullopt;
+  }
+  if (!std::filesystem::is_regular_file(rootfs / "usr/share/zoneinfo" / name,
+                                        error) ||
+      error) {
+    return std::nullopt;
+  }
+  return name;
+}
+
 std::unique_ptr<Output> make_output(const std::vector<std::string> &args) {
   if (const auto path = option(args, "--output")) {
     return std::make_unique<Output>(*path);
@@ -614,7 +638,16 @@ void boot(const std::vector<std::string> &args, Output &output) {
 
   auto initial_memory = std::make_unique<AddressSpace>();
   ProcessLoader loader{*rootfs, *initial_memory};
-  auto process = loader.load(binary);
+  std::vector<std::string> initial_environment{
+      "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/var/root",
+      "SHELL=/bin/sh"};
+  const auto host_timezone =
+      bounded_execution ? std::nullopt
+                        : host_timezone_name(std::filesystem::path{*rootfs});
+  if (host_timezone) {
+    initial_environment.push_back("TZ=" + *host_timezone);
+  }
+  auto process = loader.load(binary, {}, initial_environment);
   std::vector<std::unique_ptr<Runtime>> runtimes;
   auto initial = std::make_unique<Runtime>();
   initial->memory = std::move(initial_memory);
@@ -622,6 +655,7 @@ void boot(const std::vector<std::string> &args, Output &output) {
       std::make_unique<CpuCluster>(maximum_guest_threads, *initial->memory);
   initial->kernel =
       std::make_unique<CompatibilityKernel>(*initial->memory, output, *rootfs);
+  initial->kernel->set_process_arguments({binary}, initial_environment);
   initial->kernel->enqueue_baseband_input(baseband_input);
   if (baseband_input_path) {
     output.line("[baseband] replay input=" + *baseband_input_path +
@@ -952,7 +986,16 @@ void boot(const std::vector<std::string> &args, Output &output) {
   std::optional<RealtimePacer> realtime_pacer;
   if (!bounded_execution) {
     realtime_pacer.emplace(initial_runtime->kernel->current_absolute_time());
-    output.line("[clock] mode=realtime");
+    const auto host_wall_time =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    if (host_wall_time > 0) {
+      initial_runtime->kernel->synchronize_wall_time(
+          static_cast<std::uint64_t>(host_wall_time));
+    }
+    output.line("[clock] mode=realtime wall-time=host timezone=" +
+                host_timezone.value_or("guest-default"));
   }
   while ((!bounded_execution || remaining_ticks != 0) &&
          !initial_runtime->kernel->process().exited && !hard_stop) {
@@ -1048,6 +1091,15 @@ void boot(const std::vector<std::string> &args, Output &output) {
         break;
     }
     if (realtime_pacer) {
+      const auto current_time =
+          initial_runtime->kernel->current_absolute_time();
+      const auto host_time = realtime_pacer->allowed_virtual_time();
+      if (current_time < host_time) {
+        // Guest execution advances virtual time in calibrated instruction
+        // quanta. Catch it up from the host monotonic clock as well so time
+        // keeps moving while every guest thread is idle.
+        initial_runtime->kernel->advance_absolute_time(host_time);
+      }
       const auto delay = realtime_pacer->delay_until(
           initial_runtime->kernel->current_absolute_time());
       if (delay > std::chrono::nanoseconds::zero()) {

@@ -614,7 +614,8 @@ bool CompatibilityKernel::deliver_pending_io(Cpu &cpu) {
     process_.waiting_for_events = false;
     if (pending.kind == PendingTimerKind::ClockSleep &&
         pending.wakeup_time_address) {
-      const auto now = shared_state_->clock.now();
+      const auto now = pending.calendar_clock ? shared_state_->clock.wall_time()
+                                              : shared_state_->clock.now();
       const auto seconds = static_cast<std::uint32_t>(
           now / darwin::mach::clock::nanoseconds_per_second);
       const auto nanoseconds = static_cast<std::uint32_t>(
@@ -942,6 +943,7 @@ void CompatibilityKernel::inherit_process_state(
   process_.termination_signal = 0;
   process_.host_port = parent.process_.host_port;
   process_.clock_port = parent.process_.clock_port;
+  process_.calendar_clock_port = parent.process_.calendar_clock_port;
   process_.io_master_port = parent.process_.io_master_port;
   process_.io_registry_options_port = parent.process_.io_registry_options_port;
   file_descriptors_ = parent.file_descriptors_;

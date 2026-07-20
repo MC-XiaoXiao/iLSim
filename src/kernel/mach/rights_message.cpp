@@ -342,6 +342,15 @@ bool CompatibilityKernel::dispatch_mach_rights_message(
                   xnu792::mig::task::task_get_special_port_arguments[1]
                       .request_offset)
             : std::optional<std::uint32_t>{};
+    const auto clock_id =
+        *message_id ==
+                mig_message_id(
+                    xnu792::mig::mach_host::Routine::host_get_clock_service)
+            ? memory_.read32(
+                  message_address +
+                  xnu792::mig::mach_host::host_get_clock_service_arguments[1]
+                      .request_offset)
+            : std::optional<std::uint32_t>{};
     std::uint32_t port = 0;
     bool update_process_bootstrap = false;
     if (*message_id ==
@@ -350,7 +359,11 @@ bool CompatibilityKernel::dispatch_mach_rights_message(
     } else if (*message_id ==
                mig_message_id(
                    xnu792::mig::mach_host::Routine::host_get_clock_service)) {
-      port = process_.clock_port;
+      if (clock_id == darwin::mach::clock::system_clock_id) {
+        port = process_.clock_port;
+      } else if (clock_id == darwin::mach::clock::calendar_clock_id) {
+        port = process_.calendar_clock_port;
+      }
     } else if (*message_id ==
                mig_message_id(xnu792::mig::task::Routine::semaphore_create)) {
       const auto policy =

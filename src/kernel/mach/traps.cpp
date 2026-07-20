@@ -249,9 +249,20 @@ void CompatibilityKernel::dispatch_mach(Cpu &cpu, std::uint32_t trap) {
     const auto nanoseconds = registers[3];
     const auto wakeup_time_address = registers[4];
 
-    if (clock_name != null_clock_name && clock_name != process_.clock_port) {
-      registers[0] = darwin::mach::invalid_argument;
-      return;
+    bool calendar_clock = false;
+    if (clock_name != null_clock_name) {
+      std::lock_guard mach_lock{shared_state_->mach_mutex};
+      const auto object =
+          shared_state_->mach_namespaces.resolve(process_.pid, clock_name);
+      const auto system_object = shared_state_->mach_namespaces.resolve(
+          process_.pid, process_.clock_port);
+      const auto calendar_object = shared_state_->mach_namespaces.resolve(
+          process_.pid, process_.calendar_clock_port);
+      if (!object || (object != system_object && object != calendar_object)) {
+        registers[0] = darwin::mach::invalid_argument;
+        return;
+      }
+      calendar_clock = object == calendar_object;
     }
     if (sleep_type > maximum_sleep_type ||
         nanoseconds >= nanoseconds_per_second) {
@@ -262,27 +273,36 @@ void CompatibilityKernel::dispatch_mach(Cpu &cpu, std::uint32_t trap) {
     const auto requested =
         static_cast<std::uint64_t>(seconds) * nanoseconds_per_second +
         nanoseconds;
-    const auto now = shared_state_->clock.now();
-    auto deadline = requested;
+    const auto monotonic_now = shared_state_->clock.now();
+    const auto clock_now = calendar_clock ? shared_state_->clock.wall_time()
+                                          : monotonic_now;
+    auto alarm_time = requested;
     if (sleep_type == time_relative) {
-      deadline = requested > std::numeric_limits<std::uint64_t>::max() - now
-                     ? std::numeric_limits<std::uint64_t>::max()
-                     : now + requested;
+      alarm_time =
+          requested > std::numeric_limits<std::uint64_t>::max() - clock_now
+              ? std::numeric_limits<std::uint64_t>::max()
+              : clock_now + requested;
     }
+    const auto remaining = alarm_time > clock_now ? alarm_time - clock_now : 0;
+    const auto deadline =
+        remaining > std::numeric_limits<std::uint64_t>::max() - monotonic_now
+            ? std::numeric_limits<std::uint64_t>::max()
+            : monotonic_now + remaining;
 
     registers[0] = darwin::mach::success;
-    if (deadline > now) {
+    if (alarm_time > clock_now) {
       pending_timers_[cpu.processor_id()] = PendingTimer{
-          deadline, PendingTimerKind::ClockSleep, wakeup_time_address};
+          deadline, PendingTimerKind::ClockSleep, wakeup_time_address,
+          calendar_clock};
       process_.waiting_for_events = true;
       cpu.halt(Dynarmic::HaltReason::UserDefined5);
       return;
     }
 
     const auto current_seconds =
-        static_cast<std::uint32_t>(now / nanoseconds_per_second);
+        static_cast<std::uint32_t>(clock_now / nanoseconds_per_second);
     const auto current_nanoseconds =
-        static_cast<std::uint32_t>(now % nanoseconds_per_second);
+        static_cast<std::uint32_t>(clock_now % nanoseconds_per_second);
     static_cast<void>(memory_.write32(
         wakeup_time_address + timespec_seconds_offset, current_seconds));
     static_cast<void>(
