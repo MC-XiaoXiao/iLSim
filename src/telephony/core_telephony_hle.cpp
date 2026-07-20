@@ -43,7 +43,8 @@ constexpr std::array<std::string_view, 3> observer_operations{
 // These server queries normally write a retained CFString through argument 2.
 // The offline connection is deliberately an opaque token, so every query that
 // would otherwise dereference it must terminate at this boundary.
-constexpr std::array<std::string_view, 5> offline_server_string_queries{
+constexpr std::array<std::string_view, 6> offline_server_string_queries{
+    "__CTServerConnectionCopyFirmwareVersion",
     "__CTServerConnectionCopySIMIdentity",
     "__CTServerConnectionCopyMobileIdentity",
     "__CTServerConnectionGetMobileSubscriberCountryCode",
