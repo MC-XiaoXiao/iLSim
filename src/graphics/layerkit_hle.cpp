@@ -7,8 +7,6 @@
 #include "ilegacysim/output.hpp"
 #include "ilegacysim/userland_hle.hpp"
 
-#include <bit>
-#include <cmath>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -18,8 +16,6 @@ namespace ilegacysim {
 namespace {
 
 constexpr const char *layerkit_image = "LayerKit.framework/LayerKit";
-constexpr std::uint32_t complete_object_flag = 0x01000000U;
-constexpr float maximum_system_band_divisor = 16.0F;
 
 } // namespace
 
@@ -43,7 +39,10 @@ void LayerKitHle::register_handlers(
   registry.register_function(
       layerkit_image, "_LKRenderContextSetLayerId",
       [this](UserlandHleCall &call) {
-        compatibility_.set_layer_id(call.argument(0), call.argument(1));
+        if (compatibility_.set_layer_id(call.argument(0), call.argument(1))) {
+          graphics_services_input::reset_application_scene_context(
+              *shared_state_, call.process_id(), call.argument(0));
+        }
         call.resume_original_persistently();
       });
 
@@ -84,30 +83,17 @@ void LayerKitHle::register_handlers(
             call.memory().read32(object + 0x10U).value_or(0U);
         const auto width = call.memory().read32(object + 0x14U).value_or(0U);
         const auto height = call.memory().read32(object + 0x18U).value_or(0U);
-        const auto scene_x = std::bit_cast<float>(position_x);
-        const auto scene_y = std::bit_cast<float>(position_y);
-        const auto scene_width = std::bit_cast<float>(width);
-        const auto scene_height = std::bit_cast<float>(height);
-        const auto viewport_width = static_cast<float>(device.display_width);
-        const auto viewport_height = static_cast<float>(device.display_height);
-        const auto scene_inset = viewport_height - scene_height;
-        const auto scene_top = scene_y - scene_height * 0.5F;
-        if ((render_flags & complete_object_flag) != 0U &&
-            std::isfinite(scene_x) && std::isfinite(scene_y) &&
-            std::isfinite(scene_width) && std::isfinite(scene_height) &&
-            scene_width == viewport_width &&
-            scene_x * 2.0F == scene_width && scene_inset >= 0.0F &&
-            scene_inset <= viewport_height / maximum_system_band_divisor &&
-            scene_inset == std::round(scene_inset) &&
-            (scene_top == 0.0F || scene_top == scene_inset)) {
-          graphics_services_input::record_pending_application_scene_translation(
-              *shared_state_, static_cast<std::int32_t>(scene_inset));
-        }
         if (const auto placement = compatibility_.application_window_placement(
                 context, current_layer_id, call.argument(1), render_flags,
                 position_x, position_y, width, height, device.display_width,
                 device.display_height)) {
           static_cast<void>(call.write32(object + 0x10U, placement->position_y));
+          graphics_services_input::record_application_scene_transform(
+              *shared_state_, call.process_id(), context,
+              KernelSharedState::ApplicationTouchTransform{
+                  placement->presentation_offset_x,
+                  placement->presentation_offset_y,
+                  placement->screen_origin_y});
         }
         if (const auto replacement = compatibility_.observe_commit(
                 context, current_layer_id, call.argument(1), render_flags,

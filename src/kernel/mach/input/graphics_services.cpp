@@ -249,8 +249,11 @@ ServiceResolution record_bootstrap_reply_locked(
     const auto process = state.processes.find(port->receive_owner);
     if (process != state.processes.end() && !process->second.exited &&
         process->second.executable_path.starts_with("/Applications/")) {
-      if (state.pending_application_event_object != service->object) {
-        state.latest_application_scene_translation.reset();
+      if (state.pending_application_event_object != service->object &&
+          state.latest_application_scene_transform &&
+          state.latest_application_scene_transform->process_id ==
+              port->receive_owner) {
+        state.latest_application_scene_transform.reset();
       }
       state.pending_application_event_object = service->object;
       application_event_port = true;
@@ -274,10 +277,15 @@ EnqueueResult enqueue_touch(KernelSharedState &state, const TouchInput &input) {
     if (port && process != state.processes.end() && !process->second.exited &&
         process->second.executable_path.starts_with("/Applications/")) {
       auto application_input = sanitized;
-      if (const auto translation =
-              state.application_screen_to_client_y.find(port->receive_owner);
-          translation != state.application_screen_to_client_y.end()) {
-        application_input.y -= static_cast<float>(translation->second);
+      if (state.active_application_scene &&
+          state.active_application_scene->process_id == port->receive_owner &&
+          state.active_application_scene->event_object ==
+              state.active_application_event_object &&
+          state.active_application_scene->touch_transform) {
+        const auto &transform =
+            *state.active_application_scene->touch_transform;
+        application_input.x -= transform.presentation_offset_x;
+        application_input.y -= transform.presentation_offset_y;
       }
       queue_locked(state, state.active_application_event_object,
                    application_input);
@@ -317,10 +325,29 @@ EnqueueResult enqueue_system_button(KernelSharedState &state,
   return EnqueueResult::Queued;
 }
 
-void suspend_active_application(KernelSharedState &state) {
+void suspend_active_application(
+    KernelSharedState &state,
+    KernelSharedState::ApplicationSuspensionReason reason) {
   std::lock_guard lock{state.mach_mutex};
   state.application_touch_suspended =
       state.active_application_event_object != 0U;
+  state.application_suspension_reason =
+      state.application_touch_suspended
+          ? reason
+          : KernelSharedState::ApplicationSuspensionReason::None;
+  if (!state.application_touch_suspended) {
+    state.suspended_application_scene_process_id.reset();
+    return;
+  }
+  if (state.active_application_scene) {
+    state.suspended_application_scene_process_id =
+        state.active_application_scene->process_id;
+    return;
+  }
+  if (const auto active_port = state.mach_port_objects.lookup(
+          state.active_application_event_object)) {
+    state.suspended_application_scene_process_id = active_port->receive_owner;
+  }
 }
 
 void activate_resolved_application(KernelSharedState &state,
@@ -328,48 +355,78 @@ void activate_resolved_application(KernelSharedState &state,
   std::lock_guard lock{state.mach_mutex};
   if (state.active_application_scene &&
       state.active_application_scene->process_id == process_id &&
-      state.application_screen_to_client_y.contains(process_id)) {
+      state.active_application_scene->touch_transform) {
     state.active_application_event_object =
         state.active_application_scene->event_object;
     state.application_touch_suspended = false;
   }
 }
 
-void record_pending_application_scene_translation(
-    KernelSharedState &state, std::int32_t screen_to_client_y) {
+void reset_application_scene_context(KernelSharedState &state,
+                                     std::uint32_t render_process_id,
+                                     std::uint32_t context) {
   std::lock_guard lock{state.mach_mutex};
-  const auto port =
-      state.mach_port_objects.lookup(state.pending_application_event_object);
-  if (!port) {
+  state.application_scene_context_owners.erase(
+      std::pair{render_process_id, context});
+}
+
+void record_application_scene_transform(
+    KernelSharedState &state, std::uint32_t render_process_id,
+    std::uint32_t context,
+    const KernelSharedState::ApplicationTouchTransform &transform) {
+  if (!std::isfinite(transform.presentation_offset_x) ||
+      !std::isfinite(transform.presentation_offset_y) ||
+      !std::isfinite(transform.screen_origin_y)) {
     return;
   }
-  const auto process_id = port->receive_owner;
+  std::lock_guard lock{state.mach_mutex};
+  const auto context_key = std::pair{render_process_id, context};
+  const auto owner = state.application_scene_context_owners.find(context_key);
+  std::uint32_t process_id{};
+  if (owner != state.application_scene_context_owners.end()) {
+    process_id = owner->second;
+  } else {
+    const auto pending_port =
+        state.mach_port_objects.lookup(state.pending_application_event_object);
+    if (!pending_port) {
+      return;
+    }
+    process_id = pending_port->receive_owner;
+  }
+  // SpringBoard publishes separate full-screen roots for the outgoing App's
+  // lock screen and exit snapshots. Ignore only that App's roots: a different
+  // App can publish its first live root before didBecomeActive arrives.
+  if (state.application_touch_suspended &&
+      (!state.suspended_application_scene_process_id ||
+       *state.suspended_application_scene_process_id == process_id)) {
+    return;
+  }
   const auto process = state.processes.find(process_id);
   if (process == state.processes.end() || process->second.exited ||
       !process->second.executable_path.starts_with("/Applications/")) {
     return;
   }
-  if (!state.latest_application_scene_translation ||
-      screen_to_client_y > *state.latest_application_scene_translation) {
-    state.latest_application_scene_translation = screen_to_client_y;
+  if (owner == state.application_scene_context_owners.end()) {
+    state.application_scene_context_owners.emplace(context_key, process_id);
   }
-  auto &translation = state.application_screen_to_client_y[process_id];
-  translation = std::max(translation, screen_to_client_y);
-  if (state.active_application_scene &&
-      state.active_application_scene->process_id == process_id) {
-    state.active_application_scene->screen_to_client_y = translation;
+  const auto owns_active_route =
+      state.active_application_scene &&
+      state.active_application_scene->process_id == process_id;
+  state.latest_application_scene_transform =
+      KernelSharedState::PendingApplicationSceneTransform{process_id,
+                                                          transform};
+  state.application_scene_transforms[process_id] = transform;
+  if (owns_active_route) {
+    state.active_application_scene->touch_transform = transform;
     state.active_application_event_object =
         state.active_application_scene->event_object;
-    state.application_touch_suspended = false;
   }
 }
 
-void record_application_lifecycle_event_locked(KernelSharedState &state,
-                                               std::uint32_t sender_pid,
-                                               std::uint32_t destination,
-                                               std::uint32_t event_type,
-                                               std::span<const std::uint32_t>
-                                                   exit_snapshot_pixels) {
+void record_application_lifecycle_event_locked(
+    KernelSharedState &state, std::uint32_t sender_pid,
+    std::uint32_t destination, std::uint32_t event_type,
+    std::span<const std::uint32_t> exit_snapshot_pixels) {
   if (event_type != application_did_become_active_event_type &&
       event_type != application_will_resign_active_event_type) {
     return;
@@ -392,72 +449,78 @@ void record_application_lifecycle_event_locked(KernelSharedState &state,
 
   if (event_type == application_did_become_active_event_type) {
     state.pending_application_event_object = destination;
-    const auto routed_translation = state.application_screen_to_client_y.find(
-        destination_port->receive_owner);
-    auto scene_translation = state.latest_application_scene_translation;
-    if (!scene_translation &&
-        routed_translation != state.application_screen_to_client_y.end()) {
-      scene_translation = routed_translation->second;
+    std::optional<KernelSharedState::ApplicationTouchTransform> transform;
+    if (state.latest_application_scene_transform &&
+        state.latest_application_scene_transform->process_id ==
+            destination_port->receive_owner) {
+      transform = state.latest_application_scene_transform->transform;
+    } else if (state.active_application_scene &&
+               state.active_application_scene->process_id ==
+                   destination_port->receive_owner &&
+               state.active_application_scene->event_object == destination) {
+      transform = state.active_application_scene->touch_transform;
+    } else if (const auto cached = state.application_scene_transforms.find(
+                   destination_port->receive_owner);
+               cached != state.application_scene_transforms.end()) {
+      transform = cached->second;
     }
-    if (scene_translation) {
-      state.application_screen_to_client_y[destination_port->receive_owner] =
-          *scene_translation;
-    }
-    state.active_application_scene =
-        KernelSharedState::ActiveApplicationScene{
-            destination_port->receive_owner, destination,
-            scene_translation.value_or(0)};
-    if (scene_translation) {
+    state.active_application_scene = KernelSharedState::ActiveApplicationScene{
+        destination_port->receive_owner, destination, transform};
+    if (transform) {
       state.active_application_event_object = destination;
       state.application_touch_suspended = false;
     } else {
       state.active_application_event_object = 0;
       state.application_touch_suspended = false;
     }
-    state.latest_application_scene_translation.reset();
+    state.application_suspension_reason =
+        KernelSharedState::ApplicationSuspensionReason::None;
+    state.suspended_application_scene_process_id.reset();
+    if (state.latest_application_scene_transform &&
+        state.latest_application_scene_transform->process_id ==
+            destination_port->receive_owner) {
+      state.latest_application_scene_transform.reset();
+    }
     if (state.pending_application_exit_snapshot &&
         state.pending_application_exit_snapshot->process_id ==
             destination_port->receive_owner) {
       state.pending_application_exit_snapshot.reset();
     }
   } else {
-    if (state.active_application_event_object == destination) {
-      state.application_touch_suspended = true;
-    }
+    state.application_touch_suspended = true;
+    state.suspended_application_scene_process_id =
+        destination_port->receive_owner;
     if (!exit_snapshot_pixels.empty()) {
       std::vector<std::uint32_t> application_pixels{
           exit_snapshot_pixels.begin(), exit_snapshot_pixels.end()};
-      auto scene_translation = std::int32_t{};
+      auto screen_origin_y = 0.0F;
       if (state.active_application_scene &&
           state.active_application_scene->process_id ==
-              destination_port->receive_owner) {
-        scene_translation =
-            state.active_application_scene->screen_to_client_y;
-      } else if (const auto routed =
-                     state.application_screen_to_client_y.find(
-                         destination_port->receive_owner);
-                 routed != state.application_screen_to_client_y.end()) {
-        scene_translation = routed->second;
+              destination_port->receive_owner &&
+          state.active_application_scene->touch_transform) {
+        screen_origin_y =
+            state.active_application_scene->touch_transform->screen_origin_y;
+      } else if (const auto cached = state.application_scene_transforms.find(
+                     destination_port->receive_owner);
+                 cached != state.application_scene_transforms.end()) {
+        screen_origin_y = cached->second.screen_origin_y;
       }
-      if (scene_translation > 0 &&
-          scene_translation <
-              static_cast<std::int32_t>(iphone_2g_display_height) &&
+      const auto rounded_origin_y = std::llround(screen_origin_y);
+      if (rounded_origin_y > 0 && rounded_origin_y < iphone_2g_display_height &&
           application_pixels.size() ==
               static_cast<std::size_t>(iphone_2g_display_width) *
                   iphone_2g_display_height) {
-        const auto inset = static_cast<std::size_t>(scene_translation);
+        const auto inset = static_cast<std::size_t>(rounded_origin_y);
         const auto client_height =
             static_cast<std::size_t>(iphone_2g_display_height) - inset;
         std::vector<std::uint32_t> local_pixels(application_pixels.size());
-        for (std::size_t target_y = 0;
-             target_y < iphone_2g_display_height; ++target_y) {
-          const auto client_y = std::min(
-              client_height - 1U,
-              target_y * client_height / iphone_2g_display_height);
-          const auto source =
-              (inset + client_y) * iphone_2g_display_width;
-          const auto destination_offset =
-              target_y * iphone_2g_display_width;
+        for (std::size_t target_y = 0; target_y < iphone_2g_display_height;
+             ++target_y) {
+          const auto client_y =
+              std::min(client_height - 1U,
+                       target_y * client_height / iphone_2g_display_height);
+          const auto source = (inset + client_y) * iphone_2g_display_width;
+          const auto destination_offset = target_y * iphone_2g_display_width;
           std::copy_n(application_pixels.begin() +
                           static_cast<std::ptrdiff_t>(source),
                       iphone_2g_display_width,
@@ -468,11 +531,32 @@ void record_application_lifecycle_event_locked(KernelSharedState &state,
       }
       state.pending_application_exit_snapshot =
           KernelSharedState::ApplicationExitSnapshot{
-              destination_port->receive_owner,
-              std::move(application_pixels)};
+              destination_port->receive_owner, std::move(application_pixels)};
     }
-    state.application_screen_to_client_y.erase(
-        destination_port->receive_owner);
+    const auto preserve_locked_scene =
+        state.application_suspension_reason ==
+            KernelSharedState::ApplicationSuspensionReason::Lock &&
+        state.active_application_scene &&
+        state.active_application_scene->process_id ==
+            destination_port->receive_owner;
+    state.application_suspension_reason =
+        KernelSharedState::ApplicationSuspensionReason::None;
+    if (preserve_locked_scene) {
+      return;
+    }
+    if (state.latest_application_scene_transform &&
+        state.latest_application_scene_transform->process_id ==
+            destination_port->receive_owner) {
+      state.latest_application_scene_transform.reset();
+    }
+    for (auto context = state.application_scene_context_owners.begin();
+         context != state.application_scene_context_owners.end();) {
+      if (context->second == destination_port->receive_owner) {
+        context = state.application_scene_context_owners.erase(context);
+      } else {
+        ++context;
+      }
+    }
     state.active_application_scene.reset();
   }
 }

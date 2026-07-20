@@ -59,15 +59,28 @@ enqueue_system_button(KernelSharedState &state, const SystemButtonInput &input);
 void activate_resolved_application(KernelSharedState &state,
                                    std::uint32_t process_id);
 
-// Records the scene translation introduced while SpringBoard places the most
-// recently resolved remote application context. Resolve its receive owner so
-// lifecycle route changes cannot leak geometry between applications.
-void record_pending_application_scene_translation(
-    KernelSharedState &state, std::int32_t screen_to_client_y);
+// Starts a new generation for a server-side LayerKit render context. The next
+// visible root commit binds the context to the then-pending App event route.
+void reset_application_scene_context(KernelSharedState &state,
+                                     std::uint32_t render_process_id,
+                                     std::uint32_t context);
 
-// HOME/lock temporarily return touch ownership to SpringBoard without losing
-// the application port needed after the unlock lifecycle completes.
-void suspend_active_application(KernelSharedState &state);
+// Records the observed presentation adjustment and final origin of an
+// application's remote root scene. Touches invert only the adjustment added by
+// compatibility placement; UIKit remains responsible for its own UIWindow
+// conversion. The render-context binding keeps later background App lookups
+// from changing ownership of an already-visible scene.
+void record_application_scene_transform(
+    KernelSharedState &state, std::uint32_t render_process_id,
+    std::uint32_t context,
+    const KernelSharedState::ApplicationTouchTransform &transform);
+
+// HOME/lock temporarily return touch ownership to SpringBoard. Lock keeps the
+// visible App scene transform available across the unlock lifecycle, while a
+// real Home transition releases it after the exit snapshot is prepared.
+void suspend_active_application(
+    KernelSharedState &state,
+    KernelSharedState::ApplicationSuspensionReason reason);
 
 // Observes ordinary SpringBoard-to-application GSEvents while the caller holds
 // KernelSharedState::mach_mutex. Foreground lifecycle events resume the saved

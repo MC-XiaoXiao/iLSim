@@ -426,14 +426,30 @@ struct KernelSharedState {
     TouchInput touch;
     std::uint32_t system_event_type{};
   };
+  enum class ApplicationSuspensionReason {
+    None,
+    Home,
+    Lock,
+  };
   struct ApplicationExitSnapshot {
     std::uint32_t process_id{};
     std::vector<std::uint32_t> pixels;
   };
+  struct ApplicationTouchTransform {
+    float presentation_offset_x{};
+    float presentation_offset_y{};
+    float screen_origin_y{};
+
+    bool operator==(const ApplicationTouchTransform &) const = default;
+  };
+  struct PendingApplicationSceneTransform {
+    std::uint32_t process_id{};
+    ApplicationTouchTransform transform;
+  };
   struct ActiveApplicationScene {
     std::uint32_t process_id{};
     std::uint32_t event_object{};
-    std::int32_t screen_to_client_y{};
+    std::optional<ApplicationTouchTransform> touch_transform;
   };
   struct MachSemaphore {
     std::int64_t count{};
@@ -546,8 +562,15 @@ struct KernelSharedState {
   std::uint32_t pending_application_event_object{};
   std::uint32_t active_application_event_object{};
   bool application_touch_suspended{};
-  std::map<std::uint32_t, std::int32_t> application_screen_to_client_y;
-  std::optional<std::int32_t> latest_application_scene_translation;
+  ApplicationSuspensionReason application_suspension_reason{
+      ApplicationSuspensionReason::None};
+  std::optional<std::uint32_t> suspended_application_scene_process_id;
+  std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t>
+      application_scene_context_owners;
+  std::map<std::uint32_t, ApplicationTouchTransform>
+      application_scene_transforms;
+  std::optional<PendingApplicationSceneTransform>
+      latest_application_scene_transform;
   std::optional<ActiveApplicationScene> active_application_scene;
   // UIKit creates a new full-screen CoreSurface after willResignActive and
   // asks SpringBoard to animate that surface. Preserve the final live scanout

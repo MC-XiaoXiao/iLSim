@@ -159,7 +159,11 @@ void CompatibilityKernel::enqueue_system_button(
   if ((input.button == SystemButton::Home ||
        input.button == SystemButton::Lock) &&
       input.phase == SystemButtonPhase::Down && !woke_sleeping_display) {
-    graphics_services_input::suspend_active_application(*shared_state_);
+    graphics_services_input::suspend_active_application(
+        *shared_state_,
+        input.button == SystemButton::Lock
+            ? KernelSharedState::ApplicationSuspensionReason::Lock
+            : KernelSharedState::ApplicationSuspensionReason::Home);
   }
   const auto result =
       graphics_services_input::enqueue_system_button(*shared_state_, input);

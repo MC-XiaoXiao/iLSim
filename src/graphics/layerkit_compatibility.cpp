@@ -14,7 +14,7 @@ constexpr std::uint32_t sublayers_commit_flag = 2U;
 
 } // namespace
 
-void LayerKitRootCompatibility::set_layer_id(std::uint32_t context,
+bool LayerKitRootCompatibility::set_layer_id(std::uint32_t context,
                                              std::uint32_t layer_id) {
   auto &state = contexts_[context];
   // SpringBoard reuses one remote render context and one detached root ID
@@ -24,7 +24,9 @@ void LayerKitRootCompatibility::set_layer_id(std::uint32_t context,
   if (state.layer_id != layer_id || state.redirected) {
     state = ContextState{};
     state.layer_id = layer_id;
+    return true;
   }
+  return false;
 }
 
 std::optional<LayerKitApplicationPlacement>
@@ -51,13 +53,13 @@ LayerKitRootCompatibility::application_window_placement(
   if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(layer_width) ||
       !std::isfinite(layer_height) || layer_width != screen_width ||
       x * 2.0F != layer_width || layer_height <= 0.0F ||
-      layer_height >= screen_height) {
+      layer_height > screen_height) {
     return std::nullopt;
   }
   const auto inset = screen_height - layer_height;
   const auto rounded_inset = std::round(inset);
   const auto current_top = y - layer_height * 0.5F;
-  if (inset <= 0.0F || inset * 4.0F > screen_height ||
+  if (inset < 0.0F || inset * 4.0F > screen_height ||
       inset != rounded_inset ||
       (current_top != 0.0F && current_top != inset) ||
       rounded_inset >
@@ -68,9 +70,13 @@ LayerKitRootCompatibility::application_window_placement(
   // scene. Full-width navigation/table children have their own shorter local
   // bounds; treating those as scenes adds their height deficit a second time.
   // Normalize both observed root transaction shapes from viewport geometry.
+  const auto final_y = y + inset - current_top;
+  // UIKit already converts the absolute UIWindow origin. Touch routing must
+  // invert only the extra movement performed here, while screen_origin_y is
+  // retained separately for SpringBoard's exit-snapshot preparation.
   return LayerKitApplicationPlacement{
-      std::bit_cast<std::uint32_t>(y + inset - current_top),
-      static_cast<std::int32_t>(rounded_inset)};
+      std::bit_cast<std::uint32_t>(final_y), 0.0F, final_y - y,
+      final_y - layer_height * 0.5F};
 }
 
 std::optional<std::uint32_t> LayerKitRootCompatibility::observe_commit(

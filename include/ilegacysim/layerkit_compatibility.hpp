@@ -10,7 +10,9 @@ namespace ilegacysim {
 
 struct LayerKitApplicationPlacement {
   std::uint32_t position_y{};
-  std::int32_t screen_to_client_y{};
+  float presentation_offset_x{};
+  float presentation_offset_y{};
+  float screen_origin_y{};
 
   bool operator==(const LayerKitApplicationPlacement &) const = default;
 };
@@ -23,7 +25,8 @@ struct LayerKitApplicationPlacement {
 // wrapper must be preserved so the client context remains structurally intact.
 class LayerKitRootCompatibility {
 public:
-  void set_layer_id(std::uint32_t context, std::uint32_t layer_id);
+  // Returns true when this starts a new remote scene generation.
+  bool set_layer_id(std::uint32_t context, std::uint32_t layer_id);
 
   [[nodiscard]] std::optional<LayerKitApplicationPlacement>
   application_window_placement(std::uint32_t context,
