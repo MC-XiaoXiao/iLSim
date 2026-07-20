@@ -40,6 +40,17 @@ constexpr std::array<std::string_view, 3> observer_operations{
     "_CTTelephonyCenterRemoveEveryObserver",
 };
 
+// These server queries normally write a retained CFString through argument 2.
+// The offline connection is deliberately an opaque token, so every query that
+// would otherwise dereference it must terminate at this boundary.
+constexpr std::array<std::string_view, 5> offline_server_string_queries{
+    "__CTServerConnectionCopySIMIdentity",
+    "__CTServerConnectionCopyMobileIdentity",
+    "__CTServerConnectionGetMobileSubscriberCountryCode",
+    "__CTServerConnectionCopyOperatorName",
+    "__CTServerConnectionCopyProviderName",
+};
+
 bool is_offline_ui_client(const UserlandHleCall& call) {
     return call.image_loaded(springboard_image) ||
            call.image_loaded_beneath(application_directory);
@@ -153,18 +164,11 @@ void register_core_telephony_hle(UserlandHleRegistry& registry) {
         [](UserlandHleCall& call) {
             return_firmware_object(call, offline_sim_status_export);
         });
-    registry.register_function(
-        std::string{core_telephony_image},
-        "__CTServerConnectionCopySIMIdentity",
-        [](UserlandHleCall& call) { return_empty_server_string(call); });
-    registry.register_function(
-        std::string{core_telephony_image},
-        "__CTServerConnectionCopyMobileIdentity",
-        [](UserlandHleCall& call) { return_empty_server_string(call); });
-    registry.register_function(
-        std::string{core_telephony_image},
-        "__CTServerConnectionGetMobileSubscriberCountryCode",
-        [](UserlandHleCall& call) { return_empty_server_string(call); });
+    for (const auto symbol : offline_server_string_queries) {
+        registry.register_function(
+            std::string{core_telephony_image}, std::string{symbol},
+            [](UserlandHleCall& call) { return_empty_server_string(call); });
+    }
     registry.register_function(
         std::string{core_telephony_image},
         "__CTServerConnectionGetSIMStatus",
