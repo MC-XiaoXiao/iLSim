@@ -8,6 +8,9 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <dynarmic/interface/A32/a32.h>
 
 #include "../support.hpp"
@@ -30,20 +33,26 @@ bool locks_conflict(AdvisoryLockKind lhs, AdvisoryLockKind rhs) {
 
 RegularFileOpenDescription::RegularFileOpenDescription(
     std::uint64_t identifier, std::uint32_t permanent_file_id,
+    int host_descriptor,
     std::weak_ptr<AdvisoryFileLockRegistry> lock_registry)
     : identifier_{identifier}, permanent_file_id_{permanent_file_id},
+      host_descriptor_{host_descriptor},
       lock_registry_{std::move(lock_registry)} {}
 
 RegularFileOpenDescription::~RegularFileOpenDescription() {
   if (const auto registry = lock_registry_.lock())
     registry->release(*this);
+  if (host_descriptor_ >= 0)
+    static_cast<void>(::close(host_descriptor_));
 }
 
 std::shared_ptr<RegularFileOpenDescription>
-AdvisoryFileLockRegistry::open(std::uint32_t permanent_file_id) {
+AdvisoryFileLockRegistry::open(std::uint32_t permanent_file_id,
+                               int host_descriptor) {
   std::lock_guard lock{mutex_};
   return std::make_shared<RegularFileOpenDescription>(
-      next_description_identifier_++, permanent_file_id, weak_from_this());
+      next_description_identifier_++, permanent_file_id, host_descriptor,
+      weak_from_this());
 }
 
 bool AdvisoryFileLockRegistry::try_acquire(
@@ -229,8 +238,21 @@ CompatibilityKernel::ensure_regular_file_open_description(std::uint32_t fd) {
   const auto metadata = query_hfs_metadata(file->second, true);
   if (!metadata)
     return {};
-  auto description =
-      shared_state_->advisory_file_locks->open(metadata->permanent_id);
+  const auto guest_flags = file_status_flags_.contains(fd)
+                               ? file_status_flags_.at(fd)
+                               : darwin::open_flag::read_only;
+  const auto access = guest_flags & darwin::open_flag::access_mode;
+  const auto host_access = access == darwin::open_flag::write_only
+                               ? O_WRONLY
+                           : access == darwin::open_flag::read_write
+                               ? O_RDWR
+                               : O_RDONLY;
+  const auto host_descriptor =
+      ::open(file->second.c_str(), host_access | O_CLOEXEC);
+  if (host_descriptor < 0)
+    return {};
+  auto description = shared_state_->advisory_file_locks->open(
+      metadata->permanent_id, host_descriptor);
   regular_file_open_descriptions_[fd] = description;
   return description;
 }

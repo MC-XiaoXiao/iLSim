@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -24,6 +25,9 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "support.hpp"
 
@@ -95,15 +99,20 @@ void CompatibilityKernel::dispatch_bsd_descriptor_memory(Cpu &cpu,
       bytes.clear();
     } else if (const auto file = file_descriptors_.find(fd);
                file != file_descriptors_.end()) {
-      std::ifstream stream{file->second, std::ios::binary};
-      stream.seekg(static_cast<std::streamoff>(file_offsets_[fd]));
-      if (!stream) {
-        bsd_error(cpu, 5); // EIO
+      const auto description = ensure_regular_file_open_description(fd);
+      if (!description) {
+        bsd_error(cpu, darwin::error::bad_file_descriptor);
         return;
       }
-      stream.read(reinterpret_cast<char *>(bytes.data()),
-                  static_cast<std::streamsize>(bytes.size()));
-      bytes.resize(static_cast<std::size_t>(stream.gcount()));
+      const auto result = ::pread(
+          description->host_descriptor(), bytes.data(), bytes.size(),
+          static_cast<off_t>(file_offsets_[fd]));
+      if (result < 0) {
+        bsd_error(cpu, bsd_support::darwin_filesystem_error(
+                           std::error_code{errno, std::generic_category()}));
+        return;
+      }
+      bytes.resize(static_cast<std::size_t>(result));
       file_offsets_[fd] += bytes.size();
     } else if (fd == 0) {
       bytes.clear(); // terminal input currently presents non-blocking EOF
@@ -371,31 +380,33 @@ void CompatibilityKernel::dispatch_bsd_descriptor_memory(Cpu &cpu,
         bsd_error(cpu, darwin::error::bad_address);
         return;
       }
-      std::lock_guard filesystem_lock{shared_state_->filesystem_mutex};
-      std::fstream stream{file->second,
-                          std::ios::binary | std::ios::in | std::ios::out};
-      if (!stream) {
-        bsd_error(cpu, darwin::error::io);
+      const auto description = ensure_regular_file_open_description(fd);
+      if (!description) {
+        bsd_error(cpu, darwin::error::bad_file_descriptor);
         return;
       }
+      std::lock_guard filesystem_lock{shared_state_->filesystem_mutex};
       std::uint64_t position = file_offsets_[fd];
       if ((flags & darwin::open_flag::append) != 0) {
-        std::error_code error;
-        position = std::filesystem::file_size(file->second, error);
-        if (error) {
-          bsd_error(cpu, darwin::error::io);
+        struct stat status {};
+        if (::fstat(description->host_descriptor(), &status) != 0) {
+          bsd_error(cpu, bsd_support::darwin_filesystem_error(
+                             std::error_code{errno,
+                                             std::generic_category()}));
           return;
         }
+        position = static_cast<std::uint64_t>(status.st_size);
       }
-      stream.seekp(static_cast<std::streamoff>(position));
-      stream.write(reinterpret_cast<const char *>(bytes->data()),
-                   static_cast<std::streamsize>(bytes->size()));
-      if (!stream) {
-        bsd_error(cpu, darwin::error::io);
+      const auto result = ::pwrite(description->host_descriptor(),
+                                   bytes->data(), bytes->size(),
+                                   static_cast<off_t>(position));
+      if (result < 0) {
+        bsd_error(cpu, bsd_support::darwin_filesystem_error(
+                           std::error_code{errno, std::generic_category()}));
         return;
       }
-      file_offsets_[fd] = position + bytes->size();
-      bsd_success(cpu, static_cast<std::uint32_t>(bytes->size()));
+      file_offsets_[fd] = position + static_cast<std::size_t>(result);
+      bsd_success(cpu, static_cast<std::uint32_t>(result));
       return;
     }
     if (fd != 1 && fd != 2) {

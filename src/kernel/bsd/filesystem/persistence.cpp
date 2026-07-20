@@ -6,7 +6,6 @@
 #include <string>
 #include <system_error>
 
-#include <fcntl.h>
 #include <unistd.h>
 
 #include "../support.hpp"
@@ -29,15 +28,13 @@ bool CompatibilityKernel::dispatch_bsd_filesystem_persistence(
     return true;
   }
 
-  const auto host_fd = ::open(descriptor->second.c_str(), O_RDONLY | O_CLOEXEC);
-  if (host_fd < 0) {
-    bsd_error(cpu, bsd_support::darwin_filesystem_error(
-                       std::error_code{errno, std::generic_category()}));
+  const auto description = ensure_regular_file_open_description(fd);
+  if (!description) {
+    bsd_error(cpu, bsd_support::bad_file_descriptor);
     return true;
   }
-  const auto result = ::fsync(host_fd);
+  const auto result = ::fsync(description->host_descriptor());
   const auto sync_error = errno;
-  static_cast<void>(::close(host_fd));
   if (result != 0) {
     bsd_error(cpu, bsd_support::darwin_filesystem_error(
                        std::error_code{sync_error, std::generic_category()}));

@@ -47,6 +47,8 @@
 #include <utility>
 #include <vector>
 
+#include <sys/stat.h>
+
 namespace ilegacysim {
 
 namespace {
@@ -1084,7 +1086,8 @@ void CompatibilityKernel::bsd_error(Cpu &cpu, std::uint32_t error) {
 
 bool CompatibilityKernel::write_guest_stat(std::uint32_t address,
                                            const std::filesystem::path &path,
-                                           bool follow_symlink) {
+                                           bool follow_symlink,
+                                           int host_descriptor) {
   // Darwin 8 32-bit struct stat is 96 bytes. Keep this explicit instead of
   // copying the host struct: field widths and alignment differ by ABI.
   std::array<std::byte, 96> bytes{};
@@ -1103,7 +1106,31 @@ bool CompatibilityKernel::write_guest_stat(std::uint32_t address,
     }
   };
 
-  const auto metadata = query_hfs_metadata(path, follow_symlink);
+  auto metadata = query_hfs_metadata(path, follow_symlink);
+  if (host_descriptor >= 0) {
+    struct stat status {};
+    if (::fstat(host_descriptor, &status) != 0)
+      return false;
+    struct stat path_status {};
+    const auto path_result = follow_symlink ? ::stat(path.c_str(), &path_status)
+                                            : ::lstat(path.c_str(), &path_status);
+    if (path_result != 0 || path_status.st_dev != status.st_dev ||
+        path_status.st_ino != status.st_ino) {
+      hfs::Metadata open_file;
+      open_file.name = path.filename().string();
+      open_file.catalog_id = static_cast<std::uint32_t>(status.st_ino);
+      open_file.permanent_id = open_file.catalog_id;
+      open_file.mode = static_cast<std::uint32_t>(status.st_mode);
+      open_file.owner = static_cast<std::uint32_t>(status.st_uid);
+      open_file.group = static_cast<std::uint32_t>(status.st_gid);
+      open_file.link_count = static_cast<std::uint32_t>(status.st_nlink);
+      open_file.data_length = static_cast<std::uint64_t>(status.st_size);
+      open_file.data_allocation_size =
+          static_cast<std::uint64_t>(status.st_blocks) * 512U;
+      open_file.directory = S_ISDIR(status.st_mode);
+      metadata = std::move(open_file);
+    }
+  }
   if (!metadata)
     return false;
   put32(0, root_disk_device);                           // st_dev

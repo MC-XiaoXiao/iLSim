@@ -274,7 +274,8 @@ private:
   ensure_regular_file_open_description(std::uint32_t fd);
   bool write_guest_stat(std::uint32_t address,
                         const std::filesystem::path &path,
-                        bool follow_symlink = true);
+                        bool follow_symlink = true,
+                        int host_descriptor = -1);
   bool write_guest_device_stat(std::uint32_t address, std::uint32_t minor,
                                bool character_device);
   bool write_guest_statfs(std::uint32_t address);

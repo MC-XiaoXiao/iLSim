@@ -35,6 +35,7 @@ class RegularFileOpenDescription {
 public:
   RegularFileOpenDescription(
       std::uint64_t identifier, std::uint32_t permanent_file_id,
+      int host_descriptor,
       std::weak_ptr<AdvisoryFileLockRegistry> lock_registry);
   RegularFileOpenDescription(const RegularFileOpenDescription &) = delete;
   RegularFileOpenDescription &
@@ -45,10 +46,12 @@ public:
   [[nodiscard]] std::uint32_t permanent_file_id() const {
     return permanent_file_id_;
   }
+  [[nodiscard]] int host_descriptor() const { return host_descriptor_; }
 
 private:
   std::uint64_t identifier_{};
   std::uint32_t permanent_file_id_{};
+  int host_descriptor_{-1};
   std::weak_ptr<AdvisoryFileLockRegistry> lock_registry_;
 };
 
@@ -56,7 +59,7 @@ class AdvisoryFileLockRegistry
     : public std::enable_shared_from_this<AdvisoryFileLockRegistry> {
 public:
   [[nodiscard]] std::shared_ptr<RegularFileOpenDescription>
-  open(std::uint32_t permanent_file_id);
+  open(std::uint32_t permanent_file_id, int host_descriptor);
 
   // Returns false only when another open description owns an incompatible
   // lock.  Conversion of a description's own lock is atomic.

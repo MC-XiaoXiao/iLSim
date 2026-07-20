@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -24,6 +25,9 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "support.hpp"
 
@@ -710,20 +714,21 @@ void CompatibilityKernel::dispatch_bsd_filesystem(Cpu &cpu,
     }
     const auto offset = static_cast<std::uint64_t>(registers[3]) |
                         (static_cast<std::uint64_t>(registers[4]) << 32U);
-    std::ifstream stream{found->second, std::ios::binary};
-    if (!stream) {
-      bsd_error(cpu, 5); // EIO
-      return;
-    }
-    stream.seekg(static_cast<std::streamoff>(offset));
-    if (!stream) {
-      bsd_error(cpu, bsd_support::invalid_argument);
+    const auto description =
+        ensure_regular_file_open_description(registers[0]);
+    if (!description) {
+      bsd_error(cpu, bsd_support::bad_file_descriptor);
       return;
     }
     std::vector<std::byte> bytes(size);
-    stream.read(reinterpret_cast<char *>(bytes.data()),
-                static_cast<std::streamsize>(bytes.size()));
-    bytes.resize(static_cast<std::size_t>(stream.gcount()));
+    const auto result = ::pread(description->host_descriptor(), bytes.data(),
+                                bytes.size(), static_cast<off_t>(offset));
+    if (result < 0) {
+      bsd_error(cpu, bsd_support::darwin_filesystem_error(
+                         std::error_code{errno, std::generic_category()}));
+      return;
+    }
+    bytes.resize(static_cast<std::size_t>(result));
     if (!memory_.copy_in(registers[1], bytes)) {
       bsd_error(cpu, bsd_support::bad_address);
       return;
@@ -762,21 +767,20 @@ void CompatibilityKernel::dispatch_bsd_filesystem(Cpu &cpu,
     }
     const auto offset = static_cast<std::uint64_t>(registers[3]) |
                         (static_cast<std::uint64_t>(registers[4]) << 32U);
+    const auto description = ensure_regular_file_open_description(fd);
+    if (!description) {
+      bsd_error(cpu, bsd_support::bad_file_descriptor);
+      return;
+    }
     std::lock_guard filesystem_lock{shared_state_->filesystem_mutex};
-    std::fstream stream{file->second,
-                        std::ios::binary | std::ios::in | std::ios::out};
-    if (!stream) {
-      bsd_error(cpu, darwin::error::io);
+    const auto result = ::pwrite(description->host_descriptor(), bytes->data(),
+                                 bytes->size(), static_cast<off_t>(offset));
+    if (result < 0) {
+      bsd_error(cpu, bsd_support::darwin_filesystem_error(
+                         std::error_code{errno, std::generic_category()}));
       return;
     }
-    stream.seekp(static_cast<std::streamoff>(offset));
-    stream.write(reinterpret_cast<const char *>(bytes->data()),
-                 static_cast<std::streamsize>(bytes->size()));
-    if (!stream) {
-      bsd_error(cpu, darwin::error::io);
-      return;
-    }
-    bsd_success(cpu, static_cast<std::uint32_t>(bytes->size()));
+    bsd_success(cpu, static_cast<std::uint32_t>(result));
     return;
   }
   case 157: { // statfs
@@ -878,10 +882,15 @@ void CompatibilityKernel::dispatch_bsd_filesystem(Cpu &cpu,
       bsd_error(cpu, bsd_support::invalid_argument);
       return;
     }
-    std::error_code error;
-    std::filesystem::resize_file(file->second, length, error);
-    if (error) {
-      bsd_error(cpu, error == std::errc::permission_denied ? 13U : 5U);
+    const auto description = ensure_regular_file_open_description(fd);
+    if (!description) {
+      bsd_error(cpu, bsd_support::bad_file_descriptor);
+      return;
+    }
+    if (::ftruncate(description->host_descriptor(),
+                    static_cast<off_t>(length)) != 0) {
+      bsd_error(cpu, bsd_support::darwin_filesystem_error(
+                         std::error_code{errno, std::generic_category()}));
       return;
     }
     bsd_success(cpu, 0);
@@ -1039,13 +1048,18 @@ void CompatibilityKernel::dispatch_bsd_filesystem(Cpu &cpu,
       base = static_cast<std::int64_t>(file_offsets_[fd]);
       break;  // SEEK_CUR
     case 2: { // SEEK_END
-      std::error_code size_error;
-      const auto size = std::filesystem::file_size(file->second, size_error);
-      if (size_error) {
-        bsd_error(cpu, 5);
+      const auto description = ensure_regular_file_open_description(fd);
+      struct stat status {};
+      if (!description ||
+          ::fstat(description->host_descriptor(), &status) != 0) {
+        bsd_error(cpu, description
+                           ? bsd_support::darwin_filesystem_error(
+                                 std::error_code{errno,
+                                                 std::generic_category()})
+                           : bsd_support::bad_file_descriptor);
         return;
       }
-      base = static_cast<std::int64_t>(size);
+      base = static_cast<std::int64_t>(status.st_size);
       break;
     }
     default:
@@ -1632,7 +1646,9 @@ void CompatibilityKernel::dispatch_bsd_filesystem(Cpu &cpu,
       bsd_error(cpu, bsd_support::bad_file_descriptor);
       return;
     }
-    if (!write_guest_stat(registers[1], found->second)) {
+    const auto description = ensure_regular_file_open_description(descriptor);
+    if (!write_guest_stat(registers[1], found->second, true,
+                          description ? description->host_descriptor() : -1)) {
       bsd_error(cpu, bsd_support::bad_address);
       return;
     }
