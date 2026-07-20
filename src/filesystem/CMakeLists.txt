@@ -1,0 +1,4 @@
+add_library(ilegacysim_filesystem STATIC hfs_metadata.cpp)
+add_library(iLegacySim::filesystem ALIAS ilegacysim_filesystem)
+ilegacysim_configure_module(ilegacysim_filesystem)
+target_link_libraries(ilegacysim_filesystem PUBLIC iLegacySim::foundation)

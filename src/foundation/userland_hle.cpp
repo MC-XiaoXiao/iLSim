@@ -1,0 +1,684 @@
+#include "ilegacysim/userland_hle.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <span>
+#include <stdexcept>
+#include <utility>
+
+#include "ilegacysim/address_space.hpp"
+#include "ilegacysim/cpu.hpp"
+#include "ilegacysim/macho.hpp"
+#include "ilegacysim/output.hpp"
+
+namespace ilegacysim {
+namespace {
+
+constexpr std::uint32_t arm_svc_opcode = 0xef000000U;
+constexpr std::uint32_t arm_thumb_state_bit = 1U << 5U;
+constexpr std::uint32_t first_string_page_candidate = 0x3fff0000U;
+constexpr std::uint32_t lowest_string_page_candidate = 0x3f000000U;
+constexpr std::uint32_t first_data_page_candidate = 0x50000000U;
+constexpr std::uint32_t data_region_end = 0x60000000U;
+constexpr std::size_t maximum_traced_hle_symbols = 512;
+
+bool path_has_suffix(std::string_view path, std::string_view suffix) {
+  return path.size() >= suffix.size() &&
+         path.substr(path.size() - suffix.size()) == suffix;
+}
+
+std::array<std::byte, 4> little_endian_word(std::uint32_t value) {
+  return {
+      static_cast<std::byte>(value & 0xffU),
+      static_cast<std::byte>((value >> 8U) & 0xffU),
+      static_cast<std::byte>((value >> 16U) & 0xffU),
+      static_cast<std::byte>((value >> 24U) & 0xffU),
+  };
+}
+
+std::uint32_t word_from_little_endian(std::span<const std::byte, 4> bytes) {
+  return std::to_integer<std::uint32_t>(bytes[0]) |
+         (std::to_integer<std::uint32_t>(bytes[1]) << 8U) |
+         (std::to_integer<std::uint32_t>(bytes[2]) << 16U) |
+         (std::to_integer<std::uint32_t>(bytes[3]) << 24U);
+}
+
+std::vector<std::byte>
+make_persistent_arm_trampoline(std::span<const std::byte, 4> original,
+                               std::uint32_t entry) {
+  const auto instruction = word_from_little_endian(original);
+  constexpr std::uint32_t literal_load_mask = 0x0f7f0000U;
+  constexpr std::uint32_t literal_word_load = 0x051f0000U;
+  const auto target_register = (instruction >> 12U) & 0xfU;
+  if ((instruction & literal_load_mask) == literal_word_load &&
+      target_register != 15U) {
+    const auto condition = instruction & 0xf0000000U;
+    const auto immediate = instruction & 0xfffU;
+    const auto original_pc = entry + 8U;
+    const auto literal_address = (instruction & (1U << 23U)) != 0U
+                                     ? original_pc + immediate
+                                     : original_pc - immediate;
+    // A PC-relative first instruction cannot simply be copied to the
+    // trampoline: its literal address would move with the PC. Load the
+    // original absolute literal address first, then execute the equivalent
+    // register-indirect load before returning to the second instruction.
+    const std::array words{
+        condition | 0x059f0008U | (target_register << 12U),
+        condition | 0x05900000U | (target_register << 16U) |
+            (target_register << 12U),
+        0xe59ff004U,
+        0xe1a00000U,
+        literal_address,
+        entry + 4U,
+    };
+    std::vector<std::byte> code;
+    code.reserve(words.size() * sizeof(std::uint32_t));
+    for (const auto word : words) {
+      const auto encoded = little_endian_word(word);
+      code.insert(code.end(), encoded.begin(), encoded.end());
+    }
+    return code;
+  }
+
+  std::vector<std::byte> code;
+  code.reserve(3U * sizeof(std::uint32_t));
+  code.insert(code.end(), original.begin(), original.end());
+  const auto jump = little_endian_word(0xe51ff004U);
+  const auto target = little_endian_word(entry + 4U);
+  code.insert(code.end(), jump.begin(), jump.end());
+  code.insert(code.end(), target.begin(), target.end());
+  return code;
+}
+
+std::array<std::byte, 2> little_endian_halfword(std::uint16_t value) {
+  return {
+      static_cast<std::byte>(value & 0xffU),
+      static_cast<std::byte>((value >> 8U) & 0xffU),
+  };
+}
+
+} // namespace
+
+UserlandHleCall::UserlandHleCall(UserlandHleRegistry &registry, Cpu &cpu,
+                                 AddressSpace &memory, Output &output,
+                                 std::uint32_t process_id,
+                                 std::string_view symbol)
+    : registry_{registry}, cpu_{cpu}, memory_{memory}, output_{output},
+      process_id_{process_id}, symbol_{symbol} {}
+
+std::uint32_t UserlandHleCall::argument(std::size_t index) const {
+  const auto &registers = cpu_.registers();
+  if (index < 4)
+    return registers[index];
+  const auto stack_offset = static_cast<std::uint64_t>(index - 4U) * 4U;
+  if (stack_offset >
+      std::numeric_limits<std::uint32_t>::max() - registers[13]) {
+    return 0;
+  }
+  return memory_
+      .read32(registers[13] + static_cast<std::uint32_t>(stack_offset))
+      .value_or(0);
+}
+
+std::optional<std::string>
+UserlandHleCall::string_argument(std::size_t index,
+                                 std::size_t maximum_size) const {
+  const auto address = argument(index);
+  return address == 0 ? std::nullopt
+                      : memory_.read_c_string(address, maximum_size);
+}
+
+bool UserlandHleCall::write32(std::uint32_t address, std::uint32_t value) {
+  return address == 0 || memory_.write32(address, value);
+}
+
+std::uint32_t UserlandHleCall::intern_string(std::string_view value) {
+  return registry_.intern_string(value);
+}
+
+std::uint32_t UserlandHleCall::allocate_data(std::size_t size,
+                                             std::size_t alignment) {
+  return registry_.allocate_data(size, alignment);
+}
+
+std::optional<std::uint32_t>
+UserlandHleCall::symbol_address(std::string_view symbol) const {
+  return registry_.symbol_address(symbol);
+}
+
+bool UserlandHleCall::image_loaded(std::string_view image_suffix) const {
+  return registry_.image_loaded(image_suffix);
+}
+
+bool UserlandHleCall::image_loaded_beneath(
+    std::string_view directory) const {
+  return registry_.image_loaded_beneath(directory);
+}
+
+void UserlandHleCall::set_return(std::uint32_t value) {
+  cpu_.registers()[0] = value;
+}
+
+void UserlandHleCall::resume_original() { resume_original_ = true; }
+
+void UserlandHleCall::resume_original_persistently() {
+  resume_original_persistently_ = true;
+}
+
+UserlandHleRegistry::UserlandHleRegistry(AddressSpace &memory, Output &output)
+    : memory_{memory}, output_{output} {}
+
+void UserlandHleRegistry::register_function(std::string image_suffix,
+                                            std::string symbol,
+                                            Handler handler) {
+  if (!handler || registrations_.size() >= userland_hle_call_mask) {
+    throw std::runtime_error{"invalid or exhausted userspace HLE registration"};
+  }
+  const auto duplicate =
+      std::find_if(registrations_.begin(), registrations_.end(),
+                   [&](const Registration &registration) {
+                     return !registration.prefix &&
+                            registration.image_suffix == image_suffix &&
+                            registration.symbol == symbol;
+                   });
+  if (duplicate != registrations_.end()) {
+    throw std::runtime_error{"duplicate userspace HLE function: " + symbol};
+  }
+  registrations_.push_back(
+      Registration{static_cast<std::uint16_t>(registrations_.size() + 1U),
+                   std::move(image_suffix), std::move(symbol), false,
+                   std::nullopt, std::move(handler)});
+}
+
+void UserlandHleRegistry::register_prefix(std::string image_suffix,
+                                          std::string symbol_prefix,
+                                          Handler handler) {
+  if (!handler || registrations_.size() >= userland_hle_call_mask) {
+    throw std::runtime_error{"invalid or exhausted userspace HLE registration"};
+  }
+  registrations_.push_back(
+      Registration{static_cast<std::uint16_t>(registrations_.size() + 1U),
+                   std::move(image_suffix), std::move(symbol_prefix), true,
+                   std::nullopt, std::move(handler)});
+}
+
+void UserlandHleRegistry::register_address(std::string image_suffix,
+                                           std::uint32_t virtual_address,
+                                           std::string diagnostic_name,
+                                           Handler handler) {
+  if (!handler || virtual_address == 0 || diagnostic_name.empty() ||
+      registrations_.size() >= userland_hle_call_mask) {
+    throw std::runtime_error{
+        "invalid or exhausted userspace address HLE registration"};
+  }
+  const auto duplicate =
+      std::find_if(registrations_.begin(), registrations_.end(),
+                   [&](const Registration &registration) {
+                     return registration.image_suffix == image_suffix &&
+                            registration.virtual_address == virtual_address;
+                   });
+  if (duplicate != registrations_.end()) {
+    throw std::runtime_error{"duplicate userspace HLE address: " +
+                             diagnostic_name};
+  }
+  registrations_.push_back(
+      Registration{static_cast<std::uint16_t>(registrations_.size() + 1U),
+                   std::move(image_suffix), std::move(diagnostic_name), false,
+                   virtual_address, std::move(handler)});
+}
+
+UserlandHleRegistry::Registration *
+UserlandHleRegistry::select_registration(std::string_view image_path,
+                                         std::string_view symbol) {
+  Registration *prefix_match = nullptr;
+  for (auto &registration : registrations_) {
+    if (!path_has_suffix(image_path, registration.image_suffix))
+      continue;
+    if (registration.virtual_address)
+      continue;
+    if (!registration.prefix && registration.symbol == symbol) {
+      return &registration;
+    }
+    if (registration.prefix && symbol.starts_with(registration.symbol) &&
+        (prefix_match == nullptr ||
+         registration.symbol.size() > prefix_match->symbol.size())) {
+      prefix_match = &registration;
+    }
+  }
+  return prefix_match;
+}
+
+const UserlandHleRegistry::Registration *
+UserlandHleRegistry::find_registration(std::uint16_t id) const {
+  if (id == 0 || id > registrations_.size())
+    return nullptr;
+  const auto &registration = registrations_[id - 1U];
+  return registration.id == id ? &registration : nullptr;
+}
+
+std::size_t UserlandHleRegistry::install_mapped_image(
+    Cpu &cpu, std::uint32_t process_id, const std::filesystem::path &image_path,
+    std::uint32_t mapping_address, std::uint32_t mapping_size,
+    std::uint64_t file_offset) {
+  const auto path = image_path.generic_string();
+  loaded_images_.insert(path);
+  if (mapping_size == 0 ||
+      file_offset > std::numeric_limits<std::uint32_t>::max()) {
+    return 0;
+  }
+  const auto relevant =
+      std::any_of(registrations_.begin(), registrations_.end(),
+                  [&](const Registration &registration) {
+                    return path_has_suffix(path, registration.image_suffix);
+                  });
+  if (!relevant)
+    return 0;
+
+  const auto image = MachOImage::parse(image_path);
+  const auto mapping_offset = static_cast<std::uint32_t>(file_offset);
+  const auto mapping_file_end =
+      static_cast<std::uint64_t>(mapping_offset) + mapping_size;
+  std::size_t patched = 0;
+  for (const auto &symbol : image.symbols()) {
+    if (symbol.value == 0)
+      continue;
+    const auto segment = std::find_if(
+        image.segments().begin(), image.segments().end(),
+        [&](const MachSegment &candidate) {
+          return symbol.value >= candidate.vm_address &&
+                 symbol.value - candidate.vm_address < candidate.file_size;
+        });
+    if (segment == image.segments().end())
+      continue;
+    const auto symbol_file_offset =
+        static_cast<std::uint64_t>(segment->file_offset) +
+        (symbol.value - segment->vm_address);
+    if (symbol_file_offset < mapping_offset ||
+        symbol_file_offset >= mapping_file_end) {
+      continue;
+    }
+    const auto mapping_delta = symbol_file_offset - mapping_offset;
+    if (mapping_delta >
+        std::numeric_limits<std::uint32_t>::max() - mapping_address) {
+      continue;
+    }
+    const auto runtime_address =
+        mapping_address + static_cast<std::uint32_t>(mapping_delta);
+    installed_symbols_.insert_or_assign(symbol.name, runtime_address);
+
+    auto *registration = select_registration(path, symbol.name);
+    if (registration == nullptr)
+      continue;
+    const auto patch_size = symbol.thumb_definition() ? 2U : 4U;
+    if (symbol_file_offset + patch_size > mapping_file_end)
+      continue;
+    if (installed_calls_.contains(runtime_address))
+      continue;
+    const auto original = memory_.read_bytes(runtime_address, patch_size);
+    if (!original)
+      continue;
+    bool copied = false;
+    if (symbol.thumb_definition()) {
+      // Thumb SVC has only an eight-bit immediate. The concrete handler
+      // is recovered from installed_calls_ using PC-2 during dispatch.
+      const auto instruction = little_endian_halfword(
+          static_cast<std::uint16_t>(0xdf00U | userland_hle_thumb_svc));
+      copied = memory_.copy_in(runtime_address, instruction);
+      if (copied)
+        cpu.invalidate_cache_range(runtime_address, instruction.size());
+    } else {
+      const auto instruction = little_endian_word(
+          arm_svc_opcode | userland_hle_svc_namespace | registration->id);
+      copied = memory_.copy_in(runtime_address, instruction);
+      if (copied)
+        cpu.invalidate_cache_range(runtime_address, instruction.size());
+    }
+    if (!copied)
+      continue;
+    installed_calls_.emplace(
+        runtime_address, InstalledCall{registration->id, symbol.name,
+                                       symbol.thumb_definition(), *original});
+    ++patched;
+  }
+  for (const auto &registration : registrations_) {
+    if (!registration.virtual_address ||
+        !path_has_suffix(path, registration.image_suffix)) {
+      continue;
+    }
+    const bool thumb = (*registration.virtual_address & 1U) != 0;
+    const auto preferred_address = *registration.virtual_address & ~1U;
+    const auto segment = std::find_if(
+        image.segments().begin(), image.segments().end(),
+        [&](const MachSegment &candidate) {
+          return preferred_address >= candidate.vm_address &&
+                 preferred_address - candidate.vm_address < candidate.file_size;
+        });
+    if (segment == image.segments().end())
+      continue;
+    const auto address_file_offset =
+        static_cast<std::uint64_t>(segment->file_offset) +
+        (preferred_address - segment->vm_address);
+    const auto patch_size = thumb ? 2U : 4U;
+    if (address_file_offset < mapping_offset ||
+        address_file_offset + patch_size > mapping_file_end) {
+      continue;
+    }
+    const auto mapping_delta = address_file_offset - mapping_offset;
+    if (mapping_delta >
+        std::numeric_limits<std::uint32_t>::max() - mapping_address) {
+      continue;
+    }
+    const auto runtime_address =
+        mapping_address + static_cast<std::uint32_t>(mapping_delta);
+    if (installed_calls_.contains(runtime_address))
+      continue;
+    const auto original = memory_.read_bytes(runtime_address, patch_size);
+    if (!original)
+      continue;
+    bool copied = false;
+    if (thumb) {
+      const auto instruction = little_endian_halfword(
+          static_cast<std::uint16_t>(0xdf00U | userland_hle_thumb_svc));
+      copied = memory_.copy_in(runtime_address, instruction);
+      if (copied) {
+        cpu.invalidate_cache_range(runtime_address, instruction.size());
+      }
+    } else {
+      const auto instruction = little_endian_word(
+          arm_svc_opcode | userland_hle_svc_namespace | registration.id);
+      copied = memory_.copy_in(runtime_address, instruction);
+      if (copied) {
+        cpu.invalidate_cache_range(runtime_address, instruction.size());
+      }
+    }
+    if (!copied)
+      continue;
+    installed_calls_.emplace(
+        runtime_address,
+        InstalledCall{registration.id, registration.symbol, thumb, *original});
+    ++patched;
+  }
+  if (patched != 0) {
+    output_.write("[hle] installed pid=" + std::to_string(process_id) +
+                  " image=" + image_path.filename().string() +
+                  " functions=" + std::to_string(patched) + "\n");
+  }
+  return patched;
+}
+
+bool UserlandHleRegistry::dispatch(Cpu &cpu, std::uint32_t process_id,
+                                   std::uint32_t svc_immediate) {
+  const bool thumb = svc_immediate == userland_hle_thumb_svc;
+  if (!thumb && (svc_immediate & userland_hle_svc_namespace_mask) !=
+                    userland_hle_svc_namespace) {
+    return false;
+  }
+
+  // Dynarmic exposes the architectural PC after SVC. Thumb HLEs share one
+  // immediate and are selected by their two-byte entry address; ARM HLEs
+  // retain the encoded registration id used by the original implementation.
+  const auto entry = cpu.registers()[15] - (thumb ? 2U : 4U);
+  const auto installed = installed_calls_.find(entry);
+  const auto id =
+      thumb && installed != installed_calls_.end()
+          ? installed->second.id
+          : static_cast<std::uint16_t>(svc_immediate & userland_hle_call_mask);
+  const auto *registration = find_registration(id);
+  if (registration == nullptr ||
+      (thumb &&
+       (installed == installed_calls_.end() || !installed->second.thumb))) {
+    return false;
+  }
+
+  // The mapping supplies the concrete symbol for prefix HLEs.
+  const std::string_view symbol =
+      installed != installed_calls_.end()
+          ? std::string_view{installed->second.symbol}
+          : std::string_view{registration->symbol};
+  if (traced_symbols_.size() < maximum_traced_hle_symbols &&
+      !traced_symbols_.contains(symbol)) {
+    traced_symbols_.emplace(symbol);
+    output_.write("[hle] call pid=" + std::to_string(process_id) +
+                  " cpu=" + std::to_string(cpu.processor_id()) +
+                  " symbol=" + std::string{symbol} + "\n");
+  }
+  UserlandHleCall call{*this, cpu, memory_, output_, process_id, symbol};
+  registration->handler(call);
+
+  auto &registers = cpu.registers();
+  if (call.resume_original_persistently_) {
+    if (installed == installed_calls_.end() || installed->second.thumb ||
+        installed->second.original.size() != sizeof(std::uint32_t)) {
+      return false;
+    }
+    auto trampoline = persistent_trampolines_.find(entry);
+    if (trampoline == persistent_trampolines_.end()) {
+      const auto address = persistent_trampoline_cursor_;
+      const auto code = make_persistent_arm_trampoline(
+          std::span<const std::byte, 4>{installed->second.original.data(), 4U},
+          entry);
+      const auto first_page = address & ~(AddressSpace::page_size - 1U);
+      const auto last_page =
+          (address + static_cast<std::uint32_t>(code.size()) - 1U) &
+          ~(AddressSpace::page_size - 1U);
+      for (auto page = first_page;; page += AddressSpace::page_size) {
+        if (!memory_.mapped(page, AddressSpace::page_size) &&
+            !memory_.map(page, AddressSpace::page_size,
+                         MemoryPermission::Read | MemoryPermission::Write |
+                             MemoryPermission::Execute)) {
+          return false;
+        }
+        if (page == last_page)
+          break;
+      }
+      if (!memory_.copy_in(address, code)) {
+        return false;
+      }
+      cpu.invalidate_cache_range(address, code.size());
+      trampoline = persistent_trampolines_.emplace(entry, address).first;
+      persistent_trampoline_cursor_ += static_cast<std::uint32_t>(code.size());
+    }
+    registers[15] = trampoline->second;
+    cpu.set_cpsr(cpu.cpsr() & ~arm_thumb_state_bit);
+    return true;
+  }
+  if (call.resume_original_) {
+    if (installed == installed_calls_.end() ||
+        !memory_.copy_in(entry, installed->second.original)) {
+      return false;
+    }
+    const bool original_thumb = installed->second.thumb;
+    cpu.invalidate_cache_range(entry, installed->second.original.size());
+    if (const auto symbol_entry = installed_symbols_.find(symbol);
+        symbol_entry != installed_symbols_.end() &&
+        symbol_entry->second == entry) {
+      installed_symbols_.erase(symbol_entry);
+    }
+    installed_calls_.erase(installed);
+    registers[15] = entry;
+    auto cpsr = cpu.cpsr();
+    if (original_thumb) {
+      cpsr |= arm_thumb_state_bit;
+    } else {
+      cpsr &= ~arm_thumb_state_bit;
+    }
+    cpu.set_cpsr(cpsr);
+    return true;
+  }
+
+  const auto return_address = registers[14];
+  registers[15] = return_address & ~1U;
+  auto cpsr = cpu.cpsr();
+  if ((return_address & 1U) != 0) {
+    cpsr |= arm_thumb_state_bit;
+  } else {
+    cpsr &= ~arm_thumb_state_bit;
+  }
+  cpu.set_cpsr(cpsr);
+  return true;
+}
+
+std::uint32_t UserlandHleRegistry::ensure_string_page() {
+  if (string_page_ != 0 &&
+      memory_.mapped(string_page_, AddressSpace::page_size)) {
+    return string_page_;
+  }
+  for (std::uint32_t candidate = first_string_page_candidate;
+       candidate >= lowest_string_page_candidate;
+       candidate -= AddressSpace::page_size) {
+    if (memory_.mapped(candidate, AddressSpace::page_size))
+      continue;
+    if (memory_.map(candidate, AddressSpace::page_size,
+                    MemoryPermission::Read)) {
+      string_page_ = candidate;
+      string_cursor_ = candidate;
+      return candidate;
+    }
+  }
+  return 0;
+}
+
+std::uint32_t UserlandHleRegistry::intern_string(std::string_view value) {
+  if (const auto existing = interned_strings_.find(value);
+      existing != interned_strings_.end()) {
+    return existing->second;
+  }
+  if (ensure_string_page() == 0 ||
+      value.size() + 1U > AddressSpace::page_size ||
+      string_cursor_ - string_page_ >
+          AddressSpace::page_size - (value.size() + 1U)) {
+    return 0;
+  }
+  std::vector<std::byte> bytes;
+  bytes.reserve(value.size() + 1U);
+  for (const auto character : value) {
+    bytes.push_back(static_cast<std::byte>(character));
+  }
+  bytes.push_back(std::byte{});
+  const auto address = string_cursor_;
+  if (!memory_.copy_in(address, bytes))
+    return 0;
+  string_cursor_ += static_cast<std::uint32_t>(bytes.size());
+  interned_strings_.emplace(value, address);
+  return address;
+}
+
+std::uint32_t UserlandHleRegistry::allocate_data(std::size_t size,
+                                                 std::size_t alignment) {
+  if (size == 0 || size > std::numeric_limits<std::uint32_t>::max() ||
+      alignment == 0 || (alignment & (alignment - 1U)) != 0 ||
+      alignment > AddressSpace::page_size) {
+    return 0;
+  }
+
+  const auto size32 = static_cast<std::uint32_t>(size);
+  const auto alignment32 = static_cast<std::uint32_t>(alignment);
+  auto candidate = data_cursor_ == 0 ? first_data_page_candidate : data_cursor_;
+  while (candidate < data_region_end) {
+    const auto aligned64 =
+        (static_cast<std::uint64_t>(candidate) + alignment32 - 1U) &
+        ~static_cast<std::uint64_t>(alignment32 - 1U);
+    if (aligned64 > std::numeric_limits<std::uint32_t>::max())
+      return 0;
+    const auto aligned = static_cast<std::uint32_t>(aligned64);
+    if (size32 > data_region_end - aligned)
+      return 0;
+    const auto last = aligned + size32 - 1U;
+    const auto first_page = aligned & ~(AddressSpace::page_size - 1U);
+    const auto last_page = last & ~(AddressSpace::page_size - 1U);
+
+    bool collision = false;
+    std::uint32_t collision_page = 0;
+    for (std::uint64_t page = first_page; page <= last_page;
+         page += AddressSpace::page_size) {
+      const auto page32 = static_cast<std::uint32_t>(page);
+      if (!data_pages_.contains(page32) && memory_.mapped(page32)) {
+        collision = true;
+        collision_page = page32;
+        break;
+      }
+    }
+    if (collision) {
+      candidate = collision_page + AddressSpace::page_size;
+      continue;
+    }
+
+    for (std::uint64_t page = first_page; page <= last_page;
+         page += AddressSpace::page_size) {
+      const auto page32 = static_cast<std::uint32_t>(page);
+      if (data_pages_.contains(page32))
+        continue;
+      if (!memory_.map(page32, AddressSpace::page_size,
+                       MemoryPermission::Read | MemoryPermission::Write)) {
+        return 0;
+      }
+      data_pages_.insert(page32);
+    }
+    data_cursor_ = aligned + size32;
+    return aligned;
+  }
+  return 0;
+}
+
+std::optional<std::uint32_t>
+UserlandHleRegistry::symbol_address(std::string_view symbol) const {
+  const auto found = installed_symbols_.find(symbol);
+  return found == installed_symbols_.end()
+             ? std::nullopt
+             : std::optional<std::uint32_t>{found->second};
+}
+
+bool UserlandHleRegistry::image_loaded(std::string_view image_suffix) const {
+  return std::any_of(loaded_images_.begin(), loaded_images_.end(),
+                     [image_suffix](const std::string &image) {
+                       return path_has_suffix(image, image_suffix);
+                     });
+}
+
+bool UserlandHleRegistry::image_loaded_beneath(
+    std::string_view directory) const {
+  if (directory.empty())
+    return false;
+  return std::any_of(loaded_images_.begin(), loaded_images_.end(),
+                     [directory](const std::string &image) {
+                       const auto position = image.find(directory);
+                       return position != std::string::npos &&
+                              (position == 0 || image[position - 1U] == '/');
+                     });
+}
+
+void UserlandHleRegistry::record_loaded_image(std::string image_path) {
+  loaded_images_.insert(std::move(image_path));
+}
+
+void UserlandHleRegistry::reset_mappings() {
+  installed_calls_.clear();
+  installed_symbols_.clear();
+  loaded_images_.clear();
+  interned_strings_.clear();
+  string_page_ = 0;
+  string_cursor_ = 0;
+  data_pages_.clear();
+  data_cursor_ = 0;
+  persistent_trampolines_.clear();
+  persistent_trampoline_cursor_ = 0x60000000U;
+  traced_symbols_.clear();
+}
+
+void UserlandHleRegistry::inherit_mappings(const UserlandHleRegistry &parent) {
+  installed_calls_ = parent.installed_calls_;
+  installed_symbols_ = parent.installed_symbols_;
+  loaded_images_ = parent.loaded_images_;
+  interned_strings_ = parent.interned_strings_;
+  string_page_ = parent.string_page_;
+  string_cursor_ = parent.string_cursor_;
+  data_pages_ = parent.data_pages_;
+  data_cursor_ = parent.data_cursor_;
+  persistent_trampolines_ = parent.persistent_trampolines_;
+  persistent_trampoline_cursor_ = parent.persistent_trampoline_cursor_;
+}
+
+} // namespace ilegacysim

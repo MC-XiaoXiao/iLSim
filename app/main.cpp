@@ -1,0 +1,1618 @@
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <filesystem>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+#include <dynarmic/interface/A32/disassembler.h>
+
+#include "ilegacysim/address_space.hpp"
+#include "ilegacysim/baseband_replay.hpp"
+#include "ilegacysim/cpu.hpp"
+#include "ilegacysim/darwin_abi.hpp"
+#include "ilegacysim/device_profile.hpp"
+#include "ilegacysim/display.hpp"
+#include "ilegacysim/frame_file_presenter.hpp"
+#include "ilegacysim/gdb_rsp.hpp"
+#include "ilegacysim/kernel.hpp"
+#include "ilegacysim/live_control.hpp"
+#include "ilegacysim/live_touch_scheduler.hpp"
+#include "ilegacysim/lockdown_profile.hpp"
+#include "ilegacysim/mach_thread_policy_abi.hpp"
+#include "ilegacysim/macho.hpp"
+#include "ilegacysim/output.hpp"
+#include "ilegacysim/process_loader.hpp"
+#include "ilegacysim/realtime_pacer.hpp"
+#include "ilegacysim/sdl_display.hpp"
+#include "ilegacysim/touch_replay.hpp"
+#include "ilegacysim/xnu_scheduler.hpp"
+
+namespace {
+
+using namespace ilegacysim;
+
+constexpr std::size_t fault_stack_word_count = 32;
+constexpr std::size_t maximum_watchpoint_traces = 64;
+constexpr std::size_t maximum_guest_threads = 16;
+constexpr std::size_t maximum_virtual_processors = 64;
+constexpr std::size_t arm_thumb_breakpoint_size = 2;
+constexpr std::size_t arm_breakpoint_size = 4;
+constexpr auto interactive_maximum_sleep = std::chrono::milliseconds{1};
+
+struct PendingExec {
+  std::size_t processor{};
+  std::string path;
+  std::vector<std::string> arguments;
+  std::vector<std::string> environment;
+};
+
+struct Runtime {
+  std::unique_ptr<AddressSpace> memory;
+  std::unique_ptr<CpuCluster> cpus;
+  std::unique_ptr<CompatibilityKernel> kernel;
+  std::vector<bool> allocated;
+  std::optional<PendingExec> pending_exec;
+};
+
+struct PreparedGuestSlice {
+  XnuScheduledSlice scheduled;
+  Runtime *runtime{};
+  std::size_t thread_index{};
+  Cpu *cpu{};
+  std::uint64_t tick_budget{};
+  bool single_step{};
+  CpuRunResult result;
+  std::exception_ptr error;
+};
+
+class BootGdbTarget final : public GdbTarget {
+public:
+  explicit BootGdbTarget(std::vector<std::unique_ptr<Runtime>> &runtimes)
+      : runtimes_{runtimes} {}
+
+  [[nodiscard]] std::vector<GdbThreadId> threads() const override {
+    std::vector<GdbThreadId> result;
+    for (const auto &runtime : runtimes_) {
+      for (std::size_t processor = 0; processor < runtime->allocated.size();
+           ++processor) {
+        if (runtime->allocated[processor]) {
+          result.push_back(
+              GdbThreadId{runtime->kernel->process().pid,
+                          static_cast<std::uint32_t>(processor + 1U)});
+        }
+      }
+    }
+    return result;
+  }
+
+  [[nodiscard]] std::optional<GdbThreadId> current_thread() const override {
+    return current_thread_;
+  }
+
+  void set_current_thread(GdbThreadId thread) { current_thread_ = thread; }
+
+  [[nodiscard]] std::optional<std::string>
+  thread_extra_info(GdbThreadId thread) const override {
+    const auto selected = find_thread(thread);
+    if (!selected)
+      return std::nullopt;
+    return "pid " + std::to_string(thread.process) + " thread " +
+           std::to_string(thread.thread) +
+           " wait=" + selected->first->kernel->wait_reason(selected->second);
+  }
+
+  [[nodiscard]] std::optional<GdbArmRegisters>
+  read_registers(GdbThreadId thread) const override {
+    const auto selected = find_thread(thread);
+    if (!selected)
+      return std::nullopt;
+    GdbArmRegisters result{};
+    const auto &cpu = selected->first->cpus->cpu(selected->second);
+    std::copy(cpu.registers().begin(), cpu.registers().end(), result.begin());
+    result[gdb_arm_cpsr_register] = cpu.cpsr();
+    return result;
+  }
+
+  bool write_registers(GdbThreadId thread,
+                       const GdbArmRegisters &registers) override {
+    const auto selected = find_thread(thread);
+    if (!selected)
+      return false;
+    auto &cpu = selected->first->cpus->cpu(selected->second);
+    std::copy_n(registers.begin(), gdb_arm_general_register_count,
+                cpu.registers().begin());
+    cpu.set_cpsr(registers[gdb_arm_cpsr_register]);
+    return true;
+  }
+
+  [[nodiscard]] std::optional<std::vector<std::byte>>
+  read_memory(GdbThreadId thread, std::uint32_t address,
+              std::size_t size) const override {
+    const auto selected = find_thread(thread);
+    return selected ? selected->first->memory->read_bytes(address, size)
+                    : std::nullopt;
+  }
+
+  bool write_memory(GdbThreadId thread, std::uint32_t address,
+                    std::span<const std::byte> bytes) override {
+    const auto selected = find_thread(thread);
+    if (!selected || !selected->first->memory->copy_in(address, bytes))
+      return false;
+    clear_process_cache(*selected->first);
+    return true;
+  }
+
+  bool insert_software_breakpoint(GdbThreadId thread, std::uint32_t address,
+                                  std::size_t kind) override {
+    const auto selected = find_thread(thread);
+    if (!selected ||
+        (kind != arm_thumb_breakpoint_size && kind != arm_breakpoint_size) ||
+        (address & static_cast<std::uint32_t>(kind - 1U)) != 0) {
+      return false;
+    }
+    const auto key = std::pair{thread.process, address};
+    if (const auto existing = breakpoints_.find(key);
+        existing != breakpoints_.end()) {
+      return existing->second.kind == kind;
+    }
+    const auto original = selected->first->memory->read_bytes(address, kind);
+    if (!original)
+      return false;
+    static constexpr std::array<std::byte, arm_thumb_breakpoint_size>
+        thumb_breakpoint{std::byte{0x00}, std::byte{0xbe}};
+    static constexpr std::array<std::byte, arm_breakpoint_size> arm_breakpoint{
+        std::byte{0x70}, std::byte{0x00}, std::byte{0x20}, std::byte{0xe1}};
+    const auto instruction = kind == arm_thumb_breakpoint_size
+                                 ? std::span<const std::byte>{thumb_breakpoint}
+                                 : std::span<const std::byte>{arm_breakpoint};
+    if (!selected->first->memory->copy_in(address, instruction))
+      return false;
+    breakpoints_.emplace(key, BreakpointRecord{kind, std::move(*original)});
+    clear_process_cache(*selected->first);
+    return true;
+  }
+
+  bool remove_software_breakpoint(GdbThreadId thread, std::uint32_t address,
+                                  std::size_t kind) override {
+    const auto selected = find_thread(thread);
+    const auto breakpoint = breakpoints_.find({thread.process, address});
+    if (!selected || breakpoint == breakpoints_.end() ||
+        breakpoint->second.kind != kind ||
+        !selected->first->memory->copy_in(address,
+                                          breakpoint->second.original)) {
+      return false;
+    }
+    breakpoints_.erase(breakpoint);
+    clear_process_cache(*selected->first);
+    return true;
+  }
+
+  void prepare_fork_child(std::uint32_t parent_pid,
+                          AddressSpace &child_memory) const {
+    for (const auto &[key, breakpoint] : breakpoints_) {
+      if (key.first == parent_pid) {
+        static_cast<void>(
+            child_memory.copy_in(key.second, breakpoint.original));
+      }
+    }
+  }
+
+  void notify_exec(std::uint32_t process) {
+    std::erase_if(breakpoints_, [process](const auto &item) {
+      return item.first.first == process;
+    });
+  }
+
+  void remove_all_breakpoints() {
+    for (const auto &[key, breakpoint] : breakpoints_) {
+      for (const auto &runtime : runtimes_) {
+        if (runtime->kernel->process().pid == key.first) {
+          static_cast<void>(
+              runtime->memory->copy_in(key.second, breakpoint.original));
+          clear_process_cache(*runtime);
+          break;
+        }
+      }
+    }
+    breakpoints_.clear();
+  }
+
+private:
+  struct BreakpointRecord {
+    std::size_t kind{};
+    std::vector<std::byte> original;
+  };
+
+  [[nodiscard]] std::optional<std::pair<Runtime *, std::size_t>>
+  find_thread(GdbThreadId thread) const {
+    if (thread.thread == 0)
+      return std::nullopt;
+    const auto processor = static_cast<std::size_t>(thread.thread - 1U);
+    for (const auto &runtime : runtimes_) {
+      if (runtime->kernel->process().pid == thread.process &&
+          processor < runtime->allocated.size() &&
+          runtime->allocated[processor]) {
+        return std::pair{runtime.get(), processor};
+      }
+    }
+    return std::nullopt;
+  }
+
+  static void clear_process_cache(Runtime &runtime) {
+    for (std::size_t processor = 0; processor < runtime.cpus->size();
+         ++processor) {
+      runtime.cpus->cpu(processor).clear_cache();
+    }
+  }
+
+  std::vector<std::unique_ptr<Runtime>> &runtimes_;
+  std::optional<GdbThreadId> current_thread_;
+  std::map<std::pair<std::uint32_t, std::uint32_t>, BreakpointRecord>
+      breakpoints_;
+};
+
+std::string usage() {
+  return "Usage:\n"
+         "  ilegacysim profile [--output FILE]\n"
+         "  ilegacysim inspect --rootfs DIR [--binary /sbin/launchd] "
+         "[--symbols SUBSTRING] [--output FILE]\n"
+         "  ilegacysim disasm --rootfs DIR --binary PATH "
+         "(--symbol NAME | --address ADDR) [--count N] [--thumb]\n"
+         "  ilegacysim boot --rootfs DIR [--binary /sbin/launchd] [--ticks N] "
+         "[--cores N] [--watch-address ADDR] [--gdb PORT] "
+         "[--display headless|sdl] [--network isolated|loopback|host] "
+         "[--activation activated|unactivated|preserve] "
+         "[--frame-output FILE] [--touch-replay FILE] [--control-stdin] "
+         "[--baseband-input FILE] [--baseband-output FILE] "
+         "[--output FILE]\n"
+         "  ilegacysim smoke [--cores N] [--output FILE]\n";
+}
+
+std::optional<std::string> option(const std::vector<std::string> &args,
+                                  std::string_view name) {
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    if (args[i] == name) {
+      if (i + 1 >= args.size()) {
+        throw std::runtime_error{"missing value for " + std::string{name}};
+      }
+      return args[i + 1];
+    }
+  }
+  return std::nullopt;
+}
+
+std::unique_ptr<Output> make_output(const std::vector<std::string> &args) {
+  if (const auto path = option(args, "--output")) {
+    return std::make_unique<Output>(*path);
+  }
+  return std::make_unique<Output>(std::cout);
+}
+
+void profile(Output &output) {
+  const auto &device = DeviceProfile::iphone_2g_1_0();
+  std::ostringstream text;
+  text << "product: " << device.product_type << '\n'
+       << "board: " << device.board_config << '\n'
+       << "soc: " << device.soc << '\n'
+       << "cpu: " << device.cpu_core << " (" << device.instruction_set << ")\n"
+       << "cpu_hz: " << device.cpu_hz << '\n'
+       << "ram_bytes: " << device.ram_bytes << '\n'
+       << "physical_cpu_count: " << device.physical_cpu_count << '\n'
+       << "display: " << device.display_width << 'x' << device.display_height;
+  output.line(text.str());
+}
+
+void inspect(const std::vector<std::string> &args, Output &output) {
+  const auto rootfs = option(args, "--rootfs");
+  if (!rootfs) {
+    throw std::runtime_error{"inspect requires --rootfs"};
+  }
+  const auto guest_binary = option(args, "--binary").value_or("/sbin/launchd");
+  std::filesystem::path relative = guest_binary;
+  if (relative.is_absolute()) {
+    relative = relative.relative_path();
+  }
+  const auto host_path = std::filesystem::path{*rootfs} / relative;
+  const auto image = MachOImage::parse(host_path);
+
+  std::ostringstream text;
+  text << "path: " << host_path.string() << '\n'
+       << "cpu: " << mach_cpu_name(image.cpu_type(), image.cpu_subtype())
+       << '\n'
+       << "file_type: " << mach_file_type_name(image.file_type()) << '\n'
+       << "load_commands: " << image.command_count() << '\n'
+       << "entry: ";
+  if (image.entry_point()) {
+    text << "0x" << std::hex << *image.entry_point() << std::dec;
+  } else {
+    text << "unknown";
+  }
+  text << '\n' << "dyld: " << image.dynamic_linker().value_or("none") << '\n';
+  for (const auto &segment : image.segments()) {
+    text << "segment " << segment.name << " vm=0x" << std::hex
+         << segment.vm_address << " size=0x" << segment.vm_size << " file=0x"
+         << segment.file_offset << "+0x" << segment.file_size << std::dec
+         << '\n';
+    for (const auto &section : segment.sections) {
+      text << "  section " << section.segment << ',' << section.name << " vm=0x"
+           << std::hex << section.address << " size=0x" << section.size
+           << " file=0x" << section.file_offset << " flags=0x" << section.flags
+           << " reserved1=0x" << section.reserved1 << " reserved2=0x"
+           << section.reserved2 << std::dec << '\n';
+    }
+  }
+  for (const auto &dylib : image.dylibs()) {
+    text << (dylib.prebound ? "prebound " : "dylib ") << dylib.path << '\n';
+  }
+  if (!image.unknown_commands().empty()) {
+    text << "unknown_commands:";
+    for (const auto command : image.unknown_commands()) {
+      text << " 0x" << std::hex << command;
+    }
+    text << std::dec << '\n';
+  }
+  if (const auto pattern = option(args, "--symbols")) {
+    for (const auto &symbol : image.symbols()) {
+      if (symbol.name.find(*pattern) == std::string::npos)
+        continue;
+      text << "symbol " << symbol.name << " vm=0x" << std::hex << symbol.value
+           << " type=0x" << static_cast<unsigned>(symbol.type) << " section=0x"
+           << static_cast<unsigned>(symbol.section) << " desc=0x"
+           << symbol.description << (symbol.thumb_definition() ? " thumb" : "")
+           << std::dec << '\n';
+    }
+    for (const auto &stub : image.stubs()) {
+      if (stub.symbol.find(*pattern) == std::string::npos)
+        continue;
+      text << "stub " << stub.symbol << " vm=0x" << std::hex << stub.address
+           << " size=0x" << stub.size << std::dec << '\n';
+    }
+  }
+
+  AddressSpace memory;
+  image.map_into(memory);
+  text << "mapped_pages: " << memory.mapped_page_count();
+  output.line(text.str());
+}
+
+void append_word(std::array<std::byte, 8> &code, std::size_t offset,
+                 std::uint32_t word) {
+  for (std::size_t i = 0; i < 4; ++i) {
+    code[offset + i] = static_cast<std::byte>((word >> (i * 8U)) & 0xffU);
+  }
+}
+
+void disasm(const std::vector<std::string> &args, Output &output) {
+  const auto rootfs = option(args, "--rootfs");
+  const auto binary = option(args, "--binary");
+  const auto symbol_name = option(args, "--symbol");
+  const auto address_option = option(args, "--address");
+  if (!rootfs || !binary || (!symbol_name && !address_option) ||
+      (symbol_name && address_option)) {
+    throw std::runtime_error{"disasm requires --rootfs, --binary, and exactly "
+                             "one of --symbol/--address"};
+  }
+  std::filesystem::path relative = *binary;
+  if (relative.is_absolute())
+    relative = relative.relative_path();
+  const auto image =
+      MachOImage::parse(std::filesystem::path{*rootfs} / relative);
+  const MachSymbol *symbol = nullptr;
+  std::uint32_t start_address = 0;
+  if (symbol_name) {
+    symbol = image.find_symbol(*symbol_name);
+    if (symbol == nullptr || symbol->value == 0) {
+      throw std::runtime_error{"defined symbol not found: " + *symbol_name};
+    }
+    start_address = symbol->value;
+  } else {
+    start_address =
+        static_cast<std::uint32_t>(std::stoul(*address_option, nullptr, 0));
+    for (const auto &candidate : image.symbols()) {
+      if (candidate.value != 0 && candidate.value <= start_address &&
+          (symbol == nullptr || candidate.value > symbol->value)) {
+        symbol = &candidate;
+      }
+    }
+  }
+  const auto count = static_cast<std::size_t>(
+      std::stoul(option(args, "--count").value_or("8")));
+  const auto thumb =
+      std::find(args.begin(), args.end(), "--thumb") != args.end();
+  std::ostringstream text;
+  if (symbol != nullptr) {
+    text << symbol->name;
+    if (start_address != symbol->value) {
+      text << "+0x" << std::hex << (start_address - symbol->value) << std::dec;
+    }
+    text << " @ ";
+  }
+  text << "0x" << std::hex << start_address << std::dec << '\n';
+  for (std::size_t index = 0; index < count; ++index) {
+    if (thumb) {
+      const auto address =
+          start_address + static_cast<std::uint32_t>(index * 2U);
+      const auto instruction = image.read_vm_u16(address);
+      if (!instruction)
+        break;
+      text << "0x" << std::hex << std::setw(8) << std::setfill('0') << address
+           << "  " << std::setw(4) << *instruction << "      "
+           << Dynarmic::A32::DisassembleThumb16(*instruction) << '\n';
+    } else {
+      const auto address =
+          start_address + static_cast<std::uint32_t>(index * 4U);
+      const auto instruction = image.read_vm_u32(address);
+      if (!instruction)
+        break;
+      text << "0x" << std::hex << std::setw(8) << std::setfill('0') << address
+           << "  " << std::setw(8) << *instruction << "  "
+           << Dynarmic::A32::DisassembleArm(*instruction);
+      if ((*instruction & 0x0f000000U) == 0x0b000000U) {
+        auto displacement = static_cast<std::int32_t>(*instruction << 8U) >> 6U;
+        const auto target =
+            address + 8U + static_cast<std::uint32_t>(displacement);
+        if (const auto *stub = image.find_stub(target)) {
+          text << " ; " << stub->symbol;
+        }
+      }
+      text << '\n';
+    }
+  }
+  output.write(text.str());
+}
+
+void smoke(const std::vector<std::string> &args, Output &output) {
+  const auto core_count_string = option(args, "--cores").value_or("2");
+  const auto core_count =
+      static_cast<std::size_t>(std::stoul(core_count_string));
+  if (core_count == 0 || core_count > maximum_virtual_processors) {
+    throw std::runtime_error{"--cores must be in the range 1.." +
+                             std::to_string(maximum_virtual_processors)};
+  }
+
+  AddressSpace memory;
+  constexpr std::uint32_t code_address = 0x1000;
+  memory.map(code_address, AddressSpace::page_size,
+             MemoryPermission::Read | MemoryPermission::Write |
+                 MemoryPermission::Execute);
+  std::array<std::byte, 8> code{};
+  append_word(code, 0, 0xe2800001U); // add r0, r0, #1
+  append_word(code, 4, 0xef000080U); // svc #0x80 (Darwin syscall gate)
+  memory.copy_in(code_address, code);
+
+  CpuCluster cluster{core_count, memory};
+  for (std::size_t index = 0; index < cluster.size(); ++index) {
+    cluster.cpu(index).registers()[0] = static_cast<std::uint32_t>(index * 100);
+    cluster.cpu(index).registers()[15] = code_address;
+    cluster.cpu(index).set_cpsr(0x10); // ARM user mode, ARM state
+  }
+  const auto results = cluster.run_parallel(16);
+
+  std::ostringstream text;
+  text << "Dynarmic ARMv6 parallel smoke test: " << core_count
+       << " virtual CPU(s)\n";
+  for (std::size_t index = 0; index < cluster.size(); ++index) {
+    text << "cpu" << index << " r0=" << cluster.cpu(index).registers()[0]
+         << " pc=0x" << std::hex << cluster.cpu(index).registers()[15]
+         << std::dec << " svc="
+         << (results[index].svc ? std::to_string(*results[index].svc) : "none")
+         << '\n';
+    const auto expected = static_cast<std::uint32_t>(index * 100 + 1);
+    if (cluster.cpu(index).registers()[0] != expected ||
+        results[index].svc != std::optional<std::uint32_t>{0x80}) {
+      throw std::runtime_error{
+          "Dynarmic smoke test produced an unexpected CPU state"};
+    }
+  }
+  text << "status: ok";
+  output.line(text.str());
+}
+
+void boot(const std::vector<std::string> &args, Output &output) {
+  const auto rootfs = option(args, "--rootfs");
+  if (!rootfs) {
+    throw std::runtime_error{"boot requires --rootfs"};
+  }
+  const auto binary = option(args, "--binary").value_or("/sbin/launchd");
+  const auto activation_value =
+      option(args, "--activation").value_or("activated");
+  const auto activation = parse_lockdown_activation(activation_value);
+  if (!activation) {
+    throw std::runtime_error{
+        "--activation must be activated, unactivated, or preserve"};
+  }
+  const auto activation_result = apply_lockdown_profile(*rootfs, *activation);
+  output.line("[device-state] activation=" + activation_value +
+              " path=" + activation_result.path.string() +
+              " changed=" + std::to_string(activation_result.changed));
+  const auto ticks_option = option(args, "--ticks");
+  const auto bounded_execution = ticks_option.has_value();
+  const auto ticks = ticks_option ? std::stoull(*ticks_option)
+                                  : std::numeric_limits<std::uint64_t>::max();
+  const auto default_processor_count =
+      DeviceProfile::iphone_2g_1_0().physical_cpu_count;
+  const auto guest_processor_count = static_cast<std::size_t>(
+      std::stoul(option(args, "--cores")
+                     .value_or(std::to_string(default_processor_count))));
+  if (guest_processor_count == 0 ||
+      guest_processor_count > maximum_virtual_processors) {
+    throw std::runtime_error{"--cores must be in the range 1.." +
+                             std::to_string(maximum_virtual_processors)};
+  }
+  const auto network_policy_value =
+      option(args, "--network").value_or("isolated");
+  const auto network_policy = parse_host_network_policy(network_policy_value);
+  if (!network_policy) {
+    throw std::runtime_error{"--network must be isolated, loopback, or host"};
+  }
+  const auto display_mode = option(args, "--display").value_or("headless");
+  if (display_mode != "headless" && display_mode != "sdl") {
+    throw std::runtime_error{"--display must be headless or sdl"};
+  }
+  std::unique_ptr<SdlDisplay> sdl_display;
+  std::unique_ptr<FrameFilePresenter> frame_file_presenter;
+  std::unique_ptr<TouchReplay> touch_replay;
+  std::unique_ptr<LiveControl> live_control;
+  LiveTouchScheduler live_touch_scheduler;
+  if (display_mode == "sdl") {
+    if (!SdlDisplay::available()) {
+      throw std::runtime_error{
+          "--display sdl requested, but SDL2 support is not built"};
+    }
+    sdl_display = std::make_unique<SdlDisplay>();
+  }
+  if (const auto path = option(args, "--frame-output")) {
+    frame_file_presenter = std::make_unique<FrameFilePresenter>(*path);
+  }
+  if (const auto path = option(args, "--touch-replay")) {
+    touch_replay = std::make_unique<TouchReplay>(*path);
+  }
+  if (std::find(args.begin(), args.end(), "--control-stdin") != args.end()) {
+    live_control = std::make_unique<LiveControl>(0);
+    output.line("[control] ready; use help for commands");
+  }
+  std::optional<std::uint16_t> gdb_port;
+  if (const auto value = option(args, "--gdb")) {
+    const auto parsed = std::stoul(*value);
+    if (parsed == 0 || parsed > std::numeric_limits<std::uint16_t>::max()) {
+      throw std::runtime_error{
+          "--gdb must be a TCP port in the range 1..65535"};
+    }
+    gdb_port = static_cast<std::uint16_t>(parsed);
+  }
+  std::optional<std::uint32_t> watch_address;
+  if (const auto value = option(args, "--watch-address")) {
+    const auto parsed = std::stoull(*value, nullptr, 0);
+    if (parsed > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error{
+          "--watch-address exceeds the 32-bit guest address space"};
+    }
+    watch_address = static_cast<std::uint32_t>(parsed);
+  }
+  const auto baseband_input_path = option(args, "--baseband-input");
+  const auto baseband_output_path = option(args, "--baseband-output");
+  const auto baseband_input =
+      baseband_input_path
+          ? bsd::baseband_device::load_replay_file(*baseband_input_path)
+          : std::vector<std::byte>{};
+
+  auto initial_memory = std::make_unique<AddressSpace>();
+  ProcessLoader loader{*rootfs, *initial_memory};
+  auto process = loader.load(binary);
+  std::vector<std::unique_ptr<Runtime>> runtimes;
+  auto initial = std::make_unique<Runtime>();
+  initial->memory = std::move(initial_memory);
+  initial->cpus =
+      std::make_unique<CpuCluster>(maximum_guest_threads, *initial->memory);
+  initial->kernel =
+      std::make_unique<CompatibilityKernel>(*initial->memory, output, *rootfs);
+  initial->kernel->enqueue_baseband_input(baseband_input);
+  if (baseband_input_path) {
+    output.line("[baseband] replay input=" + *baseband_input_path +
+                " bytes=" + std::to_string(baseband_input.size()));
+  }
+  if (sdl_display) {
+    initial->kernel->set_display_presenter(
+        [backend = sdl_display.get()](const DisplayFrame &frame) {
+          backend->present(frame);
+        });
+  } else if (frame_file_presenter) {
+    initial->kernel->set_display_presenter(
+        [backend = frame_file_presenter.get(),
+         &output](const DisplayFrame &frame) {
+          backend->present(frame);
+          const auto visible = std::count_if(
+              frame.pixels.begin(), frame.pixels.end(),
+              [](std::uint32_t pixel) { return (pixel & 0x00ffffffU) != 0; });
+          output.line("[display] frame=" + std::to_string(frame.sequence) +
+                      " visible-pixels=" + std::to_string(visible));
+        });
+  }
+  initial->allocated.assign(maximum_guest_threads, false);
+  Runtime *initial_runtime = initial.get();
+  runtimes.push_back(std::move(initial));
+  BootGdbTarget debug_target{runtimes};
+  XnuScheduler scheduler{xnu792::scheduler::standard_quantum_ticks,
+                         xnu792::scheduler::scheduler_tick_interval,
+                         guest_processor_count};
+
+  std::uint32_t next_pid = 2;
+  std::size_t watchpoint_trace_count = 0;
+  std::mutex watchpoint_mutex;
+  std::function<void(Runtime &)> configure_runtime;
+  configure_runtime = [&](Runtime &runtime) {
+    auto *runtime_ptr = &runtime;
+    runtime.kernel->set_host_network_policy(*network_policy);
+    if (!runtime.kernel->set_virtual_processor_count(guest_processor_count)) {
+      throw std::runtime_error{"invalid virtual processor topology"};
+    }
+    for (std::size_t index = 0; index < runtime.cpus->size(); ++index) {
+      auto &cpu = runtime.cpus->cpu(index);
+      runtime.kernel->attach(cpu);
+      cpu.set_svc_dispatch_mode(guest_processor_count > 1
+                                    ? SvcDispatchMode::Deferred
+                                    : SvcDispatchMode::Immediate);
+      cpu.set_debug_breakpoints_enabled(gdb_port.has_value());
+      if (watch_address) {
+        cpu.set_memory_write_watchpoint(
+            *watch_address,
+            [&, runtime_ptr](Cpu &source, std::uint32_t address,
+                             std::size_t size, std::uint64_t value) {
+              const std::scoped_lock lock{watchpoint_mutex};
+              if (watchpoint_trace_count >= maximum_watchpoint_traces)
+                return;
+              ++watchpoint_trace_count;
+              std::ostringstream message;
+              message << "[watch] pid=" << runtime_ptr->kernel->process().pid
+                      << " cpu=" << source.processor_id() << " pc=0x"
+                      << std::hex << source.registers()[15] << " address=0x"
+                      << address << " size=0x" << size << " value=0x" << value;
+              for (std::size_t register_index = 0; register_index < 4;
+                   ++register_index) {
+                message << " r" << std::dec << register_index << "=0x"
+                        << std::hex << source.registers()[register_index];
+              }
+              message << " sp=0x" << source.registers()[13] << " lr=0x"
+                      << source.registers()[14];
+              output.line(message.str());
+            });
+      }
+    }
+    runtime.kernel->set_thread_create_handler(
+        [runtime_ptr,
+         &scheduler](const std::array<std::uint32_t, 16> &registers,
+                     std::uint32_t cpsr) -> std::optional<std::size_t> {
+          for (std::size_t index = 1; index < runtime_ptr->cpus->size();
+               ++index) {
+            if (runtime_ptr->allocated[index])
+              continue;
+            auto &child = runtime_ptr->cpus->cpu(index);
+            child.reset();
+            child.registers() = registers;
+            child.set_cpsr(cpsr);
+            runtime_ptr->allocated[index] = true;
+            const auto registered = scheduler.register_thread(
+                XnuThreadId{runtime_ptr->kernel->process().pid,
+                            static_cast<std::uint32_t>(index)},
+                runtime_ptr->kernel->process().thread_base_priority);
+            if (!registered) {
+              runtime_ptr->allocated[index] = false;
+              return std::nullopt;
+            }
+            return index;
+          }
+          return std::nullopt;
+        });
+    runtime.kernel->set_thread_terminate_handler(
+        [runtime_ptr, &scheduler](std::uint32_t pid, std::size_t processor) {
+          if (pid != runtime_ptr->kernel->process().pid ||
+              processor >= runtime_ptr->allocated.size() ||
+              !runtime_ptr->allocated[processor] ||
+              !scheduler.remove_thread(
+                  XnuThreadId{pid, static_cast<std::uint32_t>(processor)})) {
+            return false;
+          }
+          runtime_ptr->allocated[processor] = false;
+          return true;
+        });
+    runtime.kernel->set_thread_state_query(
+        [&runtimes](std::uint32_t pid, std::uint32_t slot, std::uint32_t flavor)
+            -> std::optional<darwin::arm_thread::GeneralState> {
+          if (flavor != darwin::arm_thread::general_state_flavor) {
+            return std::nullopt;
+          }
+          const auto runtime = std::find_if(
+              runtimes.begin(), runtimes.end(), [pid](const auto &candidate) {
+                return candidate->kernel->process().pid == pid;
+              });
+          if (runtime == runtimes.end() || slot >= (*runtime)->cpus->size() ||
+              slot >= (*runtime)->allocated.size() ||
+              !(*runtime)->allocated[slot]) {
+            return std::nullopt;
+          }
+          const auto &thread = (*runtime)->cpus->cpu(slot);
+          darwin::arm_thread::GeneralState state{};
+          std::copy(thread.registers().begin(), thread.registers().end(),
+                    state.begin());
+          state[darwin::arm_thread::cpsr_index] = thread.cpsr();
+          return state;
+        });
+    runtime.kernel->set_fork_handler(
+        [&, runtime_ptr](Cpu &parent_cpu) -> std::optional<std::uint32_t> {
+          const auto child_pid = next_pid++;
+          auto child = std::make_unique<Runtime>();
+          child->memory = runtime_ptr->memory->clone();
+          debug_target.prepare_fork_child(runtime_ptr->kernel->process().pid,
+                                          *child->memory);
+          child->cpus = std::make_unique<CpuCluster>(maximum_guest_threads,
+                                                     *child->memory);
+          child->kernel = std::make_unique<CompatibilityKernel>(
+              *child->memory, output, *rootfs);
+          child->kernel->inherit_process_state(*runtime_ptr->kernel, child_pid);
+          child->allocated.assign(maximum_guest_threads, false);
+          configure_runtime(*child);
+          auto &child_cpu = child->cpus->cpu(0);
+          child_cpu.registers() = parent_cpu.registers();
+          child_cpu.registers()[0] = 0;
+          child_cpu.set_cpsr(parent_cpu.cpsr() & ~(1U << 29U));
+          child->allocated[0] = true;
+          static_cast<void>(scheduler.register_thread(
+              XnuThreadId{child_pid, 0},
+              child->kernel->process().thread_base_priority));
+          runtimes.push_back(std::move(child));
+          return child_pid;
+        });
+    runtime.kernel->set_exec_handler(
+        [runtime_ptr](Cpu &source, std::string path,
+                      std::vector<std::string> arguments,
+                      std::vector<std::string> environment) {
+          runtime_ptr->pending_exec = PendingExec{
+              source.processor_id(),
+              std::move(path),
+              std::move(arguments),
+              std::move(environment),
+          };
+          return true;
+        });
+    runtime.kernel->set_spawn_exec_handler(
+        [&](std::uint32_t child_pid, std::string path,
+            std::vector<std::string> arguments,
+            std::vector<std::string> environment, bool start_suspended) {
+          const auto child = std::find_if(
+              runtimes.begin(), runtimes.end(),
+              [child_pid](const auto &candidate) {
+                return candidate->kernel->process().pid == child_pid;
+              });
+          if (child == runtimes.end())
+            return false;
+
+          auto &child_runtime = **child;
+          debug_target.notify_exec(child_pid);
+          child_runtime.memory->clear();
+          ProcessLoader loader{*rootfs, *child_runtime.memory};
+          child_runtime.kernel->set_process_arguments(arguments, environment);
+          auto loaded =
+              loader.load(path, std::move(arguments), std::move(environment));
+          child_runtime.kernel->set_process_image(path);
+          child_runtime.kernel->prepare_exec(0);
+          auto &child_cpu = child_runtime.cpus->cpu(0);
+          child_cpu.reset();
+          child_cpu.clear_cache();
+          child_cpu.registers().fill(0);
+          child_cpu.registers()[13] = loaded.stack_pointer;
+          child_cpu.registers()[15] = loaded.entry_point;
+          child_cpu.set_cpsr(0x10);
+          child_runtime.kernel->install_main_image_hle(child_cpu);
+          if (start_suspended) {
+            static_cast<void>(scheduler.block(XnuThreadId{child_pid, 0}));
+          }
+          return true;
+        });
+    runtime.kernel->set_scheduler_runnable_query(
+        [&scheduler] { return scheduler.runnable_count() != 0; });
+    runtime.kernel->set_signal_delivery_handler(
+        [&runtimes, &scheduler](std::uint32_t target_pid,
+                                std::uint32_t signal) {
+          for (auto &target : runtimes) {
+            if (target->kernel->process().pid != target_pid)
+              continue;
+            const auto error = target->kernel->deliver_signal(signal);
+            if (error == 0 && target->kernel->process().exited) {
+              scheduler.remove_process(target_pid);
+            }
+            return error;
+          }
+          return darwin::error::no_such_process;
+        });
+    runtime.kernel->set_scheduler_preemption_query(
+        [runtime_ptr, &scheduler](std::size_t processor) {
+          const XnuThreadId thread{runtime_ptr->kernel->process().pid,
+                                   static_cast<std::uint32_t>(processor)};
+          const auto scheduling_info = scheduler.info(thread);
+          return scheduling_info && scheduling_info->last_processor &&
+                 scheduler.preemption_for(thread,
+                                          *scheduling_info->last_processor) !=
+                     XnuPreemption::None;
+        });
+    runtime.kernel->set_task_priority_handler(
+        [runtime_ptr, &scheduler](std::int32_t priority) {
+          for (std::size_t processor = 0;
+               processor < runtime_ptr->allocated.size(); ++processor) {
+            if (!runtime_ptr->allocated[processor])
+              continue;
+            static_cast<void>(scheduler.set_base_priority(
+                XnuThreadId{runtime_ptr->kernel->process().pid,
+                            static_cast<std::uint32_t>(processor)},
+                priority));
+          }
+        });
+    runtime.kernel->set_thread_policy_handler(
+        [runtime_ptr, &scheduler](std::size_t processor, std::uint32_t flavor,
+                                  std::span<const std::uint32_t> policy) {
+          using namespace darwin::mach::thread_policy;
+          const XnuThreadId thread{runtime_ptr->kernel->process().pid,
+                                   static_cast<std::uint32_t>(processor)};
+          if (flavor == extended_policy &&
+              policy.size() >= extended_policy_word_count) {
+            return scheduler.set_timeshare(thread, policy[0] != 0);
+          }
+          if (flavor == time_constraint_policy &&
+              policy.size() >= time_constraint_policy_word_count) {
+            const auto to_scheduler_ticks = [](std::uint32_t value) {
+              return static_cast<std::uint64_t>(value) *
+                     xnu792::scheduler::default_guest_ticks_per_second /
+                     absolute_time_units_per_second;
+            };
+            return scheduler.set_realtime(
+                thread, to_scheduler_ticks(policy[realtime_period_index]),
+                to_scheduler_ticks(policy[realtime_computation_index]),
+                to_scheduler_ticks(policy[realtime_constraint_index]),
+                policy[realtime_preemptible_index] != 0);
+          }
+          if (flavor == precedence_policy &&
+              policy.size() >= precedence_policy_word_count) {
+            const auto importance = std::bit_cast<std::int32_t>(
+                policy[precedence_importance_index]);
+            return scheduler.set_base_priority(
+                thread, runtime_ptr->kernel->process().thread_base_priority +
+                            importance);
+          }
+          return false;
+        });
+  };
+  configure_runtime(*initial_runtime);
+
+  auto &initial_cpu = initial_runtime->cpus->cpu(0);
+  initial_runtime->allocated[0] = true;
+  static_cast<void>(scheduler.register_thread(
+      XnuThreadId{initial_runtime->kernel->process().pid, 0},
+      initial_runtime->kernel->process().thread_base_priority));
+  initial_cpu.registers()[13] = process.stack_pointer;
+  initial_cpu.registers()[15] = process.entry_point;
+  initial_cpu.set_cpsr(0x10);
+
+  {
+    std::ostringstream message;
+    message << "[loader] main=0x" << std::hex << process.main_header
+            << " dyld_entry=0x" << process.entry_point << " sp=0x"
+            << process.stack_pointer << std::dec
+            << " processors=" << guest_processor_count
+            << " network=" << host_network_policy_name(*network_policy) << '\n';
+    output.write(message.str());
+  }
+  std::uint64_t remaining_ticks = ticks;
+  std::uint64_t consumed_ticks = 0;
+  std::uint32_t stopped_pid = 1;
+  std::size_t stopped_cpu = 0;
+  CpuRunResult stopped_result{};
+  bool hard_stop = false;
+  std::unique_ptr<GdbRemoteServer> gdb_server;
+  std::optional<GdbResumeRequest> debug_request;
+  if (gdb_port) {
+    gdb_server = std::make_unique<GdbRemoteServer>(*gdb_port, output);
+    gdb_server->listen_and_accept();
+    const GdbThreadId initial_thread{1, 1};
+    debug_target.set_current_thread(initial_thread);
+    auto request = gdb_server->command_loop(debug_target, initial_thread);
+    if (request.kind == GdbResumeKind::Detach) {
+      debug_target.remove_all_breakpoints();
+      gdb_server->detach();
+      gdb_server.reset();
+      for (auto &runtime : runtimes) {
+        for (std::size_t processor = 0; processor < runtime->cpus->size();
+             ++processor) {
+          runtime->cpus->cpu(processor).set_debug_breakpoints_enabled(false);
+        }
+      }
+    } else if (request.kind == GdbResumeKind::Kill) {
+      hard_stop = true;
+    } else {
+      debug_request = request;
+    }
+  }
+  if (touch_replay) {
+    touch_replay->start();
+  }
+  std::optional<RealtimePacer> realtime_pacer;
+  if (!bounded_execution) {
+    realtime_pacer.emplace(initial_runtime->kernel->current_absolute_time());
+    output.line("[clock] mode=realtime");
+  }
+  while ((!bounded_execution || remaining_ticks != 0) &&
+         !initial_runtime->kernel->process().exited && !hard_stop) {
+    if (sdl_display && !sdl_display->poll_events()) {
+      hard_stop = true;
+      break;
+    }
+    if (sdl_display) {
+      for (const auto &input : sdl_display->take_touch_events()) {
+        initial_runtime->kernel->enqueue_touch_input(input);
+      }
+      for (const auto &input : sdl_display->take_button_events()) {
+        initial_runtime->kernel->enqueue_system_button(input);
+      }
+    }
+    if (touch_replay) {
+      for (const auto &input : touch_replay->poll()) {
+        initial_runtime->kernel->enqueue_touch_input(input);
+      }
+    }
+    for (const auto &input : live_touch_scheduler.poll()) {
+      initial_runtime->kernel->enqueue_touch_input(input);
+    }
+    if (live_control) {
+      for (const auto &command : live_control->poll()) {
+        switch (command.kind) {
+        case LiveControlCommandKind::Touch:
+          initial_runtime->kernel->enqueue_touch_input(command.touch);
+          output.line("[control] touch queued");
+          break;
+        case LiveControlCommandKind::Gesture:
+          if (command.wake_display) {
+            initial_runtime->kernel->enqueue_system_button(
+                SystemButtonInput{SystemButton::Home, SystemButtonPhase::Down});
+            initial_runtime->kernel->enqueue_system_button(
+                SystemButtonInput{SystemButton::Home, SystemButtonPhase::Up});
+            output.line("[control] display wake requested before gesture");
+          }
+          live_touch_scheduler.schedule(command.gesture);
+          output.line(
+              "[control] gesture=" + command.message +
+              " scheduled events=" + std::to_string(command.gesture.size()));
+          break;
+        case LiveControlCommandKind::Wake:
+          initial_runtime->kernel->enqueue_system_button(
+              SystemButtonInput{SystemButton::Home, SystemButtonPhase::Down});
+          initial_runtime->kernel->enqueue_system_button(
+              SystemButtonInput{SystemButton::Home, SystemButtonPhase::Up});
+          output.line("[control] display wake requested");
+          break;
+        case LiveControlCommandKind::Lock:
+          initial_runtime->kernel->enqueue_system_button(
+              SystemButtonInput{SystemButton::Lock, SystemButtonPhase::Down});
+          initial_runtime->kernel->enqueue_system_button(
+              SystemButtonInput{SystemButton::Lock, SystemButtonPhase::Up});
+          output.line("[control] display lock requested");
+          break;
+        case LiveControlCommandKind::Snapshot: {
+          FrameFilePresenter snapshot_writer{command.path};
+          const auto frame = initial_runtime->kernel->display_snapshot();
+          snapshot_writer.present(frame);
+          output.line("[control] snapshot=" + command.path.string() +
+                      " frame=" + std::to_string(frame.sequence));
+          break;
+        }
+        case LiveControlCommandKind::Status: {
+          const auto frame = initial_runtime->kernel->display_snapshot();
+          output.line(
+              "[control] status frame=" + std::to_string(frame.sequence) +
+              " processes=" + std::to_string(runtimes.size()) +
+              " threads=" + std::to_string(scheduler.thread_count()) +
+              " runnable=" + std::to_string(scheduler.runnable_count()) +
+              " display-power=" +
+              (initial_runtime->kernel->display_powered_on() ? "on" : "off"));
+          break;
+        }
+        case LiveControlCommandKind::Help:
+          output.line("[control] commands: touch down|move|up|cancel x y; "
+                      "tap x y [hold-ms]; unlock; "
+                      "drag x1 y1 x2 y2 [duration-ms] [steps]; "
+                      "wake; lock; snapshot PATH; status; quit");
+          break;
+        case LiveControlCommandKind::Quit:
+          output.line("[control] quit requested");
+          hard_stop = true;
+          break;
+        case LiveControlCommandKind::Error:
+          output.line("[control] error: " + command.message);
+          break;
+        }
+      }
+      if (hard_stop)
+        break;
+    }
+    if (realtime_pacer) {
+      const auto delay = realtime_pacer->delay_until(
+          initial_runtime->kernel->current_absolute_time());
+      if (delay > std::chrono::nanoseconds::zero()) {
+        std::this_thread::sleep_for(std::min(
+            delay, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       interactive_maximum_sleep)));
+        continue;
+      }
+    }
+    for (auto &runtime : runtimes) {
+      for (std::size_t processor = 0; processor < runtime->cpus->size();
+           ++processor) {
+        const XnuThreadId thread{runtime->kernel->process().pid,
+                                 static_cast<std::uint32_t>(processor)};
+        const auto scheduling_info = scheduler.info(thread);
+        if (!runtime->allocated[processor] || !scheduling_info ||
+            scheduling_info->state != XnuThreadState::Waiting) {
+          continue;
+        }
+        auto &waiting_cpu = runtime->cpus->cpu(processor);
+        if (runtime->kernel->deliver_pending_io(waiting_cpu) ||
+            runtime->kernel->deliver_pending_mach(waiting_cpu)) {
+          static_cast<void>(scheduler.make_runnable(thread));
+        }
+      }
+    }
+    for (auto &parent : runtimes) {
+      const auto pending_waits = parent->kernel->pending_waits();
+      for (const auto &[processor, pending] : pending_waits) {
+        bool has_waitable_child = false;
+        bool completed = false;
+        for (auto &child : runtimes) {
+          const auto &child_process = child->kernel->process();
+          if (child_process.reaped ||
+              child_process.parent_pid != parent->kernel->process().pid ||
+              (pending.target_pid != -1 &&
+               static_cast<std::uint32_t>(pending.target_pid) !=
+                   child_process.pid)) {
+            continue;
+          }
+          has_waitable_child = true;
+          if (!child_process.exited)
+            continue;
+          const auto wait_status =
+              child_process.termination_signal != 0
+                  ? child_process.termination_signal & 0x7fU
+                  : (child_process.exit_status & 0xffU) << 8U;
+          if (parent->kernel->complete_wait(parent->cpus->cpu(processor),
+                                            child_process.pid, wait_status)) {
+            child->kernel->process().reaped = true;
+            static_cast<void>(scheduler.make_runnable(
+                XnuThreadId{parent->kernel->process().pid,
+                            static_cast<std::uint32_t>(processor)}));
+            completed = true;
+          }
+          break;
+        }
+        if (!completed && !has_waitable_child) {
+          if (parent->kernel->fail_wait(parent->cpus->cpu(processor), 10)) {
+            static_cast<void>(scheduler.make_runnable(
+                XnuThreadId{parent->kernel->process().pid,
+                            static_cast<std::uint32_t>(processor)}));
+          }
+        }
+      }
+    }
+    std::optional<XnuThreadId> preferred_thread;
+    if (debug_request && debug_request->thread &&
+        debug_request->thread->thread != 0) {
+      preferred_thread = XnuThreadId{debug_request->thread->process,
+                                     debug_request->thread->thread - 1U};
+    }
+    std::vector<XnuScheduledSlice> scheduled_batch;
+    scheduled_batch.reserve(guest_processor_count);
+    auto reservable_ticks = remaining_ticks;
+    for (std::size_t processor = 0; processor < guest_processor_count;
+         ++processor) {
+      if (bounded_execution && reservable_ticks == 0)
+        break;
+      const auto scheduled = scheduler.choose_next(processor, preferred_thread);
+      if (scheduled) {
+        scheduled_batch.push_back(*scheduled);
+        if (bounded_execution) {
+          reservable_ticks -=
+              std::min(reservable_ticks, scheduled->tick_budget);
+        }
+      }
+      // A debugger-selected thread is the only thread allowed to make
+      // progress for this resume request.
+      if (preferred_thread)
+        break;
+    }
+
+    std::vector<PreparedGuestSlice> prepared_slices;
+    prepared_slices.reserve(scheduled_batch.size());
+    auto batch_ticks = remaining_ticks;
+    for (const auto &scheduled_value : scheduled_batch) {
+      if (!scheduler.contains(scheduled_value.thread))
+        continue;
+      Runtime *selected_runtime = nullptr;
+      for (auto &candidate : runtimes) {
+        if (candidate->kernel->process().pid ==
+            scheduled_value.thread.process) {
+          selected_runtime = candidate.get();
+          break;
+        }
+      }
+      if (selected_runtime == nullptr ||
+          scheduled_value.thread.thread >= selected_runtime->cpus->size()) {
+        throw std::runtime_error{"scheduler selected an unknown guest thread"};
+      }
+      if (selected_runtime->kernel->process().exited) {
+        scheduler.remove_process(selected_runtime->kernel->process().pid);
+        continue;
+      }
+      const auto index =
+          static_cast<std::size_t>(scheduled_value.thread.thread);
+      auto &cpu = selected_runtime->cpus->cpu(index);
+      cpu.clear_halt();
+      const auto slice =
+          bounded_execution ? std::min(batch_ticks, scheduled_value.tick_budget)
+                            : scheduled_value.tick_budget;
+      if (bounded_execution)
+        batch_ticks -= slice;
+      prepared_slices.push_back(PreparedGuestSlice{
+          scheduled_value,
+          selected_runtime,
+          index,
+          &cpu,
+          slice,
+          debug_request && debug_request->kind == GdbResumeKind::Step,
+      });
+    }
+
+    const auto execute_slice = [](PreparedGuestSlice &prepared) {
+      try {
+        prepared.result = prepared.single_step
+                              ? prepared.cpu->step()
+                              : prepared.cpu->run(prepared.tick_budget);
+      } catch (...) {
+        prepared.error = std::current_exception();
+      }
+    };
+    if (prepared_slices.size() == 1) {
+      execute_slice(prepared_slices.front());
+    } else if (!prepared_slices.empty()) {
+      std::vector<std::thread> workers;
+      workers.reserve(prepared_slices.size());
+      for (auto &prepared : prepared_slices) {
+        auto *prepared_ptr = &prepared;
+        workers.emplace_back(
+            [prepared_ptr, &execute_slice] { execute_slice(*prepared_ptr); });
+      }
+      for (auto &worker : workers)
+        worker.join();
+    }
+
+    const bool ran_thread = !prepared_slices.empty();
+    std::uint64_t scheduler_round_ticks = 0;
+    for (auto &prepared : prepared_slices) {
+      if (prepared.error)
+        std::rethrow_exception(prepared.error);
+      const auto scheduled =
+          std::optional<XnuScheduledSlice>{prepared.scheduled};
+      if (!scheduler.contains(scheduled->thread))
+        continue;
+      auto &runtime = *prepared.runtime;
+      const auto index = prepared.thread_index;
+      auto &cpu = *prepared.cpu;
+      auto result = std::move(prepared.result);
+      if (guest_processor_count > 1 && result.svc) {
+        runtime.kernel->dispatch(cpu, *result.svc);
+        // UserDefined2 stopped the Dynarmic worker at the SVC. Only
+        // the reason explicitly requested by the serial kernel
+        // dispatch represents the guest thread's scheduler state.
+        result.reason = cpu.consume_requested_halt_reason();
+      }
+      scheduler_round_ticks =
+          std::max(scheduler_round_ticks, result.ticks_consumed);
+      stopped_pid = runtime.kernel->process().pid;
+      stopped_cpu = index;
+      stopped_result = result;
+      consumed_ticks += result.ticks_consumed;
+      if (bounded_execution) {
+        remaining_ticks -= std::min(remaining_ticks, result.ticks_consumed);
+      }
+      bool debug_stop =
+          result.debug_breakpoint.has_value() || prepared.single_step;
+      std::uint8_t debug_signal = gdb_signal::trap;
+      const auto fatal_result =
+          result.fault || !result.exception.empty() ||
+          Dynarmic::Has(result.reason, Dynarmic::HaltReason::UserDefined4);
+      auto completion = XnuSliceCompletion::Continue;
+      bool scheduler_completed = false;
+      if (Dynarmic::Has(result.reason, Dynarmic::HaltReason::UserDefined5)) {
+        completion = XnuSliceCompletion::Block;
+      } else if (Dynarmic::Has(result.reason,
+                               Dynarmic::HaltReason::UserDefined6) &&
+                 runtime.pending_exec) {
+        auto pending = std::move(*runtime.pending_exec);
+        runtime.pending_exec.reset();
+        debug_target.notify_exec(runtime.kernel->process().pid);
+        runtime.memory->clear();
+        ProcessLoader exec_loader{*rootfs, *runtime.memory};
+        runtime.kernel->set_process_arguments(pending.arguments,
+                                              pending.environment);
+        auto loaded =
+            exec_loader.load(pending.path, std::move(pending.arguments),
+                             std::move(pending.environment));
+        runtime.kernel->set_process_image(pending.path);
+        runtime.kernel->prepare_exec(pending.processor);
+        auto &exec_cpu = runtime.cpus->cpu(pending.processor);
+        exec_cpu.reset();
+        exec_cpu.clear_cache();
+        exec_cpu.registers().fill(0);
+        exec_cpu.registers()[13] = loaded.stack_pointer;
+        exec_cpu.registers()[15] = loaded.entry_point;
+        exec_cpu.set_cpsr(0x10);
+        runtime.kernel->install_main_image_hle(exec_cpu);
+        static_cast<void>(scheduler.complete_slice(
+            scheduled->thread, result.ticks_consumed,
+            XnuSliceCompletion::Terminate, XnuTimeAccounting::Deferred));
+        scheduler.remove_process(runtime.kernel->process().pid);
+        std::fill(runtime.allocated.begin(), runtime.allocated.end(), false);
+        runtime.allocated[pending.processor] = true;
+        static_cast<void>(scheduler.register_thread(
+            XnuThreadId{runtime.kernel->process().pid,
+                        static_cast<std::uint32_t>(pending.processor)},
+            runtime.kernel->process().thread_base_priority));
+        scheduler_completed = true;
+      } else if (fatal_result) {
+        if (gdb_server) {
+          debug_stop = true;
+          debug_signal = result.fault ? gdb_signal::segmentation_fault
+                                      : gdb_signal::illegal_instruction;
+        } else {
+          completion = XnuSliceCompletion::Terminate;
+          hard_stop = true;
+        }
+      } else if (Dynarmic::Has(result.reason,
+                               Dynarmic::HaltReason::UserDefined1)) {
+        completion = XnuSliceCompletion::Terminate;
+      } else if (Dynarmic::Has(result.reason,
+                               Dynarmic::HaltReason::UserDefined8)) {
+        if (const auto request = runtime.kernel->consume_scheduler_yield(index);
+            request && request->depress) {
+          const auto duration_ticks =
+              static_cast<std::uint64_t>(request->duration_milliseconds) *
+              (xnu792::scheduler::default_guest_ticks_per_second /
+               xnu792::scheduler::milliseconds_per_second);
+          static_cast<void>(
+              scheduler.depress(scheduled->thread, duration_ticks));
+        }
+        completion = XnuSliceCompletion::Yield;
+      } else if (Dynarmic::Has(result.reason,
+                               Dynarmic::HaltReason::UserDefined2)) {
+        // XNU AST preemption retains the current quantum. The
+        // scheduler requeues this thread at the head of its
+        // priority, while a higher priority still wins selection.
+        completion = XnuSliceCompletion::Continue;
+      } else if (result.ticks_consumed == 0 && !debug_stop) {
+        // A runnable CPU returning without executing an instruction
+        // and without a classified wait/exit/fault would otherwise
+        // make the unbounded scheduler spin forever. This is an
+        // internal emulation failure, not a normal stop condition.
+        std::ostringstream error;
+        error << "scheduler made no progress for pid="
+              << runtime.kernel->process().pid << " cpu=" << index << " pc=0x"
+              << std::hex << cpu.registers()[15] << " halt_reason=0x"
+              << static_cast<std::uint64_t>(result.reason);
+        throw std::runtime_error{error.str()};
+      }
+      if (!scheduler_completed) {
+        static_cast<void>(
+            scheduler.complete_slice(scheduled->thread, result.ticks_consumed,
+                                     completion, XnuTimeAccounting::Deferred));
+        if (completion == XnuSliceCompletion::Terminate &&
+            runtime.kernel->process().exited) {
+          scheduler.remove_process(runtime.kernel->process().pid);
+        }
+      }
+      if (gdb_server && gdb_server->poll_interrupt()) {
+        debug_stop = true;
+        debug_signal = gdb_signal::interrupt;
+      }
+      if (debug_stop && gdb_server && !hard_stop) {
+        const GdbThreadId stopped_thread{
+            runtime.kernel->process().pid,
+            static_cast<std::uint32_t>(index + 1U)};
+        debug_target.set_current_thread(stopped_thread);
+        auto request = gdb_server->command_loop(debug_target, stopped_thread,
+                                                debug_signal, true);
+        if (request.kind == GdbResumeKind::Detach) {
+          debug_target.remove_all_breakpoints();
+          gdb_server->detach();
+          gdb_server.reset();
+          debug_request.reset();
+          for (auto &candidate : runtimes) {
+            for (std::size_t processor = 0; processor < candidate->cpus->size();
+                 ++processor) {
+              candidate->cpus->cpu(processor).set_debug_breakpoints_enabled(
+                  false);
+            }
+          }
+        } else if (request.kind == GdbResumeKind::Kill) {
+          hard_stop = true;
+        } else {
+          debug_request = request;
+        }
+      }
+      if (hard_stop)
+        break;
+    }
+    scheduler.advance_time(scheduler_round_ticks);
+    if (scheduler_round_ticks != 0) {
+      constexpr auto absolute_time_units_per_guest_tick =
+          darwin::mach::thread_policy::absolute_time_units_per_second /
+          xnu792::scheduler::default_guest_ticks_per_second;
+      static_assert(
+          darwin::mach::thread_policy::absolute_time_units_per_second %
+                  xnu792::scheduler::default_guest_ticks_per_second ==
+              0,
+          "guest scheduler ticks must map exactly to virtual time");
+      initial_runtime->kernel->advance_time_by(
+          scheduler_round_ticks * absolute_time_units_per_guest_tick);
+      // AppleH1CLCD scans its reserved CoreSurface directly; firmware does
+      // not unlock or swap that front buffer. Refresh each process-local
+      // surface after advancing virtual display time. Only the process that
+      // owns surface ID 0x100 performs any pixel work.
+      for (auto &runtime : runtimes) {
+        if (!runtime->kernel->process().exited) {
+          static_cast<void>(runtime->kernel->refresh_display_scanout());
+        }
+      }
+    }
+    if (!ran_thread) {
+      if (gdb_server && gdb_server->poll_interrupt()) {
+        const auto stopped_thread =
+            debug_target.current_thread().value_or(GdbThreadId{1, 1});
+        auto request = gdb_server->command_loop(debug_target, stopped_thread,
+                                                gdb_signal::interrupt, true);
+        if (request.kind == GdbResumeKind::Detach) {
+          debug_target.remove_all_breakpoints();
+          gdb_server->detach();
+          gdb_server.reset();
+          debug_request.reset();
+          for (auto &runtime : runtimes) {
+            for (std::size_t processor = 0; processor < runtime->cpus->size();
+                 ++processor) {
+              runtime->cpus->cpu(processor).set_debug_breakpoints_enabled(
+                  false);
+            }
+          }
+        } else if (request.kind == GdbResumeKind::Kill) {
+          hard_stop = true;
+        } else {
+          debug_request = request;
+        }
+        continue;
+      }
+      std::optional<std::uint64_t> next_deadline;
+      for (const auto &runtime : runtimes) {
+        const auto deadline = runtime->kernel->next_timer_deadline();
+        if (deadline && (!next_deadline || *deadline < *next_deadline)) {
+          next_deadline = deadline;
+        }
+      }
+      if (next_deadline) {
+        if (realtime_pacer) {
+          const auto delay = realtime_pacer->delay_until(*next_deadline);
+          if (delay > std::chrono::nanoseconds::zero()) {
+            std::this_thread::sleep_for(std::min(
+                delay, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           interactive_maximum_sleep)));
+            continue;
+          }
+        }
+        initial_runtime->kernel->advance_absolute_time(*next_deadline);
+        continue;
+      }
+      constexpr auto touch_replay_quiet_period = std::chrono::seconds{2};
+      if (bounded_execution && touch_replay &&
+          !touch_replay->settled(touch_replay_quiet_period)) {
+        // A finite headless run must not terminate during a guest idle window
+        // while host-time UI automation still has events scheduled or the
+        // guest is draining the final event. Keep the same low-overhead idle
+        // behavior as the unbounded interactive loop.
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        continue;
+      }
+      if (bounded_execution)
+        break;
+      // An interactive emulator remains alive while every guest thread
+      // is blocked: SDL input, GDB interrupt, and future host-network
+      // completions may still produce a wakeup. Avoid a busy-spin while
+      // retaining a responsive event loop.
+      std::this_thread::sleep_for(interactive_maximum_sleep);
+    }
+  }
+  std::size_t allocated_count = 0;
+  std::size_t runnable_count = 0;
+  std::size_t waiting_count = 0;
+  std::size_t mapped_pages = 0;
+  std::size_t resident_pages = 0;
+  std::size_t shared_page_mappings = 0;
+  std::size_t cached_file_mappings = 0;
+  std::size_t mapping_regions = 0;
+  Runtime *stopped_runtime = initial_runtime;
+  for (auto &runtime : runtimes) {
+    mapped_pages += runtime->memory->mapped_page_count();
+    resident_pages += runtime->memory->resident_page_count();
+    shared_page_mappings += runtime->memory->shared_page_count();
+    cached_file_mappings += runtime->memory->cached_file_mapping_count();
+    mapping_regions += runtime->memory->mapping_region_count();
+    allocated_count +=
+        std::count(runtime->allocated.begin(), runtime->allocated.end(), true);
+    std::size_t process_runnable = 0;
+    std::size_t process_waiting = 0;
+    for (std::size_t processor = 0; processor < runtime->allocated.size();
+         ++processor) {
+      if (!runtime->allocated[processor])
+        continue;
+      const auto scheduling_info =
+          scheduler.info(XnuThreadId{runtime->kernel->process().pid,
+                                     static_cast<std::uint32_t>(processor)});
+      if (!scheduling_info)
+        continue;
+      process_runnable += scheduling_info->state == XnuThreadState::Runnable ||
+                          scheduling_info->state == XnuThreadState::Running;
+      process_waiting += scheduling_info->state == XnuThreadState::Waiting;
+    }
+    runnable_count += process_runnable;
+    waiting_count += process_waiting;
+    runtime->kernel->process().waiting_for_events =
+        process_runnable == 0 && process_waiting != 0;
+    if (!runtime->kernel->process().exited) {
+      for (std::size_t processor = 0; processor < runtime->allocated.size();
+           ++processor) {
+        if (!runtime->allocated[processor])
+          continue;
+        const auto scheduling_info =
+            scheduler.info(XnuThreadId{runtime->kernel->process().pid,
+                                       static_cast<std::uint32_t>(processor)});
+        const auto runnable =
+            scheduling_info &&
+            (scheduling_info->state == XnuThreadState::Runnable ||
+             scheduling_info->state == XnuThreadState::Running);
+        const auto waiting = scheduling_info &&
+                             scheduling_info->state == XnuThreadState::Waiting;
+        output.line("[scheduler] pid=" +
+                    std::to_string(runtime->kernel->process().pid) +
+                    " cpu=" + std::to_string(processor) +
+                    " runnable=" + std::to_string(runnable) +
+                    " waiting=" + std::to_string(waiting) + " priority=" +
+                    std::to_string(scheduling_info
+                                       ? scheduling_info->scheduled_priority
+                                       : -1) +
+                    " wait=" + runtime->kernel->wait_reason(processor));
+      }
+    }
+    if (runtime->kernel->process().pid == stopped_pid)
+      stopped_runtime = runtime.get();
+  }
+  std::ostringstream message;
+  message << "[cpu] stopped pid=" << stopped_pid << " cpu=" << stopped_cpu
+          << " pc=0x" << std::hex
+          << stopped_runtime->cpus->cpu(stopped_cpu).registers()[15] << std::dec
+          << " ticks=" << consumed_ticks << " processes=" << runtimes.size()
+          << " threads=" << allocated_count << " runnable=" << runnable_count
+          << " mapped-pages=" << mapped_pages
+          << " resident-pages=" << resident_pages
+          << " mapping-regions=" << mapping_regions
+          << " shared-page-mappings=" << shared_page_mappings
+          << " cached-file-mappings=" << cached_file_mappings
+          << " cached-file-pages="
+          << initial_runtime->memory->cached_file_page_count();
+  const auto &stopped_registers =
+      stopped_runtime->cpus->cpu(stopped_cpu).registers();
+  if (const auto instruction = stopped_runtime->memory->read32(
+          stopped_registers[15], MemoryPermission::Execute)) {
+    message << " insn=0x" << std::hex << *instruction << "("
+            << Dynarmic::A32::DisassembleArm(*instruction) << ")"
+            << " lr=0x" << stopped_registers[14] << std::dec;
+  }
+  if (stopped_result.fault) {
+    message << " fault=0x" << std::hex << stopped_result.fault->address
+            << " access=" << static_cast<unsigned>(stopped_result.fault->access)
+            << " size=0x" << stopped_result.fault->size;
+    for (std::size_t index = 0; index < 14; ++index) {
+      message << " r" << std::dec << index << "=0x" << std::hex
+              << stopped_registers[index];
+    }
+    message << " stack=";
+    for (std::size_t index = 0; index < fault_stack_word_count; ++index) {
+      const auto address =
+          stopped_registers[13] +
+          static_cast<std::uint32_t>(index * sizeof(std::uint32_t));
+      const auto word = stopped_runtime->memory->read32(address);
+      if (!word)
+        break;
+      if (index != 0)
+        message << ',';
+      message << "0x" << *word;
+    }
+    message << " code=";
+    const auto code_base = stopped_registers[15] - 8U * sizeof(std::uint32_t);
+    for (std::size_t index = 0; index < 16; ++index) {
+      const auto word = stopped_runtime->memory->read32(
+          code_base + static_cast<std::uint32_t>(index * 4U));
+      if (!word)
+        break;
+      if (index != 0)
+        message << ',';
+      message << "0x" << *word;
+    }
+    message << std::dec;
+  }
+  if (!stopped_result.exception.empty()) {
+    message << " exception=" << stopped_result.exception;
+  }
+  if (initial_runtime->kernel->process().exited) {
+    message << " exit=" << initial_runtime->kernel->process().exit_status;
+  }
+  if (runnable_count == 0 && waiting_count != 0) {
+    message << " state=waiting-for-events";
+  }
+  output.line(message.str());
+  if (baseband_output_path) {
+    const auto captured = initial_runtime->kernel->take_baseband_output();
+    bsd::baseband_device::write_capture_file(*baseband_output_path, captured);
+    output.line("[baseband] capture output=" + *baseband_output_path +
+                " bytes=" + std::to_string(captured.size()));
+  }
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+  try {
+    if (argc < 2) {
+      std::cerr << usage();
+      return 2;
+    }
+    std::vector<std::string> args;
+    for (int i = 2; i < argc; ++i) {
+      args.emplace_back(argv[i]);
+    }
+    auto output = make_output(args);
+    const std::string_view command{argv[1]};
+    if (command == "profile") {
+      profile(*output);
+    } else if (command == "inspect") {
+      inspect(args, *output);
+    } else if (command == "disasm") {
+      disasm(args, *output);
+    } else if (command == "smoke") {
+      smoke(args, *output);
+    } else if (command == "boot") {
+      boot(args, *output);
+    } else {
+      throw std::runtime_error{"unknown command: " + std::string{command}};
+    }
+    return 0;
+  } catch (const std::exception &error) {
+    std::cerr << "ilegacysim: " << error.what() << '\n';
+    return 1;
+  }
+}

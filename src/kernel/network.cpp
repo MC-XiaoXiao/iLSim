@@ -1,0 +1,1238 @@
+#include "ilegacysim/kernel.hpp"
+
+#include "ilegacysim/baseband_device.hpp"
+#include "ilegacysim/darwin_abi.hpp"
+#include "ilegacysim/darwin_kqueue_abi.hpp"
+#include "ilegacysim/darwin_network_abi.hpp"
+#include "ilegacysim/darwin_route_socket.hpp"
+#include "ilegacysim/kernel_network.hpp"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <span>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "bsd/support.hpp"
+
+namespace ilegacysim {
+namespace {
+
+constexpr std::uint32_t ebadf = 9;
+constexpr std::uint32_t efault = 14;
+constexpr std::uint32_t einval = 22;
+constexpr std::uint32_t enotconn = 57;
+constexpr std::size_t maximum_io = 16U * 1024U * 1024U;
+
+}  // namespace
+
+namespace kernel_network {
+darwin::network::InterfaceSnapshot make_interface_snapshot(
+    std::string_view name,
+    const KernelSharedState::NetworkInterface& interface) {
+    darwin::network::InterfaceSnapshot result;
+    result.name = name;
+    result.index = interface.index;
+    result.flags = interface.flags;
+    result.family = interface.family;
+    result.unit = interface.unit;
+    result.mtu = interface.mtu;
+    result.type = interface.type;
+    result.link_address = interface.link_address;
+    result.link_address_length = interface.link_address_length;
+    if (interface.has_ipv4) {
+        result.ipv4_address = interface.ipv4_address;
+        result.ipv4_netmask = interface.ipv4_netmask;
+        if (std::to_integer<std::uint8_t>(interface.ipv4_broadcast[0]) != 0) {
+            result.ipv4_broadcast = interface.ipv4_broadcast;
+        }
+    }
+    if (interface.has_ipv6) {
+        result.ipv6_address = interface.ipv6_address;
+        result.ipv6_netmask = interface.ipv6_netmask;
+    }
+    return result;
+}
+}  // namespace kernel_network
+
+void CompatibilityKernel::set_host_network_policy(HostNetworkPolicy policy) {
+    host_network_policy_ = policy;
+    const auto before = wifi_state_->snapshot();
+    // Host isolation controls only whether BSD sockets may reach the host.
+    // The guest still sees its emulated Wi-Fi LAN, just as a device attached
+    // to an access point without an upstream route retains en0 and multicast.
+    static_cast<void>(wifi_state_->set_power(true));
+    static_cast<void>(wifi_state_->associate());
+    apply_wifi_transition(before, wifi_state_->snapshot());
+}
+
+std::optional<darwin::network::InterfaceSnapshot>
+CompatibilityKernel::network_interface_snapshot(std::string_view name) const {
+    std::lock_guard network_lock{shared_state_->network_mutex};
+    const auto found = shared_state_->network_interfaces.find(std::string{name});
+    if (found == shared_state_->network_interfaces.end()) return std::nullopt;
+    return kernel_network::make_interface_snapshot(
+        found->first, found->second);
+}
+
+std::vector<darwin::route::Entry> CompatibilityKernel::route_snapshot() const {
+    return shared_state_->route_table.snapshot();
+}
+
+
+bool CompatibilityKernel::receive_socket_message(
+    Cpu& cpu, std::uint32_t fd, std::uint32_t message_address) {
+    using namespace darwin::socket;
+    const auto name_address =
+        memory_.read32(message_address + arm32_message::name_offset);
+    const auto name_capacity =
+        memory_.read32(message_address + arm32_message::name_length_offset);
+    const auto iov_address =
+        memory_.read32(message_address + arm32_message::iov_offset);
+    const auto iov_count =
+        memory_.read32(message_address + arm32_message::iov_count_offset);
+    const auto control_address =
+        memory_.read32(message_address + arm32_message::control_offset);
+    const auto control_capacity =
+        memory_.read32(message_address + arm32_message::control_length_offset);
+    if (!name_address || !name_capacity || !iov_address || !iov_count ||
+        !control_address || !control_capacity) {
+        bsd_error(cpu, efault);
+        return true;
+    }
+    if (!iov_address || !iov_count || !control_address || !control_capacity ||
+        *iov_count > 1024) {
+        bsd_error(cpu, !iov_address || !iov_count ? efault : einval);
+        return true;
+    }
+
+    struct GuestIovec {
+        std::uint32_t base{};
+        std::uint32_t capacity{};
+    };
+    std::vector<GuestIovec> iovecs;
+    iovecs.reserve(*iov_count);
+    std::size_t receive_capacity = 0;
+    for (std::uint32_t index = 0; index < *iov_count; ++index) {
+        const auto entry = *iov_address + index * arm32_iovec::size;
+        const auto base = memory_.read32(entry + arm32_iovec::base_offset);
+        const auto capacity =
+            memory_.read32(entry + arm32_iovec::length_offset);
+        if (!base || !capacity ||
+            (*capacity != 0 && *base == 0) ||
+            *capacity > maximum_io ||
+            receive_capacity > maximum_io - *capacity) {
+            bsd_error(cpu, !base || !capacity || (*capacity != 0 && *base == 0)
+                               ? efault
+                               : einval);
+            return true;
+        }
+        iovecs.push_back(GuestIovec{*base, *capacity});
+        receive_capacity += *capacity;
+    }
+
+    if (const auto udp = virtual_udp_sockets_.find(fd);
+        udp != virtual_udp_sockets_.end()) {
+        const auto received = udp->second->receive(receive_capacity);
+        if (!received) return false;
+
+        std::size_t source_offset = 0;
+        for (const auto& iovec : iovecs) {
+            const auto remaining = received->bytes.size() - source_offset;
+            const auto count = std::min<std::size_t>(iovec.capacity, remaining);
+            if (count != 0 &&
+                !memory_.copy_in(
+                    iovec.base,
+                    std::span<const std::byte>{received->bytes}.subspan(
+                        source_offset, count))) {
+                bsd_error(cpu, efault);
+                return true;
+            }
+            source_offset += count;
+            if (source_offset == received->bytes.size()) break;
+        }
+
+        const auto actual_name_length = static_cast<std::uint32_t>(
+            received->source_address.size());
+        const auto copied_name_length =
+            std::min(*name_capacity, actual_name_length);
+        if (copied_name_length != 0 &&
+            (*name_address == 0 ||
+             !memory_.copy_in(
+                 *name_address,
+                 std::span<const std::byte>{received->source_address}.first(
+                     copied_name_length)))) {
+            bsd_error(cpu, efault);
+            return true;
+        }
+
+        const auto option_enabled = [&](std::uint32_t level,
+                                        std::uint32_t option) {
+            const auto descriptor = socket_options_.find(fd);
+            if (descriptor == socket_options_.end()) return false;
+            const auto found = descriptor->second.find({level, option});
+            if (found == descriptor->second.end()) return false;
+            return std::any_of(found->second.begin(), found->second.end(),
+                               [](std::byte value) {
+                                   return value != std::byte{0};
+                               });
+        };
+        const auto family = udp->second->family();
+        bsd::VirtualUdpAncillaryOptions options;
+        if (family == darwin::network::address_family_inet) {
+            options.receive_destination_address = option_enabled(
+                darwin::network::protocol_ip,
+                darwin::network::ip_receive_destination_address);
+            options.receive_interface = option_enabled(
+                darwin::network::protocol_ip,
+                darwin::network::ip_receive_interface);
+            options.receive_hop_limit = option_enabled(
+                darwin::network::protocol_ip,
+                darwin::network::ip_receive_ttl);
+        } else {
+            options.receive_destination_address = option_enabled(
+                darwin::network::protocol_ipv6,
+                darwin::network::ipv6_packet_info);
+            options.receive_hop_limit = option_enabled(
+                darwin::network::protocol_ipv6,
+                darwin::network::ipv6_hop_limit);
+        }
+        const auto control =
+            bsd::make_virtual_udp_ancillary(family, *received, options);
+        const auto copied_control =
+            std::min<std::size_t>(*control_capacity, control.size());
+        std::uint32_t message_flags = 0;
+        if (copied_control < control.size())
+            message_flags |= message_control_truncated;
+        if (copied_control != 0 &&
+            (*control_address == 0 ||
+             !memory_.copy_in(
+                 *control_address,
+                 std::span<const std::byte>{control}.first(copied_control)))) {
+            bsd_error(cpu, efault);
+            return true;
+        }
+        if (!memory_.write32(
+                message_address + arm32_message::name_length_offset,
+                actual_name_length) ||
+            !memory_.write32(
+                message_address + arm32_message::control_length_offset,
+                static_cast<std::uint32_t>(copied_control)) ||
+            !memory_.write32(message_address + arm32_message::flags_offset,
+                             message_flags)) {
+            bsd_error(cpu, efault);
+            return true;
+        }
+        bsd_success(cpu, static_cast<std::uint32_t>(received->bytes.size()));
+        output_.write("[network] recvmsg virtual UDP fd=" +
+                      std::to_string(fd) + " bytes=" +
+                      std::to_string(received->bytes.size()) + " control=" +
+                      std::to_string(copied_control) + "\n");
+        return true;
+    }
+
+    if (const auto host = host_sockets_.find(fd); host != host_sockets_.end()) {
+        const auto received = host->second->receive(receive_capacity);
+        if (received.status == HostSocketStatus::WouldBlock) return false;
+        if (received.status == HostSocketStatus::Error) {
+            bsd_error(cpu, received.darwin_error);
+            return true;
+        }
+
+        std::size_t source_offset = 0;
+        for (const auto& iovec : iovecs) {
+            const auto count = std::min<std::size_t>(
+                iovec.capacity, received.bytes.size() - source_offset);
+            if (count != 0 &&
+                !memory_.copy_in(
+                    iovec.base,
+                    std::span<const std::byte>{received.bytes}.subspan(
+                        source_offset, count))) {
+                bsd_error(cpu, efault);
+                return true;
+            }
+            source_offset += count;
+            if (source_offset == received.bytes.size()) break;
+        }
+
+        const auto actual_name_length = static_cast<std::uint32_t>(
+            std::min<std::size_t>(received.address.size(),
+                                  std::numeric_limits<std::uint32_t>::max()));
+        const auto copied_name_length = std::min(*name_capacity, actual_name_length);
+        if (copied_name_length != 0 &&
+            (*name_address == 0 ||
+             !memory_.copy_in(
+                 *name_address,
+                 std::span<const std::byte>{received.address}.first(
+                     copied_name_length)))) {
+            bsd_error(cpu, efault);
+            return true;
+        }
+        const auto option_enabled = [&](std::uint32_t level,
+                                        std::uint32_t option) {
+            const auto descriptor = socket_options_.find(fd);
+            if (descriptor == socket_options_.end()) return false;
+            const auto found = descriptor->second.find({level, option});
+            if (found == descriptor->second.end() || found->second.empty()) {
+                return false;
+            }
+            std::uint32_t enabled = 0;
+            for (std::size_t byte = 0;
+                 byte < std::min(found->second.size(), sizeof(enabled)); ++byte) {
+                enabled |= std::to_integer<std::uint32_t>(found->second[byte])
+                           << (byte * 8U);
+            }
+            return enabled != 0;
+        };
+        std::vector<std::byte> guest_control;
+        const auto append_u32 = [](std::vector<std::byte>& bytes,
+                                   std::uint32_t value) {
+            for (std::size_t byte = 0; byte < sizeof(value); ++byte) {
+                bytes.push_back(
+                    static_cast<std::byte>(value >> (byte * 8U)));
+            }
+        };
+        const auto append_control = [&](std::uint32_t level,
+                                        std::uint32_t type,
+                                        std::span<const std::byte> payload) {
+            const auto length = darwin::network::arm32_control_header_size +
+                                static_cast<std::uint32_t>(payload.size());
+            append_u32(guest_control, length);
+            append_u32(guest_control, level);
+            append_u32(guest_control, type);
+            guest_control.insert(
+                guest_control.end(), payload.begin(), payload.end());
+            while ((guest_control.size() & 3U) != 0) {
+                guest_control.push_back(std::byte{0});
+            }
+        };
+        const auto received_interface_index = received.interface_index.value_or(
+            host_network_policy_ == HostNetworkPolicy::Loopback ? 1U : 2U);
+        const auto interface_name = received_interface_index == 1U
+                                        ? std::string{"lo0"}
+                                        : std::string{"en0"};
+        darwin::network::InterfaceSnapshot receive_interface;
+        if (const auto snapshot = network_interface_snapshot(interface_name)) {
+            receive_interface = *snapshot;
+        } else {
+            receive_interface.name = interface_name;
+            receive_interface.index = interface_name == "lo0" ? 1U : 2U;
+            receive_interface.type = interface_name == "lo0"
+                                         ? darwin::network::interface_type_loopback
+                                         : darwin::network::interface_type_ethernet;
+        }
+        if (host->second->darwin_family() ==
+            darwin::network::address_family_inet) {
+            if (option_enabled(
+                    darwin::network::protocol_ip,
+                    darwin::network::ip_receive_destination_address)) {
+                std::array<std::byte, 4> destination{};
+                std::copy_n(
+                    received.destination_address.begin(),
+                    std::min(destination.size(),
+                             received.destination_address.size()),
+                    destination.begin());
+                append_control(
+                    darwin::network::protocol_ip,
+                    darwin::network::ip_receive_destination_address,
+                    destination);
+            }
+            if (option_enabled(
+                    darwin::network::protocol_ip,
+                    darwin::network::ip_receive_interface)) {
+                std::array<std::byte,
+                           darwin::network::arm32_sockaddr_dl_size>
+                    link{};
+                link[0] = static_cast<std::byte>(link.size());
+                link[1] = static_cast<std::byte>(
+                    darwin::network::address_family_link);
+                link[2] = static_cast<std::byte>(receive_interface.index);
+                link[3] = static_cast<std::byte>(
+                    receive_interface.index >> 8U);
+                link[4] = static_cast<std::byte>(receive_interface.type);
+                const auto name_length = std::min<std::size_t>(
+                    receive_interface.name.size(), 12U);
+                link[5] = static_cast<std::byte>(name_length);
+                link[6] = static_cast<std::byte>(
+                    std::min<std::size_t>(
+                        receive_interface.link_address_length,
+                        12U - name_length));
+                for (std::size_t index = 0; index < name_length; ++index) {
+                    link[8U + index] = static_cast<std::byte>(
+                        receive_interface.name[index]);
+                }
+                for (std::size_t index = 0;
+                     index < std::to_integer<std::uint8_t>(link[6]); ++index) {
+                    link[8U + name_length + index] =
+                        receive_interface.link_address[index];
+                }
+                append_control(
+                    darwin::network::protocol_ip,
+                    darwin::network::ip_receive_interface, link);
+            }
+            if (option_enabled(darwin::network::protocol_ip,
+                               darwin::network::ip_receive_ttl) &&
+                received.hop_limit) {
+                const std::array ttl{
+                    static_cast<std::byte>(*received.hop_limit)};
+                append_control(darwin::network::protocol_ip,
+                               darwin::network::ip_receive_ttl, ttl);
+            }
+        } else if (host->second->darwin_family() ==
+                   darwin::network::address_family_inet6) {
+            if (option_enabled(darwin::network::protocol_ipv6,
+                               darwin::network::ipv6_packet_info)) {
+                std::array<std::byte, 20> packet_info{};
+                std::copy_n(
+                    received.destination_address.begin(),
+                    std::min<std::size_t>(16,
+                                         received.destination_address.size()),
+                    packet_info.begin());
+                for (std::size_t byte = 0; byte < sizeof(std::uint32_t);
+                     ++byte) {
+                    packet_info[16U + byte] = static_cast<std::byte>(
+                        received_interface_index >> (byte * 8U));
+                }
+                append_control(darwin::network::protocol_ipv6,
+                               darwin::network::ipv6_packet_info,
+                               packet_info);
+            }
+            if (option_enabled(darwin::network::protocol_ipv6,
+                               darwin::network::ipv6_hop_limit) &&
+                received.hop_limit) {
+                std::array<std::byte, 4> hop_limit{};
+                for (std::size_t byte = 0; byte < hop_limit.size(); ++byte) {
+                    hop_limit[byte] = static_cast<std::byte>(
+                        *received.hop_limit >> (byte * 8U));
+                }
+                append_control(darwin::network::protocol_ipv6,
+                               darwin::network::ipv6_hop_limit,
+                               hop_limit);
+            }
+        }
+        const auto copied_control = std::min<std::size_t>(
+            *control_capacity, guest_control.size());
+        std::uint32_t message_flags = 0;
+        if (copied_control < guest_control.size()) {
+            message_flags |= message_control_truncated;
+        }
+        if (copied_control != 0 &&
+            (*control_address == 0 ||
+             !memory_.copy_in(
+                 *control_address,
+                 std::span<const std::byte>{guest_control}.first(
+                     copied_control)))) {
+            bsd_error(cpu, efault);
+            return true;
+        }
+        if (!memory_.write32(
+                message_address + arm32_message::name_length_offset,
+                actual_name_length) ||
+            !memory_.write32(
+                message_address + arm32_message::control_length_offset,
+                static_cast<std::uint32_t>(copied_control)) ||
+            !memory_.write32(
+                message_address + arm32_message::flags_offset,
+                message_flags)) {
+            bsd_error(cpu, efault);
+            return true;
+        }
+        bsd_success(
+            cpu, static_cast<std::uint32_t>(received.transferred));
+        output_.write("[network] recvmsg host fd=" + std::to_string(fd) +
+                      " bytes=" + std::to_string(received.transferred) +
+                      " iov=" + std::to_string(iovecs.size()) + "\n");
+        return true;
+    }
+
+    const auto endpoint = socket_pair_endpoints_.find(fd);
+    if (endpoint == socket_pair_endpoints_.end()) {
+        bsd_error(cpu, virtual_descriptors_.contains(fd) ? enotconn : ebadf);
+        return true;
+    }
+    std::lock_guard socket_lock{shared_state_->socket_mutex};
+    auto& source = shared_state_->socket_pair_buffers[endpoint->second.pair]
+                                                        [endpoint->second.side];
+    const auto lifetime = endpoint->second.description
+                              ? endpoint->second.description->lifetime
+                              : nullptr;
+    if (!lifetime) {
+        bsd_error(cpu, ebadf);
+        return true;
+    }
+    const bool end_of_stream = !endpoint->second.local_read_open() ||
+                               !endpoint->second.peer_write_open();
+    if (source.empty() && !end_of_stream) return false;
+    const auto read_begin = lifetime->read_offsets[endpoint->second.side];
+    std::uint32_t total = 0;
+    for (const auto& iovec : iovecs) {
+        if (source.empty()) break;
+        const auto count = std::min<std::size_t>(iovec.capacity, source.size());
+        std::vector<std::byte> bytes;
+        bytes.reserve(count);
+        for (std::size_t byte = 0; byte < count; ++byte) {
+            bytes.push_back(source.front());
+            source.pop_front();
+        }
+        if (!memory_.copy_in(iovec.base, bytes)) {
+            bsd_error(cpu, efault);
+            return true;
+        }
+        total += static_cast<std::uint32_t>(count);
+    }
+    const auto read_end = read_begin + total;
+    lifetime->read_offsets[endpoint->second.side] = read_end;
+    std::vector<KernelSharedState::DescriptorTransfer> transfers;
+    auto& ancillary = shared_state_->socket_pair_ancillary[endpoint->second.pair]
+                                                           [endpoint->second.side];
+    while (!ancillary.empty() &&
+           ancillary.front().byte_offset < read_begin) {
+        ancillary.pop_front();
+    }
+    while (!ancillary.empty() && ancillary.front().byte_offset < read_end) {
+        auto record = std::move(ancillary.front());
+        ancillary.pop_front();
+        transfers.insert(
+            transfers.end(),
+            std::make_move_iterator(record.transfers.begin()),
+            std::make_move_iterator(record.transfers.end()));
+    }
+    std::vector<std::uint32_t> received_fds;
+    const auto required_control = static_cast<std::uint32_t>(12U + transfers.size() * 4U);
+    std::uint32_t message_flags = 0;
+    if (!transfers.empty() && (*control_address == 0 || *control_capacity < required_control)) {
+        message_flags |= message_control_truncated;
+    } else if (!transfers.empty()) {
+        for (const auto& transfer : transfers) {
+            const auto imported = import_descriptor(transfer);
+            if (!imported) {
+                bsd_error(cpu, 24);  // EMFILE
+                return true;
+            }
+            received_fds.push_back(*imported);
+        }
+        if (!memory_.write32(*control_address, required_control) ||
+            !memory_.write32(*control_address + 4, 0xffffU) ||
+            !memory_.write32(*control_address + 8, 1U)) {
+            bsd_error(cpu, efault);
+            return true;
+        }
+        for (std::size_t index = 0; index < received_fds.size(); ++index) {
+            if (!memory_.write32(*control_address + 12U +
+                                     static_cast<std::uint32_t>(index * 4U),
+                                 received_fds[index])) {
+                bsd_error(cpu, efault);
+                return true;
+            }
+        }
+    }
+    const auto actual_control = transfers.empty() || message_flags != 0
+                                    ? 0U
+                                    : required_control;
+    if (!memory_.write32(
+            message_address + arm32_message::control_length_offset,
+            actual_control) ||
+        !memory_.write32(
+            message_address + arm32_message::flags_offset, message_flags)) {
+        bsd_error(cpu, efault);
+        return true;
+    }
+    bsd_success(cpu, total);
+    output_.write("[network] recvmsg fd=" + std::to_string(fd) +
+                  " bytes=" + std::to_string(total) +
+                  " rights=" + std::to_string(received_fds.size()) + "\n");
+    return true;
+}
+
+bool CompatibilityKernel::receive_socket_bytes(
+    Cpu& cpu, std::uint32_t fd, std::uint32_t address, std::uint32_t size,
+    std::uint32_t source_address,
+    std::uint32_t source_length_address) {
+    if (size == 0) {
+        bsd_success(cpu, 0);
+        return true;
+    }
+    if (const auto host = host_sockets_.find(fd); host != host_sockets_.end()) {
+        const auto received = host->second->receive(size);
+        if (received.status == HostSocketStatus::WouldBlock) return false;
+        if (received.status == HostSocketStatus::Error) {
+            bsd_error(cpu, received.darwin_error);
+            return true;
+        }
+        if (!memory_.copy_in(address, received.bytes) ||
+            !copy_socket_address(
+                source_address, source_length_address, received.address)) {
+            bsd_error(cpu, darwin::error::bad_address);
+        } else {
+            bsd_success(cpu, static_cast<std::uint32_t>(received.transferred));
+        }
+        return true;
+    }
+    if (const auto udp = virtual_udp_sockets_.find(fd);
+        udp != virtual_udp_sockets_.end()) {
+        const auto received = udp->second->receive(size);
+        if (!received) return false;
+        if (!memory_.copy_in(address, received->bytes) ||
+            !copy_socket_address(source_address, source_length_address,
+                                 received->source_address)) {
+            bsd_error(cpu, darwin::error::bad_address);
+        } else {
+            bsd_success(cpu,
+                        static_cast<std::uint32_t>(received->bytes.size()));
+            output_.write("[network] virtual UDP receive fd=" +
+                          std::to_string(fd) + " bytes=" +
+                          std::to_string(received->bytes.size()) + "\n");
+        }
+        return true;
+    }
+    if (const auto descriptor = virtual_descriptors_.find(fd);
+        descriptor != virtual_descriptors_.end() &&
+        descriptor->second == bsd::baseband_device::descriptor_kind) {
+        auto bytes =
+            shared_state_->baseband_device_state.receive(size);
+        if (bytes.empty()) return false;
+        if (!memory_.copy_in(address, bytes)) {
+            bsd_error(cpu, darwin::error::bad_address);
+        } else {
+            bsd_success(cpu, static_cast<std::uint32_t>(bytes.size()));
+            output_.write("[baseband] read pid=" +
+                          std::to_string(process_.pid) + " fd=" +
+                          std::to_string(fd) + " bytes=" +
+                          std::to_string(bytes.size()) + " hex=" +
+                          bsd_support::format_payload_prefix(bytes) + "\n");
+        }
+        return true;
+    }
+    if (const auto descriptor = virtual_descriptors_.find(fd);
+        descriptor != virtual_descriptors_.end() &&
+        descriptor->second == "system-event-socket") {
+        const auto event = consume_system_event(fd);
+        if (!event) return false;
+        const auto copied_size = std::min<std::size_t>(size, event->bytes.size());
+        if (!memory_.copy_in(
+                address,
+                std::span<const std::byte>{event->bytes}.first(copied_size))) {
+            bsd_error(cpu, darwin::error::bad_address);
+        } else {
+            bsd_success(cpu, static_cast<std::uint32_t>(copied_size));
+            output_.write("[network] kern_event id=" +
+                          std::to_string(event->identifier) + " code=" +
+                          std::to_string(event->event_code) + "\n");
+        }
+        return true;
+    }
+    if (const auto descriptor = virtual_descriptors_.find(fd);
+        descriptor != virtual_descriptors_.end() &&
+        descriptor->second == "route-socket") {
+        const auto message = consume_route_message(fd);
+        if (!message) return false;
+        const auto copied_size = std::min<std::size_t>(size, message->bytes.size());
+        if (!memory_.copy_in(
+                address,
+                std::span<const std::byte>{message->bytes}.first(copied_size))) {
+            bsd_error(cpu, darwin::error::bad_address);
+        } else {
+            bsd_success(cpu, static_cast<std::uint32_t>(copied_size));
+        }
+        return true;
+    }
+    const auto endpoint = socket_pair_endpoints_.find(fd);
+    if (endpoint == socket_pair_endpoints_.end()) return false;
+    std::vector<std::byte> bytes;
+    {
+        std::lock_guard socket_lock{shared_state_->socket_mutex};
+        const auto pair = shared_state_->socket_pair_buffers.find(
+            endpoint->second.pair);
+        if (pair == shared_state_->socket_pair_buffers.end()) return false;
+        auto& pending = pair->second[endpoint->second.side];
+        const auto lifetime = endpoint->second.description
+                                  ? endpoint->second.description->lifetime
+                                  : nullptr;
+        if (!lifetime) return false;
+        const bool end_of_stream = !endpoint->second.local_read_open() ||
+                                   !endpoint->second.peer_write_open();
+        if (pending.empty() && !end_of_stream) return false;
+        const auto count = std::min<std::size_t>(size, pending.size());
+        bytes.resize(count);
+        for (auto& byte : bytes) {
+            byte = pending.front();
+            pending.pop_front();
+        }
+        const auto side = endpoint->second.side;
+        lifetime->read_offsets[side] += count;
+        auto& ancillary = shared_state_->socket_pair_ancillary[
+            endpoint->second.pair][side];
+        while (!ancillary.empty() &&
+               ancillary.front().byte_offset < lifetime->read_offsets[side]) {
+            // read/recv without a control buffer consumes and discards rights
+            // attached to bytes in that range, matching SOCK_STREAM semantics.
+            ancillary.pop_front();
+        }
+    }
+    if (!memory_.copy_in(address, bytes)) {
+        bsd_error(cpu, darwin::error::bad_address);
+    } else {
+        bsd_success(cpu, static_cast<std::uint32_t>(bytes.size()));
+        output_.write("[network] read fd=" + std::to_string(fd) +
+                      " bytes=" + std::to_string(bytes.size()) + "\n");
+    }
+    return true;
+}
+
+bool CompatibilityKernel::copy_socket_address(
+    std::uint32_t address, std::uint32_t length_address,
+    std::span<const std::byte> socket_address) {
+    if (address == 0 && length_address == 0) return true;
+    if (address == 0 || length_address == 0) return false;
+    const auto capacity = memory_.read32(length_address);
+    if (!capacity) return false;
+    const auto copied = std::min<std::size_t>(*capacity, socket_address.size());
+    return (copied == 0 || memory_.copy_in(address, socket_address.first(copied))) &&
+           memory_.write32(
+               length_address, static_cast<std::uint32_t>(socket_address.size()));
+}
+
+bool CompatibilityKernel::complete_unix_accept(
+    Cpu& cpu, std::uint32_t listener_fd, std::uint32_t address,
+    std::uint32_t length_address) {
+    if (!virtual_descriptors_.contains(listener_fd)) {
+        bsd_error(cpu, ebadf);
+        return true;
+    }
+    if (!listening_sockets_.contains(listener_fd)) {
+        bsd_error(cpu, einval);
+        return true;
+    }
+    const auto listener = unix_listener_states_.find(listener_fd);
+    if (listener == unix_listener_states_.end()) {
+        bsd_error(cpu, einval);
+        return true;
+    }
+
+    std::lock_guard socket_lock{shared_state_->socket_mutex};
+    if (listener->second->pending_endpoints.empty()) return false;
+    const auto accepted_fd = allocate_file_descriptor();
+    if (!accepted_fd) {
+        bsd_error(cpu, 24);  // EMFILE
+        return true;
+    }
+    auto accepted_endpoint =
+        std::move(listener->second->pending_endpoints.front());
+    listener->second->pending_endpoints.pop_front();
+    const auto pair = accepted_endpoint.pair;
+    virtual_descriptors_[*accepted_fd] = "unix-stream";
+    socket_pair_endpoints_[*accepted_fd] = std::move(accepted_endpoint);
+    file_status_flags_[*accepted_fd] = darwin::open_flag::read_write;
+    descriptor_flags_[*accepted_fd] = 0;
+
+    constexpr std::array<std::byte, 2> unnamed_peer{
+        std::byte{2}, static_cast<std::byte>(darwin::socket::local)};
+    if (!copy_socket_address(address, length_address, unnamed_peer)) {
+        virtual_descriptors_.erase(*accepted_fd);
+        socket_pair_endpoints_.erase(*accepted_fd);
+        file_status_flags_.erase(*accepted_fd);
+        descriptor_flags_.erase(*accepted_fd);
+        bsd_error(cpu, efault);
+        return true;
+    }
+    output_.write("[network] accept pid=" + std::to_string(process_.pid) +
+                  " listener-fd=" + std::to_string(listener_fd) + " fd=" +
+                  std::to_string(*accepted_fd) + " pair=" +
+                  std::to_string(pair) + "\n");
+    bsd_success(cpu, *accepted_fd);
+    return true;
+}
+
+std::optional<std::uint32_t> CompatibilityKernel::install_host_socket(
+    std::shared_ptr<HostSocket> socket) {
+    if (!socket) return std::nullopt;
+    const auto fd = allocate_file_descriptor();
+    if (!fd) return std::nullopt;
+    const auto ipv6 =
+        socket->darwin_family() == darwin::network::address_family_inet6;
+    const auto stream = socket->darwin_type() == 1;
+    virtual_descriptors_[*fd] =
+        ipv6 ? (stream ? "inet6-stream" : "inet6-dgram")
+             : (stream ? "inet-stream" : "inet-dgram");
+    host_sockets_[*fd] = std::move(socket);
+    file_status_flags_[*fd] = darwin::open_flag::read_write;
+    descriptor_flags_[*fd] = 0;
+    return fd;
+}
+
+void CompatibilityKernel::apply_wifi_transition(
+    const WifiSnapshot& before, const WifiSnapshot& after) {
+    constexpr std::string_view name{"en0"};
+    bool flags_changed = false;
+    bool address_added = false;
+    bool address_deleted = false;
+    {
+        std::lock_guard network_lock{shared_state_->network_mutex};
+        const auto found = shared_state_->network_interfaces.find(
+            std::string{name});
+        if (found == shared_state_->network_interfaces.end()) return;
+        auto& interface = found->second;
+        const auto previous_flags = interface.flags;
+        const auto previous_ipv4 = interface.has_ipv4;
+
+        if (after.powered) {
+            interface.flags = static_cast<std::uint16_t>(
+                interface.flags | darwin::network::interface_flag_up |
+                darwin::network::interface_flag_running);
+        } else {
+            interface.flags = static_cast<std::uint16_t>(
+                interface.flags &
+                static_cast<std::uint16_t>(
+                    ~(darwin::network::interface_flag_up |
+                      darwin::network::interface_flag_running |
+                      darwin::network::interface_flag_output_active)));
+        }
+
+        interface.has_ipv4 = after.ipv4.has_value();
+        interface.ipv4_address = {};
+        interface.ipv4_netmask = {};
+        interface.ipv4_broadcast = {};
+        if (after.ipv4) {
+            const auto make_sockaddr = [](const std::array<std::byte, 4>& value) {
+                std::array<std::byte, 16> result{};
+                result[0] = std::byte{16};
+                result[1] = static_cast<std::byte>(
+                    darwin::network::address_family_inet);
+                std::copy(value.begin(), value.end(), result.begin() + 4);
+                return result;
+            };
+            interface.ipv4_address = make_sockaddr(after.ipv4->address);
+            interface.ipv4_netmask = make_sockaddr(after.ipv4->netmask);
+            interface.ipv4_broadcast = make_sockaddr(after.ipv4->broadcast);
+        }
+        flags_changed = previous_flags != interface.flags;
+        address_added = !previous_ipv4 && interface.has_ipv4;
+        address_deleted = previous_ipv4 && !interface.has_ipv4;
+    }
+
+    synchronize_interface_routes(
+        name, darwin::network::address_family_inet);
+
+    if (before.powered != after.powered) {
+        post_data_link_event(
+            name, after.powered ? darwin::network::kernel_event_link_on
+                                : darwin::network::kernel_event_link_off);
+    }
+    if (flags_changed) {
+        post_data_link_event(
+            name, darwin::network::kernel_event_interface_flags_changed);
+    }
+    if (address_added) {
+        post_network_event(
+            name, darwin::network::kernel_event_inet_subclass,
+            darwin::network::kernel_event_inet_new_address);
+    } else if (address_deleted) {
+        post_network_event(
+            name, darwin::network::kernel_event_inet_subclass,
+            darwin::network::kernel_event_inet_address_deleted);
+    }
+}
+
+void CompatibilityKernel::post_network_event(
+    std::string_view interface_name, std::uint32_t event_subclass,
+    std::uint32_t event_code) {
+    darwin::network::InterfaceSnapshot snapshot;
+    {
+        std::lock_guard network_lock{shared_state_->network_mutex};
+        const auto interface = shared_state_->network_interfaces.find(
+            std::string{interface_name});
+        if (interface == shared_state_->network_interfaces.end()) return;
+        snapshot = kernel_network::make_interface_snapshot(
+            interface->first, interface->second);
+    }
+    const auto event_data = darwin::network::make_network_event_data(snapshot);
+
+    std::lock_guard socket_lock{shared_state_->socket_mutex};
+    const auto identifier = shared_state_->next_kernel_event_identifier++;
+    KernelSharedState::KernelEvent event{
+        identifier,
+        darwin::network::kernel_event_vendor_apple,
+        darwin::network::kernel_event_network_class,
+        event_subclass,
+        event_code,
+        darwin::network::make_kernel_event(
+            identifier, darwin::network::kernel_event_vendor_apple,
+            darwin::network::kernel_event_network_class,
+            event_subclass,
+            event_code, event_data),
+    };
+    shared_state_->kernel_events.push_back(std::move(event));
+    while (shared_state_->kernel_events.size() >
+           darwin::network::maximum_retained_kernel_events) {
+        shared_state_->kernel_events.pop_front();
+    }
+}
+
+void CompatibilityKernel::post_data_link_event(
+    std::string_view interface_name, std::uint32_t event_code) {
+    post_network_event(
+        interface_name, darwin::network::kernel_event_data_link_subclass,
+        event_code);
+}
+
+bool CompatibilityKernel::system_event_matches(
+    std::uint32_t fd, const KernelSharedState::KernelEvent& event) const {
+    const auto filter = system_event_filters_.find(fd);
+    if (filter == system_event_filters_.end()) return true;
+    const auto [vendor, event_class, subclass] = filter->second;
+    if (vendor == darwin::network::kernel_event_any) return true;
+    if (vendor != event.vendor) return false;
+    if (event_class == darwin::network::kernel_event_any) return true;
+    if (event_class != event.event_class) return false;
+    return subclass == darwin::network::kernel_event_any ||
+           subclass == event.event_subclass;
+}
+
+bool CompatibilityKernel::system_event_available(std::uint32_t fd) const {
+    const auto cursor = system_event_next_identifiers_.find(fd);
+    if (cursor == system_event_next_identifiers_.end()) return false;
+    std::lock_guard socket_lock{shared_state_->socket_mutex};
+    return std::any_of(
+        shared_state_->kernel_events.begin(), shared_state_->kernel_events.end(),
+        [&](const auto& event) {
+            return event.identifier >= cursor->second &&
+                   system_event_matches(fd, event);
+        });
+}
+
+std::optional<KernelSharedState::KernelEvent>
+CompatibilityKernel::consume_system_event(std::uint32_t fd) {
+    const auto cursor = system_event_next_identifiers_.find(fd);
+    if (cursor == system_event_next_identifiers_.end()) return std::nullopt;
+    std::lock_guard socket_lock{shared_state_->socket_mutex};
+    const auto event = std::find_if(
+        shared_state_->kernel_events.begin(), shared_state_->kernel_events.end(),
+        [&](const auto& candidate) {
+            return candidate.identifier >= cursor->second &&
+                   system_event_matches(fd, candidate);
+        });
+    if (event == shared_state_->kernel_events.end()) return std::nullopt;
+    cursor->second = event->identifier + 1U;
+    return *event;
+}
+
+bool CompatibilityKernel::route_message_available(std::uint32_t fd) const {
+    const auto socket = route_socket_states_.find(fd);
+    if (socket == route_socket_states_.end() || !socket->second) return false;
+    const auto& state = *socket->second;
+    std::lock_guard route_lock{shared_state_->route_socket_mutex};
+    return std::any_of(
+        shared_state_->route_socket_messages.begin(),
+        shared_state_->route_socket_messages.end(),
+        [&](const auto& message) {
+            const auto receiver_matches =
+                !message.receiver_socket ||
+                *message.receiver_socket == state.identifier;
+            const auto family_matches =
+                message.receiver_socket || state.protocol == 0 ||
+                state.protocol == message.family;
+            return message.identifier >= state.next_message_identifier &&
+                   receiver_matches && family_matches;
+        });
+}
+
+std::optional<KernelSharedState::RouteSocketMessage>
+CompatibilityKernel::consume_route_message(std::uint32_t fd) {
+    const auto socket = route_socket_states_.find(fd);
+    if (socket == route_socket_states_.end() || !socket->second) {
+        return std::nullopt;
+    }
+    auto& state = *socket->second;
+    std::lock_guard route_lock{shared_state_->route_socket_mutex};
+    const auto message = std::find_if(
+        shared_state_->route_socket_messages.begin(),
+        shared_state_->route_socket_messages.end(),
+        [&](const auto& candidate) {
+            const auto receiver_matches =
+                !candidate.receiver_socket ||
+                *candidate.receiver_socket == state.identifier;
+            const auto family_matches =
+                candidate.receiver_socket || state.protocol == 0 ||
+                state.protocol == candidate.family;
+            return candidate.identifier >= state.next_message_identifier &&
+                   receiver_matches && family_matches;
+        });
+    if (message == shared_state_->route_socket_messages.end()) return std::nullopt;
+    state.next_message_identifier = message->identifier + 1U;
+    return *message;
+}
+
+void CompatibilityKernel::post_route_message(
+    std::vector<std::byte> bytes, std::uint8_t family,
+    std::optional<std::uint64_t> receiver_socket) {
+    std::lock_guard route_lock{shared_state_->route_socket_mutex};
+    KernelSharedState::RouteSocketMessage message;
+    message.identifier = shared_state_->next_route_message_identifier++;
+    message.bytes = std::move(bytes);
+    message.family = family;
+    message.receiver_socket = receiver_socket;
+    shared_state_->route_socket_messages.push_back(std::move(message));
+    while (shared_state_->route_socket_messages.size() >
+           darwin::route::maximum_retained_messages) {
+        shared_state_->route_socket_messages.pop_front();
+    }
+}
+
+void CompatibilityKernel::synchronize_interface_routes(
+    std::string_view interface_name, std::uint8_t family) {
+    KernelSharedState::NetworkInterface interface;
+    {
+        std::lock_guard network_lock{shared_state_->network_mutex};
+        const auto found = shared_state_->network_interfaces.find(
+            std::string{interface_name});
+        if (found == shared_state_->network_interfaces.end()) return;
+        interface = found->second;
+    }
+
+    std::vector<darwin::route::Entry> replacements;
+    if (family == darwin::network::address_family_inet &&
+        interface.has_ipv4) {
+        const auto loopback =
+            (interface.flags & darwin::network::interface_flag_loopback) != 0;
+        const auto flags = darwin::route::flag_up |
+                           (loopback ? darwin::route::flag_host : 0U);
+        const auto mask = loopback
+                              ? std::span<const std::byte>{}
+                              : std::span<const std::byte>{
+                                    interface.ipv4_netmask};
+        if (auto route = darwin::route::make_interface_route(
+                std::string{interface_name}, interface.index,
+                interface.ipv4_address, mask, flags)) {
+            replacements.push_back(std::move(*route));
+        }
+    } else if (family == darwin::network::address_family_inet6 &&
+               interface.has_ipv6) {
+        const auto mask_is_host = std::all_of(
+            interface.ipv6_netmask.begin() + 8,
+            interface.ipv6_netmask.begin() + 24,
+            [](std::byte byte) { return byte == std::byte{0xff}; });
+        if (!mask_is_host) {
+            if (auto prefix = darwin::route::make_interface_route(
+                    std::string{interface_name}, interface.index,
+                    interface.ipv6_address, interface.ipv6_netmask,
+                    darwin::route::flag_up |
+                        darwin::route::flag_cloning)) {
+                replacements.push_back(std::move(*prefix));
+            }
+        }
+        if (auto local = darwin::route::make_interface_route(
+                std::string{interface_name}, interface.index,
+                interface.ipv6_address, {},
+                darwin::route::flag_up | darwin::route::flag_host |
+                    darwin::route::flag_local)) {
+            replacements.push_back(std::move(*local));
+        }
+    }
+
+    const auto update = shared_state_->route_table.replace_interface_routes(
+        interface_name, family, replacements);
+    for (const auto& removed : update.removed) {
+        post_route_message(darwin::route::make_entry_message(
+            removed, 0, 0, false, false,
+            darwin::route::message_delete), removed.family);
+    }
+    for (const auto& added : update.added) {
+        post_route_message(darwin::route::make_entry_message(
+            added, 0, 0, false, false,
+            darwin::route::message_add), added.family);
+    }
+    if (!update.removed.empty() || !update.added.empty()) {
+        output_.write(
+            "[network] interface routes if=" +
+            std::string{interface_name} + " family=" +
+            std::to_string(family) + " removed=" +
+            std::to_string(update.removed.size()) + " added=" +
+            std::to_string(update.added.size()) + "\n");
+    }
+}
+
+bool CompatibilityKernel::descriptor_readable(std::uint32_t fd) const {
+    if (file_descriptors_.contains(fd)) return true;
+    if (const auto descriptor = virtual_descriptors_.find(fd);
+        descriptor != virtual_descriptors_.end() &&
+        descriptor->second == bsd::baseband_device::descriptor_kind &&
+        shared_state_->baseband_device_state.pending_receive_bytes() != 0) {
+        return true;
+    }
+    if (const auto host = host_sockets_.find(fd);
+        host != host_sockets_.end() && host->second->readable()) {
+        return true;
+    }
+    if (const auto udp = virtual_udp_sockets_.find(fd);
+        udp != virtual_udp_sockets_.end() && udp->second->readable()) {
+        return true;
+    }
+    if (listening_sockets_.contains(fd)) {
+        if (const auto listener = unix_listener_states_.find(fd);
+            listener != unix_listener_states_.end()) {
+            std::lock_guard socket_lock{shared_state_->socket_mutex};
+            if (!listener->second->pending_endpoints.empty()) return true;
+        }
+    }
+    const auto socket_ready = [&](std::uint32_t socket_fd) {
+        const auto endpoint = socket_pair_endpoints_.find(socket_fd);
+        if (endpoint == socket_pair_endpoints_.end()) return false;
+        std::lock_guard socket_lock{shared_state_->socket_mutex};
+        const auto pair = shared_state_->socket_pair_buffers.find(endpoint->second.pair);
+        return pair != shared_state_->socket_pair_buffers.end() &&
+               (!pair->second[endpoint->second.side].empty() ||
+                !endpoint->second.local_read_open() ||
+                !endpoint->second.peer_write_open());
+    };
+    if (socket_ready(fd)) return true;
+    if (system_event_available(fd)) return true;
+    if (route_message_available(fd)) return true;
+    const auto queue = kqueues_.find(fd);
+    if (queue == kqueues_.end()) return false;
+    return std::any_of(queue->second.begin(), queue->second.end(), [&](const auto& event) {
+        return (event.ident != fd && event.filter == -1 &&
+                descriptor_readable(event.ident)) ||
+               (event.filter == -2 && descriptor_writable(event.ident));
+    });
+}
+
+bool CompatibilityKernel::descriptor_writable(std::uint32_t fd) const {
+    if (fd == 1 || fd == 2 || file_descriptors_.contains(fd) ||
+        socket_pair_endpoints_.contains(fd)) {
+        return true;
+    }
+    if (const auto host = host_sockets_.find(fd); host != host_sockets_.end()) {
+        return host->second->writable();
+    }
+    if (const auto udp = virtual_udp_sockets_.find(fd);
+        udp != virtual_udp_sockets_.end()) {
+        return udp->second->writable();
+    }
+    if (const auto control = kernel_control_endpoints_.find(fd);
+        control != kernel_control_endpoints_.end()) {
+        return control->second->peer.has_value();
+    }
+    if (const auto descriptor = virtual_descriptors_.find(fd);
+        descriptor != virtual_descriptors_.end() &&
+        (descriptor->second == "route-socket" ||
+         descriptor->second == bsd::baseband_device::descriptor_kind)) {
+        return true;
+    }
+    return false;
+}
+
+std::optional<std::uint32_t> CompatibilityKernel::socket_pending_byte_count(
+    std::uint32_t fd, std::uint32_t& darwin_error) const {
+    darwin_error = 0;
+    if (const auto host = host_sockets_.find(fd); host != host_sockets_.end()) {
+        const auto pending = host->second->pending_bytes();
+        if (pending.status == HostSocketStatus::Error) {
+            darwin_error = pending.darwin_error;
+            return std::nullopt;
+        }
+        return static_cast<std::uint32_t>(std::min<std::size_t>(
+            pending.transferred, std::numeric_limits<std::uint32_t>::max()));
+    }
+    if (const auto udp = virtual_udp_sockets_.find(fd);
+        udp != virtual_udp_sockets_.end()) {
+        return static_cast<std::uint32_t>(std::min<std::size_t>(
+            udp->second->pending_bytes(),
+            std::numeric_limits<std::uint32_t>::max()));
+    }
+    if (const auto descriptor = virtual_descriptors_.find(fd);
+        descriptor != virtual_descriptors_.end() &&
+        descriptor->second == bsd::baseband_device::descriptor_kind) {
+        return static_cast<std::uint32_t>(std::min<std::size_t>(
+            shared_state_->baseband_device_state.pending_receive_bytes(),
+            std::numeric_limits<std::uint32_t>::max()));
+    }
+    if (const auto endpoint = socket_pair_endpoints_.find(fd);
+        endpoint != socket_pair_endpoints_.end()) {
+        std::lock_guard socket_lock{shared_state_->socket_mutex};
+        return static_cast<std::uint32_t>(std::min<std::size_t>(
+            shared_state_->socket_pair_buffers[endpoint->second.pair]
+                                                [endpoint->second.side]
+                                                    .size(),
+            std::numeric_limits<std::uint32_t>::max()));
+    }
+    if (kernel_control_endpoints_.contains(fd)) {
+        return 0;
+    }
+    if (const auto descriptor = virtual_descriptors_.find(fd);
+        descriptor != virtual_descriptors_.end() &&
+        (descriptor->second.starts_with("unix-") ||
+         descriptor->second.starts_with("inet") ||
+         descriptor->second == "socketpair")) {
+        return 0;
+    }
+    darwin_error = 25;  // ENOTTY
+    return std::nullopt;
+}
+
+std::optional<std::uint32_t> CompatibilityKernel::collect_ready_kevents(
+    std::uint32_t queue_fd, std::uint32_t event_address, std::uint32_t event_count) {
+    const auto queue = kqueues_.find(queue_fd);
+    if (queue == kqueues_.end()) return std::nullopt;
+    std::uint32_t written = 0;
+    for (const auto& registration : queue->second) {
+        const auto ready = registration.filter == darwin::kqueue::filter_read
+                               ? descriptor_readable(registration.ident)
+                           : registration.filter == darwin::kqueue::filter_write
+                               ? descriptor_writable(registration.ident)
+                               : false;
+        if (written == event_count || !ready) {
+            continue;
+        }
+        std::uint32_t available = 1;
+        if (const auto endpoint = socket_pair_endpoints_.find(registration.ident);
+            endpoint != socket_pair_endpoints_.end()) {
+            std::lock_guard socket_lock{shared_state_->socket_mutex};
+            available = static_cast<std::uint32_t>(
+                shared_state_->socket_pair_buffers[endpoint->second.pair]
+                                                  [endpoint->second.side]
+                                                      .size());
+        }
+        const auto event = event_address +
+                           written * darwin::kqueue::arm32_event::size;
+        if (!memory_.write32(
+                event + darwin::kqueue::arm32_event::identifier_offset,
+                registration.ident) ||
+            !memory_.write16(
+                event + darwin::kqueue::arm32_event::filter_offset,
+                static_cast<std::uint16_t>(registration.filter)) ||
+            !memory_.write16(
+                event + darwin::kqueue::arm32_event::flags_offset, 0) ||
+            !memory_.write32(
+                event + darwin::kqueue::arm32_event::filter_flags_offset, 0) ||
+            !memory_.write32(
+                event + darwin::kqueue::arm32_event::data_offset, available) ||
+            !memory_.write32(
+                event + darwin::kqueue::arm32_event::user_data_offset,
+                registration.user_data)) {
+            return std::nullopt;
+        }
+        ++written;
+    }
+    return written;
+}
+
+void CompatibilityKernel::detach_kevents_for_descriptor(std::uint32_t fd) {
+    for (auto& [queue_fd, registrations] : kqueues_) {
+        (void)queue_fd;
+        std::erase_if(registrations, [fd](const auto& registration) {
+            return registration.ident == fd;
+        });
+    }
+}
+
+
+}  // namespace ilegacysim

@@ -1,0 +1,3 @@
+add_library(ilegacysim_device_state STATIC lockdown_profile.cpp)
+add_library(iLegacySim::device_state ALIAS ilegacysim_device_state)
+ilegacysim_configure_module(ilegacysim_device_state)

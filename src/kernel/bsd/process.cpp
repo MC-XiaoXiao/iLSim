@@ -1,0 +1,457 @@
+#include "ilegacysim/kernel.hpp"
+
+#include "ilegacysim/darwin_abi.hpp"
+#include "ilegacysim/darwin_kqueue_abi.hpp"
+#include "ilegacysim/darwin_network_abi.hpp"
+#include "ilegacysim/darwin_resource_abi.hpp"
+#include "ilegacysim/darwin_route_socket.hpp"
+#include "ilegacysim/kernel_network.hpp"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <fstream>
+#include <iterator>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <span>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "support.hpp"
+
+namespace ilegacysim {
+
+void CompatibilityKernel::dispatch_bsd_process(Cpu &cpu, std::uint32_t number) {
+  if (dispatch_bsd_process_credentials(cpu, number))
+    return;
+  if (dispatch_bsd_process_spawn(cpu, number))
+    return;
+
+  auto &registers = cpu.registers();
+  switch (number) {
+  case 0: { // syscall: call number in r0, arguments shifted by one register
+    const auto indirect_number = registers[0];
+    for (std::size_t index = 0; index < 6; ++index) {
+      registers[index] = registers[index + 1];
+    }
+    registers[6] = 0;
+    dispatch_bsd(cpu, indirect_number);
+    return;
+  }
+  case 1: // exit
+    shared_state_->advisory_file_locks->release_process_record_locks(
+        process_.pid);
+    process_.exited = true;
+    process_.exit_status = registers[0];
+    process_.termination_signal = 0;
+    if (auto record = shared_state_->processes.find(process_.pid);
+        record != shared_state_->processes.end()) {
+      record->second.exited = true;
+      record->second.exit_status = process_.exit_status;
+      record->second.termination_signal = 0;
+    }
+    output_.write("[process] exit pid=" + std::to_string(process_.pid) +
+                  " status=" + std::to_string(process_.exit_status) + "\n");
+    bsd_success(cpu, 0);
+    cpu.halt(Dynarmic::HaltReason::UserDefined1);
+    return;
+  case 2: { // fork
+    const auto child = fork_handler_ ? fork_handler_(cpu) : std::nullopt;
+    if (!child) {
+      bsd_error(cpu, 11); // EAGAIN
+      return;
+    }
+    output_.write("[process] fork parent=" + std::to_string(process_.pid) +
+                  " child=" + std::to_string(*child) + " bootstrap=" +
+                  std::to_string(process_.bootstrap_port) + "\n");
+    bsd_success(cpu, *child);
+    return;
+  }
+  case 66: { // vfork
+    // The child receives a private snapshot rather than temporarily
+    // sharing the parent's memory. This is stricter isolation but keeps
+    // the observable fork/exec ABI while the parent and child are scheduled.
+    const auto child = fork_handler_ ? fork_handler_(cpu) : std::nullopt;
+    if (!child) {
+      bsd_error(cpu, 11);
+      return;
+    }
+    output_.write("[process] vfork parent=" + std::to_string(process_.pid) +
+                  " child=" + std::to_string(*child) + " bootstrap=" +
+                  std::to_string(process_.bootstrap_port) + "\n");
+    bsd_success(cpu, *child);
+    return;
+  }
+  case 7: { // wait4
+    const auto target_pid = static_cast<std::int32_t>(registers[0]);
+    const auto options = registers[2];
+    if (target_pid == 0 || target_pid < -1) {
+      bsd_error(cpu, bsd_support::invalid_argument);
+      return;
+    }
+    if ((options & 1U) != 0) { // WNOHANG: no child status is ready yet
+      bsd_success(cpu, 0);
+      return;
+    }
+    pending_waits_.insert_or_assign(
+        cpu.processor_id(),
+        PendingWait{target_pid, registers[1], options, cpu.processor_id()});
+    output_.write("[process] wait pid=" + std::to_string(process_.pid) +
+                  " target=" + std::to_string(target_pid) + "\n");
+    process_.waiting_for_events = true;
+    bsd_success(cpu, 0);
+    cpu.halt(Dynarmic::HaltReason::UserDefined5);
+    return;
+  }
+  case 20: // getpid
+    bsd_success(cpu, process_.pid);
+    return;
+  case 24: // getuid
+    bsd_success(cpu, process_.uid);
+    return;
+  case 25: // geteuid
+    bsd_success(cpu, process_.effective_uid);
+    return;
+  case 39: // getppid
+    bsd_success(cpu, process_.parent_pid);
+    return;
+  case 43: // getegid
+    bsd_success(cpu, process_.effective_gid);
+    return;
+  case 47: // getgid
+    bsd_success(cpu, process_.gid);
+    return;
+  case 46: { // sigaction
+    const auto signal = registers[0];
+    if (signal == 0 || signal >= signal_actions_.size() || signal == 9 ||
+        signal == 17) { // SIGKILL / SIGSTOP
+      bsd_error(cpu, bsd_support::invalid_argument);
+      return;
+    }
+    auto &action = signal_actions_[signal];
+    if (registers[2] != 0) {
+      // The output ABI is struct sigaction: handler, mask, flags.
+      if (!memory_.write32(registers[2], action[0]) ||
+          !memory_.write32(registers[2] + 4, action[2]) ||
+          !memory_.write32(registers[2] + 8, action[3])) {
+        bsd_error(cpu, bsd_support::bad_address);
+        return;
+      }
+    }
+    if (registers[1] != 0) {
+      // The input ABI is struct __sigaction and additionally contains
+      // the userspace signal trampoline.
+      for (std::size_t index = 0; index < action.size(); ++index) {
+        const auto value = memory_.read32(
+            registers[1] + static_cast<std::uint32_t>(index * 4U));
+        if (!value) {
+          bsd_error(cpu, bsd_support::bad_address);
+          return;
+        }
+        action[index] = *value;
+      }
+    }
+    bsd_success(cpu, 0);
+    return;
+  }
+  case 48: { // sigprocmask
+    constexpr std::uint32_t unblockable =
+        (1U << (9U - 1U)) | (1U << (17U - 1U));
+    if (registers[2] != 0 && !memory_.write32(registers[2], signal_mask_)) {
+      bsd_error(cpu, bsd_support::bad_address);
+      return;
+    }
+    if (registers[1] != 0) {
+      const auto requested = memory_.read32(registers[1]);
+      if (!requested) {
+        bsd_error(cpu, bsd_support::bad_address);
+        return;
+      }
+      switch (registers[0]) {
+      case 1:
+        signal_mask_ |= *requested;
+        break; // SIG_BLOCK
+      case 2:
+        signal_mask_ &= ~*requested;
+        break; // SIG_UNBLOCK
+      case 3:
+        signal_mask_ = *requested;
+        break; // SIG_SETMASK
+      default:
+        bsd_error(cpu, bsd_support::invalid_argument);
+        return;
+      }
+      signal_mask_ &= ~unblockable;
+    }
+    bsd_success(cpu, 0);
+    return;
+  }
+  case 49: { // getlogin
+    if (registers[1] == 0 || process_.login_name.size() + 1 > registers[1]) {
+      bsd_error(cpu, 34); // ERANGE
+      return;
+    }
+    std::vector<std::byte> bytes(process_.login_name.size() + 1);
+    for (std::size_t index = 0; index < process_.login_name.size(); ++index) {
+      bytes[index] = static_cast<std::byte>(process_.login_name[index]);
+    }
+    if (!memory_.copy_in(registers[0], bytes)) {
+      bsd_error(cpu, bsd_support::bad_address);
+      return;
+    }
+    bsd_success(cpu, 0);
+    return;
+  }
+  case 50: { // setlogin
+    const auto name = memory_.read_c_string(registers[0], 256);
+    if (!name) {
+      bsd_error(cpu, bsd_support::bad_address);
+      return;
+    }
+    if (name->size() >= 32) {
+      bsd_error(cpu, bsd_support::invalid_argument);
+      return;
+    }
+    process_.login_name = *name;
+    bsd_success(cpu, 0);
+    return;
+  }
+  case 55: // reboot
+    output_.write("[kernel] guest reboot request flags=0x" + [&] {
+      std::ostringstream value;
+      value << std::hex << registers[0];
+      return value.str();
+    }() + " denied\n");
+    bsd_error(cpu, 1); // EPERM until a virtual machine reset controller exists
+    return;
+  case 60: { // umask
+    const auto previous = process_.file_creation_mask;
+    process_.file_creation_mask = registers[0] & 0777U;
+    bsd_success(cpu, previous);
+    return;
+  }
+  case 59: { // execve
+    const auto path = memory_.read_c_string(registers[0]);
+    const auto read_vector =
+        [&](std::uint32_t address) -> std::optional<std::vector<std::string>> {
+      std::vector<std::string> values;
+      if (address == 0)
+        return values;
+      for (std::uint32_t index = 0; index < 4096; ++index) {
+        const auto pointer = memory_.read32(address + index * 4U);
+        if (!pointer)
+          return std::nullopt;
+        if (*pointer == 0)
+          return values;
+        const auto value = memory_.read_c_string(*pointer, 64U * 1024U);
+        if (!value)
+          return std::nullopt;
+        values.push_back(*value);
+      }
+      return std::nullopt;
+    };
+    const auto arguments = read_vector(registers[1]);
+    const auto environment = read_vector(registers[2]);
+    if (!path || !arguments || !environment) {
+      bsd_error(cpu, bsd_support::bad_address);
+      return;
+    }
+    std::error_code path_error;
+    const auto host_path = resolve_guest_path(*path);
+    if (!std::filesystem::is_regular_file(host_path, path_error)) {
+      bsd_error(cpu, 2); // ENOENT; execvp will continue its PATH search
+      return;
+    }
+    std::ostringstream exec_message;
+    exec_message << "[process] exec pid=" << process_.pid << " " << *path
+                 << " argv=";
+    for (std::size_t index = 0; index < arguments->size(); ++index) {
+      if (index != 0)
+        exec_message << ',';
+      exec_message << '"' << (*arguments)[index] << '"';
+    }
+    exec_message << '\n';
+    output_.write(exec_message.str());
+    if (!exec_handler_ ||
+        !exec_handler_(cpu, *path, *arguments, *environment)) {
+      bsd_error(cpu, 2); // ENOENT
+      return;
+    }
+    cpu.halt(Dynarmic::HaltReason::UserDefined6);
+    return;
+  }
+  case 96: // setpriority
+    if (registers[0] != 0 ||
+        (registers[1] != 0 && registers[1] != process_.pid)) {
+      bsd_error(cpu, bsd_support::invalid_argument);
+    } else {
+      process_.nice_value =
+          std::clamp(static_cast<std::int32_t>(registers[2]), -20, 20);
+      // XNU 792 resetpriority() calls task_importance(-p_nice), whose
+      // task base is BASEPRI_DEFAULT + importance.
+      process_.thread_base_priority =
+          xnu792::scheduler::default_base_priority - process_.nice_value;
+      if (task_priority_handler_) {
+        task_priority_handler_(process_.thread_base_priority);
+      }
+      bsd_success(cpu, 0);
+    }
+    return;
+  case 116: { // gettimeofday
+    constexpr std::uint32_t firmware_epoch = 1'180'000'000U;
+    const auto absolute_time = shared_state_->clock.now();
+    if (registers[0] != 0 &&
+        (!memory_.write32(registers[0],
+                          firmware_epoch +
+                              static_cast<std::uint32_t>(absolute_time /
+                                                         1'000'000'000ULL)) ||
+         !memory_.write32(registers[0] + 4,
+                          static_cast<std::uint32_t>(
+                              (absolute_time / 1'000ULL) % 1'000'000ULL)))) {
+      bsd_error(cpu, bsd_support::bad_address);
+      return;
+    }
+    if (registers[1] != 0 && (!memory_.write32(registers[1], 0) ||
+                              !memory_.write32(registers[1] + 4, 0))) {
+      bsd_error(cpu, bsd_support::bad_address);
+      return;
+    }
+    bsd_success(cpu, 0);
+    return;
+  }
+  case 147: // setsid
+    process_.process_group = process_.pid;
+    process_.session_id = process_.pid;
+    bsd_success(cpu, process_.pid);
+    return;
+  case darwin::syscall::get_resource_limit: {
+    const auto resource = darwin::resource::selector(registers[0]);
+    if (resource >= process_.resource_limits.size()) {
+      bsd_error(cpu, bsd_support::invalid_argument);
+      return;
+    }
+    if (registers[1] > std::numeric_limits<std::uint32_t>::max() -
+                           darwin::resource::arm32_limit_size + 1U) {
+      bsd_error(cpu, bsd_support::bad_address);
+      return;
+    }
+    const auto &limit = process_.resource_limits[resource];
+    if (!memory_.write64(registers[1], limit.current) ||
+        !memory_.write64(registers[1] + sizeof(std::uint64_t), limit.maximum)) {
+      bsd_error(cpu, bsd_support::bad_address);
+      return;
+    }
+    bsd_success(cpu, 0);
+    return;
+  }
+  case darwin::syscall::set_resource_limit: {
+    const auto raw_resource = registers[0];
+    const auto resource = darwin::resource::selector(raw_resource);
+    if (resource >= process_.resource_limits.size()) {
+      bsd_error(cpu, bsd_support::invalid_argument);
+      return;
+    }
+    if (registers[1] > std::numeric_limits<std::uint32_t>::max() -
+                           darwin::resource::arm32_limit_size + 1U) {
+      bsd_error(cpu, bsd_support::bad_address);
+      return;
+    }
+    const auto requested_current = memory_.read64(registers[1]);
+    const auto requested_maximum =
+        memory_.read64(registers[1] + sizeof(std::uint64_t));
+    if (!requested_current || !requested_maximum) {
+      bsd_error(cpu, bsd_support::bad_address);
+      return;
+    }
+    if (*requested_current > *requested_maximum) {
+      bsd_error(cpu, bsd_support::invalid_argument);
+      return;
+    }
+    auto &limit = process_.resource_limits[resource];
+    if ((*requested_current > limit.maximum ||
+         *requested_maximum > limit.maximum) &&
+        process_.effective_uid != 0) {
+      bsd_error(cpu, darwin::error::operation_not_permitted);
+      return;
+    }
+    auto maximum = *requested_maximum;
+    auto current = *requested_current;
+    if (resource == darwin::resource::open_files) {
+      if (current != limit.current &&
+          current > darwin::resource::maximum_open_files &&
+          darwin::resource::requests_posix_behavior(raw_resource)) {
+        bsd_error(cpu, bsd_support::invalid_argument);
+        return;
+      }
+      maximum = std::min(maximum, darwin::resource::maximum_open_files);
+      current = std::min(current, maximum);
+    }
+    limit = darwin::resource::Limit{current, maximum};
+    output_.write("[process] setrlimit pid=" + std::to_string(process_.pid) +
+                  " resource=" + std::to_string(resource) +
+                  " current=" + std::to_string(current) +
+                  " maximum=" + std::to_string(maximum) + "\n");
+    bsd_success(cpu, 0);
+    return;
+  }
+  case darwin::syscall::disable_thread_signal:
+    // Darwin 8 ignores the integer argument: the operation permanently
+    // marks the current uthread UT_NO_SIGMASK and returns zero.
+    disabled_thread_signals_.insert(cpu.processor_id());
+    bsd_success(cpu, 0);
+    return;
+  case 333: // __pthread_canceled: cancellation bookkeeping is per guest thread
+    bsd_success(cpu, 0);
+    return;
+  case darwin::syscall::semaphore_wait_signal: { // __semwait_signal
+    std::optional<std::uint64_t> timeout_interval;
+    if (registers[2] != 0) {
+      if (registers[5] >= 1'000'000'000U) {
+        bsd_error(cpu, bsd_support::invalid_argument);
+        return;
+      }
+      const auto requested =
+          static_cast<std::uint64_t>(registers[4]) * 1'000'000'000ULL +
+          registers[5];
+      if (registers[3] != 0) {
+        timeout_interval = requested;
+      } else {
+        constexpr std::uint64_t firmware_epoch_ns =
+            1'180'000'000ULL * 1'000'000'000ULL;
+        const auto now = firmware_epoch_ns + shared_state_->clock.now();
+        timeout_interval = requested > now ? requested - now : 0;
+      }
+    }
+    wait_on_semaphore(cpu, registers[0], registers[1], timeout_interval, true);
+    return;
+  }
+  case 327: // issetugid
+    bsd_success(cpu, 0);
+    return;
+  case 355: { // getaudit
+    // Darwin 8 auditinfo: auid, two mask words, terminal port/machine,
+    // and audit session ID (six 32-bit words).
+    for (std::uint32_t offset = 0; offset < 24; offset += 4) {
+      if (!memory_.write32(registers[0] + offset,
+                           offset == 20 ? process_.pid : 0)) {
+        bsd_error(cpu, bsd_support::bad_address);
+        return;
+      }
+    }
+    bsd_success(cpu, 0);
+    return;
+  }
+  default:
+    trace_unknown(cpu, "BSD syscall", number);
+    return;
+  }
+}
+
+} // namespace ilegacysim

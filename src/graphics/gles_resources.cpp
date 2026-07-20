@@ -1,0 +1,404 @@
+#include "ilegacysim/gles_resources.hpp"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <span>
+#include <utility>
+#include <vector>
+
+#include "ilegacysim/address_space.hpp"
+#include "ilegacysim/gles_abi.hpp"
+#include "ilegacysim/surface_store.hpp"
+
+namespace ilegacysim {
+namespace {
+
+struct PixelLayout {
+    std::uint32_t bytes_per_pixel{};
+};
+
+std::optional<PixelLayout> pixel_layout(
+    std::uint32_t format, std::uint32_t type) {
+    using namespace gles_abi;
+    if (type == unsigned_byte) {
+        switch (format) {
+        case alpha:
+        case luminance: return PixelLayout{1};
+        case luminance_alpha: return PixelLayout{2};
+        case rgb: return PixelLayout{3};
+        case rgba:
+        case bgra_apple: return PixelLayout{4};
+        default: return std::nullopt;
+        }
+    }
+    if ((type == unsigned_short_5_6_5 && format == rgb) ||
+        ((type == unsigned_short_4_4_4_4 ||
+          type == unsigned_short_5_5_5_1) && format == rgba)) {
+        return PixelLayout{2};
+    }
+    return std::nullopt;
+}
+
+std::uint32_t expand(std::uint32_t value, std::uint32_t maximum) {
+    return (value * 255U + maximum / 2U) / maximum;
+}
+
+std::uint32_t decode_pixel(
+    std::span<const std::byte> bytes, std::uint32_t format,
+    std::uint32_t type) {
+    using namespace gles_abi;
+    const auto byte = [&](std::size_t index) {
+        return std::to_integer<std::uint32_t>(bytes[index]);
+    };
+    std::uint32_t red{};
+    std::uint32_t green{};
+    std::uint32_t blue{};
+    std::uint32_t alpha_value{255};
+    if (type == unsigned_byte) {
+        if (format == rgba) {
+            red = byte(0); green = byte(1); blue = byte(2); alpha_value = byte(3);
+        } else if (format == bgra_apple) {
+            blue = byte(0); green = byte(1); red = byte(2); alpha_value = byte(3);
+        } else if (format == rgb) {
+            red = byte(0); green = byte(1); blue = byte(2);
+        } else if (format == luminance) {
+            red = green = blue = byte(0);
+        } else if (format == luminance_alpha) {
+            red = green = blue = byte(0); alpha_value = byte(1);
+        } else if (format == alpha) {
+            red = green = blue = 255U;
+            alpha_value = byte(0);
+        }
+    } else {
+        const auto packed = byte(0) | (byte(1) << 8U);
+        if (type == unsigned_short_5_6_5) {
+            red = expand((packed >> 11U) & 0x1fU, 0x1fU);
+            green = expand((packed >> 5U) & 0x3fU, 0x3fU);
+            blue = expand(packed & 0x1fU, 0x1fU);
+        } else if (type == unsigned_short_4_4_4_4) {
+            red = expand((packed >> 12U) & 0x0fU, 0x0fU);
+            green = expand((packed >> 8U) & 0x0fU, 0x0fU);
+            blue = expand((packed >> 4U) & 0x0fU, 0x0fU);
+            alpha_value = expand(packed & 0x0fU, 0x0fU);
+        } else {
+            red = expand((packed >> 11U) & 0x1fU, 0x1fU);
+            green = expand((packed >> 6U) & 0x1fU, 0x1fU);
+            blue = expand((packed >> 1U) & 0x1fU, 0x1fU);
+            alpha_value = (packed & 1U) != 0 ? 255U : 0U;
+        }
+    }
+    return (alpha_value << 24U) | (red << 16U) | (green << 8U) | blue;
+}
+
+bool valid_alignment(std::uint32_t alignment) {
+    return alignment == 1 || alignment == 2 || alignment == 4 ||
+           alignment == 8;
+}
+
+std::optional<std::vector<std::uint32_t>> decode_image(
+    AddressSpace& memory, std::uint32_t width, std::uint32_t height,
+    std::uint32_t format, std::uint32_t type, std::uint32_t pixels,
+    std::uint32_t alignment) {
+    const auto layout = pixel_layout(format, type);
+    if (!layout || !valid_alignment(alignment)) return std::nullopt;
+    const auto row_bytes = static_cast<std::uint64_t>(width) *
+                           layout->bytes_per_pixel;
+    const auto stride = (row_bytes + alignment - 1U) &
+                        ~static_cast<std::uint64_t>(alignment - 1U);
+    const auto total = height == 0 ? 0 :
+        stride * (height - 1U) + row_bytes;
+    if (total > gles_abi::maximum_resource_bytes ||
+        total > std::numeric_limits<std::uint32_t>::max()) {
+        return std::nullopt;
+    }
+    std::vector<std::uint32_t> result(
+        static_cast<std::size_t>(width) * height, 0);
+    if (pixels == 0 || total == 0) return result;
+    const auto source = memory.read_bytes(pixels, static_cast<std::size_t>(total));
+    if (!source) return std::nullopt;
+    for (std::uint32_t y = 0; y < height; ++y) {
+        for (std::uint32_t x = 0; x < width; ++x) {
+            const auto offset = static_cast<std::size_t>(
+                static_cast<std::uint64_t>(y) * stride +
+                static_cast<std::uint64_t>(x) * layout->bytes_per_pixel);
+            result[static_cast<std::size_t>(y) * width + x] = decode_pixel(
+                std::span<const std::byte>{*source}.subspan(
+                    offset, layout->bytes_per_pixel), format, type);
+        }
+    }
+    return result;
+}
+
+std::optional<GlesResourceStore::TextureLevel> decode_surface(
+    AddressSpace& memory, const SurfaceStore::Backing& backing) {
+    if (backing.pixel_format != surface_pixel_format_bgra ||
+        backing.width > gles_abi::maximum_texture_dimension ||
+        backing.height > gles_abi::maximum_texture_dimension) {
+        return std::nullopt;
+    }
+    constexpr auto pixel_size = sizeof(std::uint32_t);
+    const auto row_bytes = static_cast<std::uint64_t>(backing.width) *
+                           pixel_size;
+    if (row_bytes > backing.bytes_per_row) return std::nullopt;
+    const auto required = backing.height == 0
+                              ? 0
+                              : static_cast<std::uint64_t>(backing.height - 1U) *
+                                        backing.bytes_per_row +
+                                    row_bytes;
+    if (required > backing.allocation_size ||
+        required > gles_abi::maximum_resource_bytes ||
+        required > std::numeric_limits<std::size_t>::max()) {
+        return std::nullopt;
+    }
+    const auto source = memory.read_bytes(
+        backing.base, static_cast<std::size_t>(required));
+    if (!source) return std::nullopt;
+    std::vector<std::uint32_t> pixels(
+        static_cast<std::size_t>(backing.width) * backing.height);
+    for (std::uint32_t y = 0; y < backing.height; ++y) {
+        for (std::uint32_t x = 0; x < backing.width; ++x) {
+            const auto offset = static_cast<std::size_t>(
+                static_cast<std::uint64_t>(y) * backing.bytes_per_row +
+                static_cast<std::uint64_t>(x) * pixel_size);
+            const auto blue = std::to_integer<std::uint32_t>((*source)[offset]);
+            const auto green =
+                std::to_integer<std::uint32_t>((*source)[offset + 1U]);
+            const auto red =
+                std::to_integer<std::uint32_t>((*source)[offset + 2U]);
+            const auto alpha_value =
+                std::to_integer<std::uint32_t>((*source)[offset + 3U]);
+            pixels[static_cast<std::size_t>(y) * backing.width + x] =
+                (alpha_value << 24U) | (red << 16U) |
+                (green << 8U) | blue;
+        }
+    }
+    return GlesResourceStore::TextureLevel{
+        backing.width, backing.height, gles_abi::bgra_apple,
+        std::move(pixels), backing.id};
+}
+
+}  // namespace
+
+void GlesResourceStore::reset() {
+    textures_.clear();
+    buffers_.clear();
+    generated_textures_.clear();
+    generated_buffers_.clear();
+    next_texture_ = 1;
+    next_buffer_ = 1;
+}
+
+void GlesResourceStore::inherit_state(const GlesResourceStore& parent) {
+    textures_ = parent.textures_;
+    buffers_ = parent.buffers_;
+    generated_textures_ = parent.generated_textures_;
+    generated_buffers_ = parent.generated_buffers_;
+    next_texture_ = parent.next_texture_;
+    next_buffer_ = parent.next_buffer_;
+}
+
+std::uint32_t GlesResourceStore::generate_texture() {
+    const auto name = next_texture_++;
+    generated_textures_.insert(name);
+    return name;
+}
+
+std::uint32_t GlesResourceStore::generate_buffer() {
+    const auto name = next_buffer_++;
+    generated_buffers_.insert(name);
+    return name;
+}
+
+void GlesResourceStore::ensure_texture(std::uint32_t name) {
+    if (name == 0) return;
+    generated_textures_.insert(name);
+    textures_.try_emplace(name, Texture{name, {}, {}});
+    next_texture_ = std::max(next_texture_, name + 1U);
+}
+
+void GlesResourceStore::ensure_buffer(std::uint32_t name) {
+    if (name == 0) return;
+    generated_buffers_.insert(name);
+    buffers_.try_emplace(name, Buffer{name, 0, {}});
+    next_buffer_ = std::max(next_buffer_, name + 1U);
+}
+
+void GlesResourceStore::erase_texture(std::uint32_t name) {
+    textures_.erase(name);
+    generated_textures_.erase(name);
+}
+
+void GlesResourceStore::erase_buffer(std::uint32_t name) {
+    buffers_.erase(name);
+    generated_buffers_.erase(name);
+}
+
+bool GlesResourceStore::has_texture(std::uint32_t name) const {
+    return textures_.contains(name);
+}
+
+bool GlesResourceStore::has_buffer(std::uint32_t name) const {
+    return buffers_.contains(name);
+}
+
+std::uint32_t GlesResourceStore::upload_texture_2d(
+    AddressSpace& memory, std::uint32_t name, std::uint32_t level,
+    std::uint32_t internal_format, std::uint32_t width,
+    std::uint32_t height, std::uint32_t format, std::uint32_t type,
+    std::uint32_t pixels, std::uint32_t alignment) {
+    if (name == 0 || !textures_.contains(name)) {
+        return gles_abi::invalid_operation;
+    }
+    if (width > gles_abi::maximum_texture_dimension ||
+        height > gles_abi::maximum_texture_dimension ||
+        static_cast<std::uint64_t>(width) * height * sizeof(std::uint32_t) >
+            gles_abi::maximum_resource_bytes) {
+        return gles_abi::invalid_value;
+    }
+    if (!pixel_layout(format, type)) return gles_abi::invalid_enum;
+    auto decoded = decode_image(
+        memory, width, height, format, type, pixels, alignment);
+    if (!decoded) return gles_abi::invalid_value;
+    textures_.at(name).levels.insert_or_assign(
+        level, TextureLevel{
+                   width, height, internal_format, std::move(*decoded),
+                   std::nullopt});
+    return gles_abi::no_error;
+}
+
+std::uint32_t GlesResourceStore::update_texture_2d(
+    AddressSpace& memory, std::uint32_t name, std::uint32_t level,
+    std::uint32_t x, std::uint32_t y, std::uint32_t width,
+    std::uint32_t height, std::uint32_t format, std::uint32_t type,
+    std::uint32_t pixels, std::uint32_t alignment) {
+    auto texture = textures_.find(name);
+    if (name == 0 || texture == textures_.end()) {
+        return gles_abi::invalid_operation;
+    }
+    auto destination = texture->second.levels.find(level);
+    if (destination == texture->second.levels.end()) {
+        return gles_abi::invalid_operation;
+    }
+    if (x > destination->second.width || y > destination->second.height ||
+        width > destination->second.width - x ||
+        height > destination->second.height - y || pixels == 0) {
+        return gles_abi::invalid_value;
+    }
+    if (!pixel_layout(format, type)) return gles_abi::invalid_enum;
+    const auto decoded = decode_image(
+        memory, width, height, format, type, pixels, alignment);
+    if (!decoded) return gles_abi::invalid_value;
+    for (std::uint32_t row = 0; row < height; ++row) {
+        std::copy_n(
+            decoded->begin() + static_cast<std::size_t>(row) * width, width,
+            destination->second.argb.begin() +
+                static_cast<std::size_t>(y + row) * destination->second.width + x);
+    }
+    return gles_abi::no_error;
+}
+
+std::uint32_t GlesResourceStore::set_texture_parameter(
+    std::uint32_t name, std::uint32_t parameter, std::uint32_t value) {
+    auto texture = textures_.find(name);
+    if (name == 0 || texture == textures_.end()) {
+        return gles_abi::invalid_operation;
+    }
+    texture->second.parameters.insert_or_assign(parameter, value);
+    return gles_abi::no_error;
+}
+
+std::uint32_t GlesResourceStore::import_surface_texture(
+    AddressSpace& memory, std::uint32_t name, const SurfaceStore& surfaces,
+    std::uint32_t surface_id) {
+    auto texture = textures_.find(name);
+    if (name == 0 || texture == textures_.end()) {
+        return gles_abi::invalid_operation;
+    }
+    const auto backing = surfaces.find(surface_id);
+    if (!backing) return gles_abi::invalid_value;
+    if (backing->pixel_format != surface_pixel_format_bgra) {
+        return gles_abi::invalid_enum;
+    }
+    auto decoded = decode_surface(memory, *backing);
+    if (!decoded) return gles_abi::invalid_value;
+    texture->second.levels.insert_or_assign(0, std::move(*decoded));
+    return gles_abi::no_error;
+}
+
+std::uint32_t GlesResourceStore::refresh_surface_texture(
+    AddressSpace& memory, std::uint32_t name, const SurfaceStore& surfaces) {
+    auto texture = textures_.find(name);
+    if (name == 0 || texture == textures_.end()) {
+        return gles_abi::no_error;
+    }
+    auto level = texture->second.levels.find(0);
+    if (level == texture->second.levels.end() ||
+        !level->second.surface_id) {
+        return gles_abi::no_error;
+    }
+    const auto backing = surfaces.find(*level->second.surface_id);
+    if (!backing) return gles_abi::invalid_operation;
+    auto decoded = decode_surface(memory, *backing);
+    if (!decoded) {
+        return backing->pixel_format == surface_pixel_format_bgra
+                   ? gles_abi::invalid_value
+                   : gles_abi::invalid_enum;
+    }
+    level->second = std::move(*decoded);
+    return gles_abi::no_error;
+}
+
+std::uint32_t GlesResourceStore::upload_buffer(
+    AddressSpace& memory, std::uint32_t name, std::uint32_t size,
+    std::uint32_t data, std::uint32_t usage) {
+    auto buffer = buffers_.find(name);
+    if (name == 0 || buffer == buffers_.end()) {
+        return gles_abi::invalid_operation;
+    }
+    if (size > gles_abi::maximum_resource_bytes) {
+        return gles_abi::out_of_memory;
+    }
+    std::vector<std::byte> bytes(size);
+    if (data != 0 && size != 0) {
+        const auto source = memory.read_bytes(data, size);
+        if (!source) return gles_abi::invalid_value;
+        bytes = *source;
+    }
+    buffer->second.usage = usage;
+    buffer->second.bytes = std::move(bytes);
+    return gles_abi::no_error;
+}
+
+std::uint32_t GlesResourceStore::update_buffer(
+    AddressSpace& memory, std::uint32_t name, std::uint32_t offset,
+    std::uint32_t size, std::uint32_t data) {
+    auto buffer = buffers_.find(name);
+    if (name == 0 || buffer == buffers_.end()) {
+        return gles_abi::invalid_operation;
+    }
+    if (offset > buffer->second.bytes.size() ||
+        size > buffer->second.bytes.size() - offset || data == 0) {
+        return gles_abi::invalid_value;
+    }
+    const auto source = memory.read_bytes(data, size);
+    if (!source) return gles_abi::invalid_value;
+    std::copy(source->begin(), source->end(),
+              buffer->second.bytes.begin() + offset);
+    return gles_abi::no_error;
+}
+
+const GlesResourceStore::Texture* GlesResourceStore::texture(
+    std::uint32_t name) const {
+    const auto found = textures_.find(name);
+    return found == textures_.end() ? nullptr : &found->second;
+}
+
+const GlesResourceStore::Buffer* GlesResourceStore::buffer(
+    std::uint32_t name) const {
+    const auto found = buffers_.find(name);
+    return found == buffers_.end() ? nullptr : &found->second;
+}
+
+}  // namespace ilegacysim

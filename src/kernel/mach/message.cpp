@@ -1,0 +1,555 @@
+#include "ilegacysim/bootstrap_mig_ids.hpp"
+#include "ilegacysim/darwin_abi.hpp"
+#include "ilegacysim/darwin_kqueue_abi.hpp"
+#include "ilegacysim/darwin_network_abi.hpp"
+#include "ilegacysim/darwin_resource_abi.hpp"
+#include "ilegacysim/darwin_route_socket.hpp"
+#include "ilegacysim/graphics_services_input.hpp"
+#include "ilegacysim/kernel.hpp"
+#include "ilegacysim/kernel_clock.hpp"
+#include "ilegacysim/kernel_iokit.hpp"
+#include "ilegacysim/kernel_mach_ipc.hpp"
+#include "ilegacysim/kernel_network.hpp"
+#include "ilegacysim/mach_clock_abi.hpp"
+#include "ilegacysim/mach_descriptor_transport.hpp"
+#include "ilegacysim/mach_host_mig_ids.hpp"
+#include "ilegacysim/mach_port_mig_ids.hpp"
+#include "ilegacysim/mach_scheduler_abi.hpp"
+#include "ilegacysim/mach_thread_policy_abi.hpp"
+#include "ilegacysim/mig_wire_abi.hpp"
+#include "ilegacysim/task_mig_ids.hpp"
+#include "ilegacysim/thread_act_mig_ids.hpp"
+#include "ilegacysim/vm_map_mig_ids.hpp"
+#include "ilegacysim/xnu_mig_adapter.hpp"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <fstream>
+#include <iterator>
+#include <limits>
+#include <span>
+#include <sstream>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "support.hpp"
+
+namespace ilegacysim {
+
+using namespace mach_support;
+
+void CompatibilityKernel::dispatch_mach_message(Cpu &cpu) {
+  auto &registers = cpu.registers();
+  const auto message_address = registers[0];
+  const auto begin_receive = [&] {
+    const auto timeout_enabled =
+        (registers[1] & darwin::mach_message::option_receive_timeout) != 0;
+    const auto timeout_milliseconds = registers[5];
+    std::optional<std::uint64_t> deadline;
+    if (timeout_enabled) {
+      const auto interval =
+          static_cast<std::uint64_t>(timeout_milliseconds) *
+          darwin::mach::scheduler::nanoseconds_per_millisecond;
+      const auto now = shared_state_->clock.now();
+      deadline = interval > std::numeric_limits<std::uint64_t>::max() - now
+                     ? std::numeric_limits<std::uint64_t>::max()
+                     : now + interval;
+    }
+    pending_mach_receives_[cpu.processor_id()] =
+        PendingMachReceive{message_address, registers[3],       registers[4],
+                           registers[1],    cpu.processor_id(), deadline};
+    process_.waiting_for_events = true;
+    {
+      std::lock_guard mach_lock{shared_state_->mach_mutex};
+      if (deliver_pending_mach_locked(cpu))
+        return;
+    }
+    if (timeout_enabled && timeout_milliseconds == 0) {
+      pending_mach_receives_.erase(cpu.processor_id());
+      process_.waiting_for_events = false;
+      registers[0] = darwin::mach_message::receive_timed_out;
+      return;
+    }
+    cpu.halt(Dynarmic::HaltReason::UserDefined5);
+  };
+  if (registers[2] == 0 && (registers[1] & 0x2U) != 0) {
+    begin_receive();
+    return;
+  }
+  const auto bits =
+      memory_.read32(message_address + darwin::mig_wire::header_bits_offset);
+  const auto remote_port = memory_.read32(
+      message_address + darwin::mig_wire::header_remote_port_offset);
+  const auto local_port = memory_.read32(
+      message_address + darwin::mig_wire::header_local_port_offset);
+  const auto message_id = memory_.read32(
+      message_address + darwin::mig_wire::header_identifier_offset);
+  if (!bits || !remote_port || !local_port || !message_id) {
+    registers[0] = 0x1000000eU; // MACH_SEND_INVALID_MEMORY
+    return;
+  }
+  if (const auto result = handle_clock_mach_request(
+          memory_, *shared_state_, process_, *message_id, message_address,
+          registers[2], registers[3], *remote_port, *local_port)) {
+    registers[0] = *result;
+    return;
+  }
+  const MachMessageRequest request{message_address, *bits, *remote_port,
+                                   *local_port, *message_id};
+  if (dispatch_mach_host_message(cpu, request) ||
+      dispatch_mach_processor_message(cpu, request) ||
+      dispatch_mach_port_message(cpu, request) ||
+      dispatch_mach_task_enumeration_message(cpu, request) ||
+      dispatch_mach_thread_lifecycle_message(cpu, request) ||
+      dispatch_mach_thread_state_message(cpu, request) ||
+      dispatch_mach_task_vm_message(cpu, request) ||
+      dispatch_mach_rights_message(cpu, request) ||
+      dispatch_mach_notification_message(cpu, request)) {
+    return;
+  }
+  if (const auto result = handle_iokit_mach_request(
+          memory_, output_, *shared_state_, process_, *message_id,
+          message_address, registers[2], registers[3], *remote_port,
+          *local_port,
+          IOKitMachCallSite{registers[15], registers[14], registers[7]})) {
+    registers[0] = *result;
+    return;
+  }
+  if (*message_id == mig_message_id(xnu792::mig::bootstrap::Routine::look_up) &&
+      process_.pid == 1 && registers[3] >= 36) {
+    // launchd probes its own bootstrap namespace before its server
+    // receive loop exists. Match XNU/launchd's normal early negative
+    // lookup; requests from child processes are routed to PID 1 below.
+    const std::array<std::uint32_t, 9> reply{
+        18,          36,          *local_port, 0, 0, *message_id + 100,
+        0x00000000U, 0x00000001U, 1102,
+    };
+    for (std::size_t index = 0; index < reply.size(); ++index) {
+      if (!memory_.write32(message_address +
+                               static_cast<std::uint32_t>(index * 4U),
+                           reply[index])) {
+        registers[0] = 0x10004008U;
+        return;
+      }
+    }
+    registers[0] = 0;
+    return;
+  }
+  if ((registers[1] & 0x1U) != 0 && registers[2] >= 24 &&
+      registers[2] <= 64U * 1024U) {
+    auto bytes = memory_.read_bytes(message_address, registers[2]);
+    std::uint32_t remote_object = 0;
+    std::uint32_t remote_owner = 0;
+    std::size_t remote_queue_depth = 0;
+    std::string bootstrap_service_name;
+    const auto caller_header_size =
+        memory_.read32(message_address + darwin::mig_wire::header_size_offset)
+            .value_or(0);
+    bool routable = false;
+    std::optional<std::uint32_t> graphics_event_type;
+    std::vector<std::uint32_t> exit_snapshot_pixels;
+    std::optional<std::uint32_t> transferred_receive;
+    std::vector<KernelSharedState::MachMessage::OolPayload> ool_payloads;
+    std::vector<KernelSharedState::MachMessage::OolPortArray> ool_port_arrays;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ool_deallocations;
+    if (bytes && mach_ipc::normalize_send_header(*bytes, registers[2])) {
+      graphics_event_type = graphics_services_input::event_type(*bytes);
+      if (graphics_event_type == graphics_services_input::
+                                     application_will_resign_active_event_type) {
+        exit_snapshot_pixels = display_state_->snapshot().pixels;
+      }
+      if (*message_id ==
+          mig_message_id(xnu792::mig::bootstrap::Routine::look_up)) {
+        constexpr auto service_offset =
+            xnu792::mig::bootstrap::look_up_arguments[2].request_offset;
+        constexpr std::size_t maximum_service_length = 128;
+        for (std::size_t index = 0; index < maximum_service_length &&
+                                    service_offset + index < bytes->size();
+             ++index) {
+          const auto character =
+              std::to_integer<unsigned char>((*bytes)[service_offset + index]);
+          if (character == 0)
+            break;
+          if (character < 0x20U || character > 0x7eU) {
+            bootstrap_service_name.clear();
+            break;
+          }
+          bootstrap_service_name.push_back(static_cast<char>(character));
+        }
+      }
+      const auto descriptors = mach_transport::parse_descriptors(*bytes);
+      if (!descriptors) {
+        registers[0] = 0x1000000eU;
+        return;
+      }
+      for (const auto &descriptor : *descriptors) {
+        if (descriptor.kind ==
+            mach_transport::DescriptorKind::OutOfLineMemory) {
+          const auto size = descriptor.count_or_size;
+          if (size > maximum_message_io ||
+              (size != 0 && descriptor.address_or_name == 0)) {
+            registers[0] = 0x1000000eU;
+            return;
+          }
+          auto payload =
+              size == 0 ? std::optional<
+                              std::vector<std::byte>>{std::vector<std::byte>{}}
+                        : memory_.read_bytes(descriptor.address_or_name, size);
+          if (!payload) {
+            registers[0] = 0x1000000eU;
+            return;
+          }
+          ool_payloads.push_back(KernelSharedState::MachMessage::OolPayload{
+              descriptor.offset, std::move(*payload)});
+          if (descriptor.deallocate() && size != 0) {
+            ool_deallocations.emplace_back(descriptor.address_or_name, size);
+          }
+        } else if (descriptor.kind ==
+                   mach_transport::DescriptorKind::OutOfLinePorts) {
+          if (descriptor.count_or_size >
+              maximum_message_io / darwin::mig_wire::word_size) {
+            registers[0] = 0x1000000eU;
+            return;
+          }
+          const auto byte_size =
+              descriptor.count_or_size * darwin::mig_wire::word_size;
+          if ((byte_size != 0 && descriptor.address_or_name == 0) ||
+              (byte_size != 0 &&
+               !memory_.read_bytes(descriptor.address_or_name, byte_size))) {
+            registers[0] = 0x1000000eU;
+            return;
+          }
+          ool_port_arrays.push_back(
+              {descriptor.offset, descriptor.count_or_size});
+          if (descriptor.deallocate() && byte_size != 0) {
+            ool_deallocations.emplace_back(descriptor.address_or_name,
+                                           byte_size);
+          }
+        }
+      }
+      std::lock_guard mach_lock{shared_state_->mach_mutex};
+      const auto destination_disposition = *bits & 0xffU;
+      const auto destination_right =
+          right_for_disposition(destination_disposition);
+      const auto destination_source_right =
+          source_right_for_disposition(destination_disposition);
+      auto destination_object =
+          destination_right
+              ? resolve_name_with_right(*shared_state_, process_.pid,
+                                        *remote_port, *destination_right)
+              : std::nullopt;
+      // Received MIG headers retain MAKE_SEND/MAKE_SEND_ONCE in some old
+      // libSystem paths even though copyout installed the resulting send
+      // right. Locally-created messages such as pthread's recycle message,
+      // however, legitimately address a receive right with MAKE_SEND. Accept
+      // both representations while preserving the resulting right type.
+      if (!destination_object && destination_source_right &&
+          destination_source_right != destination_right) {
+        destination_object =
+            resolve_name_with_right(*shared_state_, process_.pid, *remote_port,
+                                    *destination_source_right);
+      }
+      if (!destination_object ||
+          (*destination_right != xnu792::ipc::Right::Send &&
+           *destination_right != xnu792::ipc::Right::SendOnce)) {
+        destination_object.reset();
+      }
+      if (destination_object)
+        remote_object = *destination_object;
+      // A task-local send name resolves to one global ipc_port
+      // object. Port-set membership is retained separately because
+      // a receive right may be temporarily in transit.
+      const auto is_port_set_member = std::any_of(
+          shared_state_->mach_port_sets.begin(),
+          shared_state_->mach_port_sets.end(), [&](const auto &port_set) {
+            return std::find(port_set.second.begin(), port_set.second.end(),
+                             remote_object) != port_set.second.end();
+          });
+      routable = destination_object &&
+                 (shared_state_->mach_port_objects.contains(remote_object) ||
+                  is_port_set_member);
+      // CoreFoundation deliberately uses a zero-timeout send for run-loop
+      // wakeups. XNU rejects a duplicate wakeup once the port's one-message
+      // queue is full; allowing it to grow without bound starves the main
+      // run loop during periodic display notifications.
+      if (routable &&
+          (registers[1] & darwin::mach_message::option_send_timeout) != 0 &&
+          registers[5] == 0) {
+        const auto port =
+            shared_state_->mach_port_objects.lookup(remote_object);
+        const auto queue = shared_state_->mach_queues.find(remote_object);
+        const auto queue_depth = queue == shared_state_->mach_queues.end()
+                                     ? 0U
+                                     : queue->second.size();
+        if (port && queue_depth >= port->queue_limit) {
+          registers[0] = darwin::mach_message::send_timed_out;
+          return;
+        }
+      }
+      if (routable) {
+        std::optional<std::uint32_t> reply_object;
+        std::optional<xnu792::ipc::Right> reply_right;
+        std::uint32_t reply_disposition = 0;
+        std::vector<KernelSharedState::MachMessage::PortTransfer>
+            port_transfers;
+        const auto capture = [&](std::uint32_t name, std::uint32_t disposition,
+                                 std::uint32_t offset,
+                                 std::optional<std::uint32_t> array_index = {})
+            -> std::optional<KernelSharedState::MachMessage::PortTransfer> {
+          const auto source = source_right_for_disposition(disposition);
+          const auto result_right = right_for_disposition(disposition);
+          if (!source || !result_right)
+            return std::nullopt;
+          const auto object = resolve_name_with_right(
+              *shared_state_, process_.pid, name, *source);
+          if (!object)
+            return std::nullopt;
+          return KernelSharedState::MachMessage::PortTransfer{
+              offset, name, array_index, *object, *result_right, disposition};
+        };
+
+        const auto reply_name =
+            memory_
+                .read32(message_address +
+                        darwin::mig_wire::header_local_port_offset)
+                .value_or(0);
+        if (reply_name != xnu792::ipc::null_name) {
+          reply_disposition = (*bits >> 8U) & 0xffU;
+          if (const auto transfer = capture(reply_name, reply_disposition, 0)) {
+            reply_object = transfer->object;
+            reply_right = transfer->right;
+          } else {
+            routable = false;
+          }
+        }
+
+        if (routable) {
+          for (const auto &descriptor : *descriptors) {
+            if (descriptor.kind == mach_transport::DescriptorKind::Port) {
+              const auto name = descriptor.address_or_name;
+              if (name == xnu792::ipc::null_name)
+                continue;
+              if (const auto transfer = capture(name, descriptor.disposition(),
+                                                descriptor.offset)) {
+                port_transfers.push_back(*transfer);
+              } else {
+                routable = false;
+                break;
+              }
+              continue;
+            }
+            if (descriptor.kind !=
+                mach_transport::DescriptorKind::OutOfLinePorts) {
+              continue;
+            }
+            for (std::uint32_t element = 0; element < descriptor.count_or_size;
+                 ++element) {
+              const auto name =
+                  memory_
+                      .read32(descriptor.address_or_name +
+                              element * darwin::mig_wire::word_size)
+                      .value_or(0);
+              if (name == xnu792::ipc::null_name)
+                continue;
+              if (const auto transfer = capture(name, descriptor.disposition(),
+                                                descriptor.offset, element)) {
+                port_transfers.push_back(*transfer);
+              } else {
+                routable = false;
+                break;
+              }
+            }
+            if (!routable)
+              break;
+          }
+        }
+
+        const auto consume_transfer = [&](std::uint32_t name,
+                                          std::uint32_t disposition) {
+          const auto source = source_right_for_disposition(disposition);
+          if (!source)
+            return false;
+          if (disposition != 16U && disposition != 17U && disposition != 18U) {
+            return true;
+          }
+          return consume_moved_right_locked(*shared_state_, process_.pid, name,
+                                            *source, true);
+        };
+        if (routable && reply_object &&
+            !consume_transfer(reply_name, reply_disposition)) {
+          routable = false;
+        }
+        if (routable) {
+          for (const auto &transfer : port_transfers) {
+            if (!consume_transfer(transfer.sender_name, transfer.disposition)) {
+              routable = false;
+              break;
+            }
+            if (transfer.right == xnu792::ipc::Right::Receive) {
+              transferred_receive = transfer.object;
+            }
+          }
+        }
+        if (routable && ((*bits & 0xffU) == 17U || (*bits & 0xffU) == 18U) &&
+            !consume_moved_right_locked(*shared_state_, process_.pid,
+                                        *remote_port, *destination_right,
+                                        false)) {
+          routable = false;
+        }
+        if (routable) {
+          const auto retain_inflight = [&](std::uint32_t object,
+                                           xnu792::ipc::Right right,
+                                           std::uint32_t disposition) {
+            if (right == xnu792::ipc::Right::Send) {
+              ++shared_state_->mach_inflight_send_rights[object];
+            }
+            if (disposition == 20U) { // MAKE_SEND
+              static_cast<void>(
+                  shared_state_->mach_port_objects.increment_make_send_count(
+                      object));
+            }
+          };
+          if (reply_object && reply_right) {
+            retain_inflight(*reply_object, *reply_right, reply_disposition);
+          }
+          for (const auto &transfer : port_transfers) {
+            retain_inflight(transfer.object, transfer.right,
+                            transfer.disposition);
+          }
+          if (!bootstrap_service_name.empty() && reply_object) {
+            graphics_services_input::record_bootstrap_lookup_locked(
+                *shared_state_, *reply_object, bootstrap_service_name);
+          }
+          const auto service_resolution =
+              graphics_services_input::record_bootstrap_reply_locked(
+                  *shared_state_, remote_object, port_transfers);
+          if (graphics_event_type) {
+            graphics_services_input::record_application_lifecycle_event_locked(
+                *shared_state_, process_.pid, remote_object,
+                *graphics_event_type, exit_snapshot_pixels);
+          }
+          if (service_resolution.object != 0 &&
+              (service_resolution.application_event_port ||
+               service_resolution.service_name ==
+                   graphics_services_input::system_event_service)) {
+            output_.write(
+                "[input] resolved service=" + service_resolution.service_name +
+                " object=" + std::to_string(service_resolution.object) +
+                " flushed=" +
+                std::to_string(service_resolution.flushed_events) +
+                (service_resolution.application_event_port
+                     ? " application-event-port"
+                     : "") +
+                "\n");
+          }
+          KernelSharedState::MachMessage queued;
+          queued.bytes = *bytes;
+          queued.destination = remote_object;
+          queued.sender_pid = process_.pid;
+          queued.sender_uid = process_.effective_uid;
+          queued.sender_gid = process_.effective_gid;
+          queued.ool_payloads = std::move(ool_payloads);
+          queued.ool_port_arrays = std::move(ool_port_arrays);
+          queued.reply_object = reply_object;
+          queued.reply_right = reply_right;
+          queued.port_transfers = std::move(port_transfers);
+          shared_state_->mach_queues[remote_object].push_back(
+              std::move(queued));
+          remote_owner = shared_state_->mach_port_objects.lookup(remote_object)
+                             .value_or(xnu792::ipc::PortObject{})
+                             .receive_owner;
+          remote_queue_depth = shared_state_->mach_queues[remote_object].size();
+        }
+      }
+    }
+    if (routable) {
+      for (const auto &[address, size] : ool_deallocations) {
+        static_cast<void>(memory_.unmap(address, size));
+      }
+      if (transferred_receive) {
+        output_.write("[mach] move-receive in-transit port=" +
+                      std::to_string(*transferred_receive) +
+                      " from=" + std::to_string(process_.pid) + "\n");
+      }
+      output_.write("[mach] enqueue sender=" + std::to_string(process_.pid) +
+                    " port=" + std::to_string(*remote_port) +
+                    " object=" + std::to_string(remote_object) +
+                    " owner=" + std::to_string(remote_owner) +
+                    " depth=" + std::to_string(remote_queue_depth) +
+                    " id=" + std::to_string(*message_id) +
+                    mig_message_label(*message_id) +
+                    (bootstrap_service_name.empty()
+                         ? std::string{}
+                         : " service=" + bootstrap_service_name) +
+                    " caller-header=" + std::to_string(caller_header_size) +
+                    " bytes=" + std::to_string(registers[2]) + "\n");
+      if (process_.pid != 0) {
+        if (graphics_event_type) {
+          output_.write(
+              "[graphics-event] sender=" + std::to_string(process_.pid) +
+              " type=" + std::to_string(*graphics_event_type) +
+              " bytes=" + std::to_string(registers[2]) + "\n");
+        }
+      }
+      if ((registers[1] & 0x2U) != 0) {
+        begin_receive();
+      } else {
+        registers[0] = 0;
+      }
+      return;
+    }
+  }
+  std::uint32_t unsupported_object = 0;
+  std::uint32_t unsupported_owner = 0;
+  bool unsupported_known_right = false;
+  {
+    std::lock_guard mach_lock{shared_state_->mach_mutex};
+    if (const auto object = shared_state_->mach_namespaces.resolve(
+            process_.pid, *remote_port)) {
+      unsupported_object = *object;
+      unsupported_known_right =
+          shared_state_->mach_port_objects.contains(*object);
+      if (const auto port_object =
+              shared_state_->mach_port_objects.lookup(*object)) {
+        unsupported_owner = port_object->receive_owner;
+      }
+    }
+  }
+  // Invalid destination names are an ordinary Mach IPC result. MIG servers
+  // also use a null destination when a demux routine returns MIG_NO_REPLY;
+  // neither case is an unknown kernel call and neither may halt the guest.
+  if ((registers[1] & darwin::mach_message::option_send) != 0 &&
+      registers[2] >= darwin::mig_wire::message_header_size &&
+      registers[2] <= 64U * 1024U &&
+      (*remote_port == xnu792::ipc::null_name || !unsupported_known_right)) {
+    registers[0] = darwin::mach_message::send_invalid_destination;
+    return;
+  }
+  std::ostringstream message;
+  message << "[mach_msg] unsupported id=" << *message_id
+          << mig_message_label(*message_id) << " bits=0x" << std::hex << *bits
+          << " header=0x"
+          << memory_
+                 .read32(message_address + darwin::mig_wire::header_size_offset)
+                 .value_or(0xffffffffU)
+          << " send=0x" << registers[2] << " remote=0x" << *remote_port
+          << " object=0x" << unsupported_object << " known_right=" << std::dec
+          << unsupported_known_right << " owner=" << unsupported_owner;
+  for (std::size_t offset = 24; offset + 4 <= registers[2]; offset += 4) {
+    message << " w" << std::dec << (offset / 4) << "=0x" << std::hex
+            << memory_
+                   .read32(message_address + static_cast<std::uint32_t>(offset))
+                   .value_or(0xffffffffU);
+  }
+  message << std::dec << '\n';
+  output_.write(message.str());
+  trace_unknown(cpu, "Mach trap", 31);
+  registers[0] = darwin::mach_message::send_invalid_destination;
+  return;
+}
+
+} // namespace ilegacysim

@@ -1,0 +1,10 @@
+add_subdirectory(iokit)
+
+ilegacysim_add_compatibility_suite(
+    ilegacysim_kernel_tests kernel
+    kernel_tests.cpp
+    sysctl_tests.cpp
+    device_tests.cpp)
+target_link_libraries(ilegacysim_kernel_tests PRIVATE
+    iLegacySim::kernel_iokit_power_tests
+    iLegacySim::kernel_iokit_display_tests)

@@ -1,0 +1,7 @@
+/build/
+/external/
+/tools/dmg2img/
+/tools/hfsfuse/
+*.log
+/sources/
+/firmwares/

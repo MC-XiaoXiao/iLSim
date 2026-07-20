@@ -1,0 +1,480 @@
+#include "ilegacysim/graphics_services_input.hpp"
+
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <mutex>
+#include <vector>
+
+#include "ilegacysim/display.hpp"
+#include "ilegacysim/mig_wire_abi.hpp"
+
+namespace ilegacysim::graphics_services_input {
+namespace {
+
+constexpr std::uint32_t copy_send_bits = 19;
+constexpr std::uint32_t graphics_event_message_id = 123;
+constexpr std::uint32_t application_did_become_active_event_type = 50;
+constexpr std::uint32_t hand_event_type = 3001;
+constexpr std::uint32_t menu_button_down_event_type = 1000;
+constexpr std::uint32_t menu_button_up_event_type = 1001;
+constexpr std::uint32_t volume_up_button_down_event_type = 1006;
+constexpr std::uint32_t volume_up_button_up_event_type = 1007;
+constexpr std::uint32_t volume_down_button_down_event_type = 1008;
+constexpr std::uint32_t volume_down_button_up_event_type = 1009;
+constexpr std::uint32_t lock_button_down_event_type = 1010;
+constexpr std::uint32_t lock_button_up_event_type = 1011;
+constexpr std::size_t event_record_size = 48;
+constexpr std::size_t hand_info_size = 20;
+constexpr std::size_t path_info_size = 16;
+constexpr std::size_t event_payload_size =
+    event_record_size + hand_info_size + path_info_size;
+constexpr std::size_t hand_message_size =
+    darwin::mig_wire::message_header_size + event_payload_size;
+constexpr std::size_t simple_event_message_size =
+    darwin::mig_wire::message_header_size + event_record_size;
+
+constexpr std::size_t record_location_offset = 8;
+constexpr std::size_t record_window_location_offset = 16;
+constexpr std::size_t record_timestamp_offset = 24;
+constexpr std::size_t record_info_size_offset = 44;
+constexpr std::size_t hand_offset =
+    darwin::mig_wire::message_header_size + event_record_size;
+constexpr std::size_t hand_path_count_offset = hand_offset + 17;
+constexpr std::size_t path_offset = hand_offset + hand_info_size;
+constexpr std::size_t path_pressure_offset = path_offset + 4;
+constexpr std::size_t path_location_offset = path_offset + 8;
+
+constexpr std::uint8_t path_index = 1;
+constexpr std::uint8_t path_identity = 2;
+constexpr std::uint8_t path_active_proximity = 3;
+
+void write_word(std::span<std::byte> bytes, std::size_t offset,
+                std::uint32_t value) {
+  for (std::size_t byte = 0; byte < sizeof(value); ++byte) {
+    bytes[offset + byte] = static_cast<std::byte>(value >> (byte * 8U));
+  }
+}
+
+void write_float(std::span<std::byte> bytes, std::size_t offset, float value) {
+  write_word(bytes, offset, std::bit_cast<std::uint32_t>(value));
+}
+
+std::uint32_t read_word(std::span<const std::byte> bytes, std::size_t offset) {
+  std::uint32_t value = 0;
+  for (std::size_t byte = 0; byte < sizeof(value); ++byte) {
+    value |= std::to_integer<std::uint32_t>(bytes[offset + byte])
+             << (byte * 8U);
+  }
+  return value;
+}
+
+std::uint32_t hand_type(TouchPhase phase) {
+  // These are the values consumed by this firmware's UIKit binary, not the
+  // values published by reconstructed headers for later iPhone OS releases.
+  // UIWindow::sendEvent: branches on 1 (down), 2 (drag), and 5 (up). In
+  // particular, 0 reaches the correct window but is ignored before _mouseDown:.
+  switch (phase) {
+  case TouchPhase::Down:
+    return 1;
+  case TouchPhase::Move:
+    return 2;
+  case TouchPhase::Up:
+    return 5;
+  case TouchPhase::Cancel:
+    return 3;
+  }
+  return 3;
+}
+
+bool active(TouchPhase phase) {
+  return phase == TouchPhase::Down || phase == TouchPhase::Move;
+}
+
+std::uint32_t system_button_event_type(const SystemButtonInput &input) {
+  const auto down = input.phase == SystemButtonPhase::Down;
+  switch (input.button) {
+  case SystemButton::Home:
+    return down ? menu_button_down_event_type : menu_button_up_event_type;
+  case SystemButton::Lock:
+    return down ? lock_button_down_event_type : lock_button_up_event_type;
+  case SystemButton::VolumeUp:
+    return down ? volume_up_button_down_event_type
+                : volume_up_button_up_event_type;
+  case SystemButton::VolumeDown:
+    return down ? volume_down_button_down_event_type
+                : volume_down_button_up_event_type;
+  }
+  return menu_button_up_event_type;
+}
+
+KernelSharedState::MachMessage make_touch_message(std::uint32_t destination,
+                                                  std::uint64_t timestamp,
+                                                  const TouchInput &input) {
+  KernelSharedState::MachMessage message;
+  message.bytes.resize(hand_message_size, std::byte{0});
+  message.destination = destination;
+  message.sender_pid = 0;
+
+  write_word(message.bytes, darwin::mig_wire::header_bits_offset,
+             copy_send_bits);
+  write_word(message.bytes, darwin::mig_wire::header_size_offset,
+             static_cast<std::uint32_t>(hand_message_size));
+  write_word(message.bytes, darwin::mig_wire::header_remote_port_offset,
+             destination);
+  write_word(message.bytes, darwin::mig_wire::header_identifier_offset,
+             graphics_event_message_id);
+
+  const auto record = darwin::mig_wire::message_header_size;
+  write_word(message.bytes, record, hand_event_type);
+  write_float(message.bytes, record + record_location_offset, input.x);
+  write_float(message.bytes, record + record_location_offset + 4, input.y);
+  write_float(message.bytes, record + record_window_location_offset, input.x);
+  write_float(message.bytes, record + record_window_location_offset + 4,
+              input.y);
+  write_word(message.bytes, record + record_timestamp_offset,
+             static_cast<std::uint32_t>(timestamp));
+  write_word(message.bytes, record + record_timestamp_offset + 4,
+             static_cast<std::uint32_t>(timestamp >> 32U));
+  write_word(message.bytes, record + record_info_size_offset,
+             static_cast<std::uint32_t>(hand_info_size + path_info_size));
+
+  write_word(message.bytes, hand_offset, hand_type(input.phase));
+  message.bytes[hand_path_count_offset] = std::byte{1};
+  message.bytes[path_offset] = static_cast<std::byte>(path_index);
+  message.bytes[path_offset + 1] = static_cast<std::byte>(path_identity);
+  message.bytes[path_offset + 2] =
+      static_cast<std::byte>(active(input.phase) ? path_active_proximity : 0);
+  write_float(message.bytes, path_pressure_offset,
+              active(input.phase) ? 1.0F : 0.0F);
+  write_float(message.bytes, path_location_offset, input.x);
+  write_float(message.bytes, path_location_offset + 4, input.y);
+  return message;
+}
+
+KernelSharedState::MachMessage
+make_simple_event_message(std::uint32_t destination, std::uint64_t timestamp,
+                          std::uint32_t event_type) {
+  KernelSharedState::MachMessage message;
+  message.bytes.resize(simple_event_message_size, std::byte{0});
+  message.destination = destination;
+  message.sender_pid = 0;
+
+  write_word(message.bytes, darwin::mig_wire::header_bits_offset,
+             copy_send_bits);
+  write_word(message.bytes, darwin::mig_wire::header_size_offset,
+             static_cast<std::uint32_t>(simple_event_message_size));
+  write_word(message.bytes, darwin::mig_wire::header_remote_port_offset,
+             destination);
+  write_word(message.bytes, darwin::mig_wire::header_identifier_offset,
+             graphics_event_message_id);
+  const auto record = darwin::mig_wire::message_header_size;
+  write_word(message.bytes, record, event_type);
+  write_word(message.bytes, record + record_timestamp_offset,
+             static_cast<std::uint32_t>(timestamp));
+  write_word(message.bytes, record + record_timestamp_offset + 4,
+             static_cast<std::uint32_t>(timestamp >> 32U));
+  return message;
+}
+
+void queue_locked(KernelSharedState &state, std::uint32_t destination,
+                  const TouchInput &input) {
+  state.mach_queues[destination].push_back(
+      make_touch_message(destination, state.clock.now(), input));
+}
+
+void queue_simple_event_locked(KernelSharedState &state,
+                               std::uint32_t destination,
+                               std::uint32_t event_type) {
+  state.mach_queues[destination].push_back(
+      make_simple_event_message(destination, state.clock.now(), event_type));
+}
+
+} // namespace
+
+std::optional<std::uint32_t> event_type(std::span<const std::byte> message) {
+  constexpr std::size_t event_type_offset =
+      darwin::mig_wire::message_header_size;
+  if (message.size() < event_type_offset + sizeof(std::uint32_t) ||
+      read_word(message, darwin::mig_wire::header_identifier_offset) !=
+          graphics_event_message_id) {
+    return std::nullopt;
+  }
+  return read_word(message, event_type_offset);
+}
+
+void record_bootstrap_lookup_locked(KernelSharedState &state,
+                                    std::uint32_t reply_object,
+                                    std::string_view service_name) {
+  if (reply_object != 0 && !service_name.empty()) {
+    state.pending_bootstrap_service_lookups[reply_object] =
+        std::string{service_name};
+  }
+}
+
+ServiceResolution record_bootstrap_reply_locked(
+    KernelSharedState &state, std::uint32_t reply_object,
+    std::span<const KernelSharedState::MachMessage::PortTransfer> transfers) {
+  const auto pending =
+      state.pending_bootstrap_service_lookups.find(reply_object);
+  if (pending == state.pending_bootstrap_service_lookups.end())
+    return {};
+
+  const auto service_name = std::move(pending->second);
+  state.pending_bootstrap_service_lookups.erase(pending);
+  const auto service = std::find_if(
+      transfers.begin(), transfers.end(), [](const auto &transfer) {
+        return transfer.right == xnu792::ipc::Right::Send;
+      });
+  if (service == transfers.end())
+    return {};
+
+  std::size_t flushed = 0;
+  bool application_event_port = false;
+  if (service_name == system_event_service) {
+    state.bootstrap_service_objects[service_name] = service->object;
+    while (!state.pending_graphics_inputs.empty()) {
+      const auto &input = state.pending_graphics_inputs.front();
+      if (input.kind == KernelSharedState::PendingGraphicsInput::Kind::Touch) {
+        queue_locked(state, service->object, input.touch);
+      } else {
+        queue_simple_event_locked(state, service->object,
+                                  input.system_event_type);
+      }
+      state.pending_graphics_inputs.pop_front();
+      ++flushed;
+    }
+  } else if (const auto port =
+                 state.mach_port_objects.lookup(service->object)) {
+    const auto process = state.processes.find(port->receive_owner);
+    if (process != state.processes.end() && !process->second.exited &&
+        process->second.executable_path.starts_with("/Applications/")) {
+      if (state.pending_application_event_object != service->object) {
+        state.latest_application_scene_translation.reset();
+      }
+      state.pending_application_event_object = service->object;
+      application_event_port = true;
+    }
+  }
+  return ServiceResolution{service->object, flushed, application_event_port,
+                           service_name};
+}
+
+EnqueueResult enqueue_touch(KernelSharedState &state, const TouchInput &input) {
+  const TouchInput sanitized{input.phase,
+                             std::isfinite(input.x) ? input.x : 0.0F,
+                             std::isfinite(input.y) ? input.y : 0.0F};
+  std::lock_guard lock{state.mach_mutex};
+  if (state.active_application_event_object != 0U &&
+      !state.application_touch_suspended) {
+    const auto port =
+        state.mach_port_objects.lookup(state.active_application_event_object);
+    const auto process = port ? state.processes.find(port->receive_owner)
+                              : state.processes.end();
+    if (port && process != state.processes.end() && !process->second.exited &&
+        process->second.executable_path.starts_with("/Applications/")) {
+      auto application_input = sanitized;
+      if (const auto translation =
+              state.application_screen_to_client_y.find(port->receive_owner);
+          translation != state.application_screen_to_client_y.end()) {
+        application_input.y -= static_cast<float>(translation->second);
+      }
+      queue_locked(state, state.active_application_event_object,
+                   application_input);
+      return EnqueueResult::Queued;
+    }
+    state.active_application_event_object = 0U;
+    state.application_touch_suspended = false;
+  }
+  const auto service =
+      state.bootstrap_service_objects.find(std::string{system_event_service});
+  if (service == state.bootstrap_service_objects.end()) {
+    state.pending_graphics_inputs.push_back(
+        KernelSharedState::PendingGraphicsInput{
+            KernelSharedState::PendingGraphicsInput::Kind::Touch, sanitized,
+            0});
+    return EnqueueResult::Deferred;
+  }
+  queue_locked(state, service->second, sanitized);
+  return EnqueueResult::Queued;
+}
+
+EnqueueResult enqueue_system_button(KernelSharedState &state,
+                                    const SystemButtonInput &input) {
+  const auto event_type = system_button_event_type(input);
+  std::lock_guard lock{state.mach_mutex};
+  const auto service =
+      state.bootstrap_service_objects.find(std::string{system_event_service});
+  if (service == state.bootstrap_service_objects.end()) {
+    state.pending_graphics_inputs.push_back(
+        KernelSharedState::PendingGraphicsInput{
+            KernelSharedState::PendingGraphicsInput::Kind::SystemEvent,
+            {},
+            event_type});
+    return EnqueueResult::Deferred;
+  }
+  queue_simple_event_locked(state, service->second, event_type);
+  return EnqueueResult::Queued;
+}
+
+void suspend_active_application(KernelSharedState &state) {
+  std::lock_guard lock{state.mach_mutex};
+  state.application_touch_suspended =
+      state.active_application_event_object != 0U;
+}
+
+void activate_resolved_application(KernelSharedState &state,
+                                   std::uint32_t process_id) {
+  std::lock_guard lock{state.mach_mutex};
+  if (state.active_application_scene &&
+      state.active_application_scene->process_id == process_id &&
+      state.application_screen_to_client_y.contains(process_id)) {
+    state.active_application_event_object =
+        state.active_application_scene->event_object;
+    state.application_touch_suspended = false;
+  }
+}
+
+void record_pending_application_scene_translation(
+    KernelSharedState &state, std::int32_t screen_to_client_y) {
+  std::lock_guard lock{state.mach_mutex};
+  const auto port =
+      state.mach_port_objects.lookup(state.pending_application_event_object);
+  if (!port) {
+    return;
+  }
+  const auto process_id = port->receive_owner;
+  const auto process = state.processes.find(process_id);
+  if (process == state.processes.end() || process->second.exited ||
+      !process->second.executable_path.starts_with("/Applications/")) {
+    return;
+  }
+  if (!state.latest_application_scene_translation ||
+      screen_to_client_y > *state.latest_application_scene_translation) {
+    state.latest_application_scene_translation = screen_to_client_y;
+  }
+  auto &translation = state.application_screen_to_client_y[process_id];
+  translation = std::max(translation, screen_to_client_y);
+  if (state.active_application_scene &&
+      state.active_application_scene->process_id == process_id) {
+    state.active_application_scene->screen_to_client_y = translation;
+    state.active_application_event_object =
+        state.active_application_scene->event_object;
+    state.application_touch_suspended = false;
+  }
+}
+
+void record_application_lifecycle_event_locked(KernelSharedState &state,
+                                               std::uint32_t sender_pid,
+                                               std::uint32_t destination,
+                                               std::uint32_t event_type,
+                                               std::span<const std::uint32_t>
+                                                   exit_snapshot_pixels) {
+  if (event_type != application_did_become_active_event_type &&
+      event_type != application_will_resign_active_event_type) {
+    return;
+  }
+  const auto sender = state.processes.find(sender_pid);
+  if (sender == state.processes.end() || sender->second.exited ||
+      !sender->second.executable_path.ends_with(
+          "/SpringBoard.app/SpringBoard")) {
+    return;
+  }
+  const auto destination_port = state.mach_port_objects.lookup(destination);
+  const auto application =
+      destination_port ? state.processes.find(destination_port->receive_owner)
+                       : state.processes.end();
+  if (!destination_port || application == state.processes.end() ||
+      application->second.exited ||
+      !application->second.executable_path.starts_with("/Applications/")) {
+    return;
+  }
+
+  if (event_type == application_did_become_active_event_type) {
+    state.pending_application_event_object = destination;
+    const auto routed_translation = state.application_screen_to_client_y.find(
+        destination_port->receive_owner);
+    auto scene_translation = state.latest_application_scene_translation;
+    if (!scene_translation &&
+        routed_translation != state.application_screen_to_client_y.end()) {
+      scene_translation = routed_translation->second;
+    }
+    if (scene_translation) {
+      state.application_screen_to_client_y[destination_port->receive_owner] =
+          *scene_translation;
+    }
+    state.active_application_scene =
+        KernelSharedState::ActiveApplicationScene{
+            destination_port->receive_owner, destination,
+            scene_translation.value_or(0)};
+    if (scene_translation) {
+      state.active_application_event_object = destination;
+      state.application_touch_suspended = false;
+    } else {
+      state.active_application_event_object = 0;
+      state.application_touch_suspended = false;
+    }
+    state.latest_application_scene_translation.reset();
+    if (state.pending_application_exit_snapshot &&
+        state.pending_application_exit_snapshot->process_id ==
+            destination_port->receive_owner) {
+      state.pending_application_exit_snapshot.reset();
+    }
+  } else {
+    if (state.active_application_event_object == destination) {
+      state.application_touch_suspended = true;
+    }
+    if (!exit_snapshot_pixels.empty()) {
+      std::vector<std::uint32_t> application_pixels{
+          exit_snapshot_pixels.begin(), exit_snapshot_pixels.end()};
+      auto scene_translation = std::int32_t{};
+      if (state.active_application_scene &&
+          state.active_application_scene->process_id ==
+              destination_port->receive_owner) {
+        scene_translation =
+            state.active_application_scene->screen_to_client_y;
+      } else if (const auto routed =
+                     state.application_screen_to_client_y.find(
+                         destination_port->receive_owner);
+                 routed != state.application_screen_to_client_y.end()) {
+        scene_translation = routed->second;
+      }
+      if (scene_translation > 0 &&
+          scene_translation <
+              static_cast<std::int32_t>(iphone_2g_display_height) &&
+          application_pixels.size() ==
+              static_cast<std::size_t>(iphone_2g_display_width) *
+                  iphone_2g_display_height) {
+        const auto inset = static_cast<std::size_t>(scene_translation);
+        const auto client_height =
+            static_cast<std::size_t>(iphone_2g_display_height) - inset;
+        std::vector<std::uint32_t> local_pixels(application_pixels.size());
+        for (std::size_t target_y = 0;
+             target_y < iphone_2g_display_height; ++target_y) {
+          const auto client_y = std::min(
+              client_height - 1U,
+              target_y * client_height / iphone_2g_display_height);
+          const auto source =
+              (inset + client_y) * iphone_2g_display_width;
+          const auto destination_offset =
+              target_y * iphone_2g_display_width;
+          std::copy_n(application_pixels.begin() +
+                          static_cast<std::ptrdiff_t>(source),
+                      iphone_2g_display_width,
+                      local_pixels.begin() +
+                          static_cast<std::ptrdiff_t>(destination_offset));
+        }
+        application_pixels = std::move(local_pixels);
+      }
+      state.pending_application_exit_snapshot =
+          KernelSharedState::ApplicationExitSnapshot{
+              destination_port->receive_owner,
+              std::move(application_pixels)};
+    }
+    state.application_screen_to_client_y.erase(
+        destination_port->receive_owner);
+    state.active_application_scene.reset();
+  }
+}
+
+} // namespace ilegacysim::graphics_services_input

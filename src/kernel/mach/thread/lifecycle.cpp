@@ -1,0 +1,95 @@
+#include "ilegacysim/darwin_abi.hpp"
+#include "ilegacysim/kernel.hpp"
+#include "ilegacysim/thread_act_mig_ids.hpp"
+
+#include <array>
+#include <cstdint>
+#include <optional>
+
+#include "../support.hpp"
+
+namespace ilegacysim {
+
+using namespace mach_support;
+
+bool CompatibilityKernel::dispatch_mach_thread_lifecycle_message(
+    Cpu &cpu, const MachMessageRequest &request) {
+  if (request.identifier !=
+      mig_message_id(xnu792::mig::thread_act::Routine::thread_terminate)) {
+    return false;
+  }
+
+  std::optional<std::uint32_t> target_object;
+  std::optional<std::pair<std::uint32_t, std::uint32_t>> target;
+  {
+    std::lock_guard mach_lock{shared_state_->mach_mutex};
+    target_object = resolve_name_with_right(
+        *shared_state_, process_.pid, request.remote_port,
+        xnu792::ipc::Right::Send);
+    if (target_object)
+      target = find_thread_owner(*shared_state_, *target_object);
+  }
+
+  std::uint32_t kernel_result = darwin::mach::invalid_argument;
+  if (target) {
+    const auto accepted =
+        !thread_terminate_handler_ ||
+        thread_terminate_handler_(target->first, target->second);
+    if (accepted) {
+      std::lock_guard mach_lock{shared_state_->mach_mutex};
+      auto task = shared_state_->task_thread_port_objects.find(target->first);
+      if (task != shared_state_->task_thread_port_objects.end()) {
+        task->second.erase(target->second);
+        if (task->second.empty())
+          shared_state_->task_thread_port_objects.erase(task);
+      }
+      terminate_receive_object_locked(*shared_state_, *target_object);
+      kernel_result = darwin::mach::success;
+    }
+  }
+
+  const auto self_termination =
+      kernel_result == darwin::mach::success && target &&
+      target->first == process_.pid &&
+      target->second == static_cast<std::uint32_t>(cpu.processor_id());
+  output_.write("[thread] terminate caller=" +
+                std::to_string(process_.pid) + " target=" +
+                std::to_string(target ? target->first : 0U) + ":" +
+                std::to_string(target ? target->second : 0U) + " result=" +
+                std::to_string(kernel_result) + "\n");
+  if (self_termination) {
+    thread_ports_.erase(cpu.processor_id());
+    pending_mach_receives_.erase(cpu.processor_id());
+    cpu.registers()[0] = darwin::mach::success;
+    cpu.halt(Dynarmic::HaltReason::UserDefined1);
+    return true;
+  }
+
+  if (request.local_port == xnu792::ipc::null_name) {
+    cpu.registers()[0] = darwin::mach::success;
+    return true;
+  }
+  const std::array<std::uint32_t, 9> reply{
+      18,
+      36,
+      request.local_port,
+      0,
+      0,
+      request.identifier + 100U,
+      0,
+      1,
+      kernel_result,
+  };
+  for (std::size_t index = 0; index < reply.size(); ++index) {
+    if (!memory_.write32(request.address +
+                             static_cast<std::uint32_t>(index * 4U),
+                         reply[index])) {
+      cpu.registers()[0] = darwin::mach_message::receive_invalid_data;
+      return true;
+    }
+  }
+  cpu.registers()[0] = darwin::mach::success;
+  return true;
+}
+
+} // namespace ilegacysim

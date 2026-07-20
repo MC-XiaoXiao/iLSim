@@ -1,0 +1,31 @@
+#include "ilegacysim/live_touch_scheduler.hpp"
+
+#include <algorithm>
+
+namespace ilegacysim {
+
+void LiveTouchScheduler::schedule(std::span<const LiveTouchEvent> gesture) {
+  if (gesture.empty())
+    return;
+
+  const auto now = std::chrono::steady_clock::now();
+  const auto start = events_.empty()
+                         ? now
+                         : std::max(now, events_.back().deadline +
+                                            std::chrono::milliseconds{1});
+  for (const auto &event : gesture) {
+    events_.push_back(Event{start + event.delay, event.input});
+  }
+}
+
+std::vector<TouchInput> LiveTouchScheduler::poll() {
+  std::vector<TouchInput> result;
+  const auto now = std::chrono::steady_clock::now();
+  while (!events_.empty() && events_.front().deadline <= now) {
+    result.push_back(events_.front().input);
+    events_.pop_front();
+  }
+  return result;
+}
+
+} // namespace ilegacysim

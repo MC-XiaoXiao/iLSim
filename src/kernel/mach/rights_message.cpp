@@ -1,0 +1,434 @@
+#include "ilegacysim/bootstrap_mig_ids.hpp"
+#include "ilegacysim/darwin_abi.hpp"
+#include "ilegacysim/darwin_kqueue_abi.hpp"
+#include "ilegacysim/darwin_network_abi.hpp"
+#include "ilegacysim/darwin_resource_abi.hpp"
+#include "ilegacysim/darwin_route_socket.hpp"
+#include "ilegacysim/kernel.hpp"
+#include "ilegacysim/kernel_clock.hpp"
+#include "ilegacysim/kernel_iokit.hpp"
+#include "ilegacysim/kernel_mach_ipc.hpp"
+#include "ilegacysim/kernel_network.hpp"
+#include "ilegacysim/mach_clock_abi.hpp"
+#include "ilegacysim/mach_host_mig_ids.hpp"
+#include "ilegacysim/mach_port_mig_ids.hpp"
+#include "ilegacysim/mach_scheduler_abi.hpp"
+#include "ilegacysim/mach_thread_policy_abi.hpp"
+#include "ilegacysim/mig_wire_abi.hpp"
+#include "ilegacysim/task_mig_ids.hpp"
+#include "ilegacysim/thread_act_mig_ids.hpp"
+#include "ilegacysim/vm_map_mig_ids.hpp"
+#include "ilegacysim/xnu_mig_adapter.hpp"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <fstream>
+#include <iterator>
+#include <limits>
+#include <span>
+#include <sstream>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "support.hpp"
+
+namespace ilegacysim {
+
+using namespace mach_support;
+
+bool CompatibilityKernel::dispatch_mach_rights_message(
+    Cpu &cpu, const MachMessageRequest &request) {
+  auto &registers = cpu.registers();
+  const auto message_address = request.address;
+  const std::optional<std::uint32_t> bits{request.bits};
+  const std::optional<std::uint32_t> remote_port{request.remote_port};
+  const std::optional<std::uint32_t> local_port{request.local_port};
+  const std::optional<std::uint32_t> message_id{request.identifier};
+  if ((*message_id ==
+           mig_message_id(
+               xnu792::mig::mach_port::Routine::mach_port_deallocate) ||
+       *message_id ==
+           mig_message_id(
+               xnu792::mig::mach_port::Routine::mach_port_insert_right) ||
+       *message_id ==
+           mig_message_id(xnu792::mig::task::Routine::task_set_special_port) ||
+       *message_id ==
+           mig_message_id(xnu792::mig::thread_act::Routine::thread_policy) ||
+       *message_id ==
+           mig_message_id(xnu792::mig::vm_map::Routine::vm_deallocate)) &&
+      registers[3] >= 36) {
+    // mach_port_deallocate / mach_port_insert_right /
+    // thread_policy / vm_deallocate
+    std::uint32_t kernel_result = 0;
+    if (*message_id ==
+        mig_message_id(xnu792::mig::mach_port::Routine::mach_port_deallocate)) {
+      const auto name =
+          memory_
+              .read32(message_address +
+                      xnu792::mig::mach_port::mach_port_deallocate_arguments[1]
+                          .request_offset)
+              .value_or(0);
+      std::lock_guard mach_lock{shared_state_->mach_mutex};
+      const auto task =
+          target_task_for_port(*shared_state_, process_.pid, *remote_port);
+      if (!task) {
+        kernel_result = 4; // KERN_INVALID_ARGUMENT
+      } else if (name == xnu792::ipc::null_name ||
+                 name == xnu792::ipc::dead_name) {
+        kernel_result = 0;
+      } else {
+        const auto entry = shared_state_->mach_namespaces.lookup(*task, name);
+        if (!entry) {
+          kernel_result = 15; // KERN_INVALID_NAME
+        } else {
+          const auto has = [&](xnu792::ipc::Right right) {
+            return (entry->type & xnu792::ipc::type_mask(right)) != 0;
+          };
+          const auto right =
+              has(xnu792::ipc::Right::Send)       ? xnu792::ipc::Right::Send
+              : has(xnu792::ipc::Right::SendOnce) ? xnu792::ipc::Right::SendOnce
+              : has(xnu792::ipc::Right::DeadName) ? xnu792::ipc::Right::DeadName
+                                                  : xnu792::ipc::Right::Receive;
+          if (right == xnu792::ipc::Right::Receive) {
+            kernel_result = 17;
+          } else {
+            kernel_result = modify_port_references_locked(*shared_state_, *task,
+                                                          name, right, -1);
+          }
+        }
+        if (kernel_result == 18 || kernel_result == 19) {
+          // ipc_right_dealloc reports a wrong kind of right for
+          // this interface, not a delta-validation error.
+          kernel_result = 17; // KERN_INVALID_RIGHT
+        }
+      }
+    } else if (*message_id ==
+               mig_message_id(
+                   xnu792::mig::mach_port::Routine::mach_port_insert_right)) {
+      if (registers[2] < 52) {
+        kernel_result = 4;
+      } else {
+        const auto &insert_arguments =
+            xnu792::mig::mach_port::mach_port_insert_right_arguments;
+        const auto poly_name =
+            memory_.read32(message_address + insert_arguments[2].request_offset)
+                .value_or(0);
+        const auto descriptor_word =
+            memory_
+                .read32(message_address + insert_arguments[2].request_offset +
+                        2U * sizeof(std::uint32_t))
+                .value_or(0);
+        const auto target_name =
+            memory_.read32(message_address + insert_arguments[1].request_offset)
+                .value_or(0);
+        const auto disposition =
+            (descriptor_word >>
+             darwin::mig_wire::descriptor_disposition_shift) &
+            0xffU;
+        const auto right = right_for_disposition(disposition);
+        const auto source_right = source_right_for_disposition(disposition);
+        std::lock_guard mach_lock{shared_state_->mach_mutex};
+        const auto task =
+            target_task_for_port(*shared_state_, process_.pid, *remote_port);
+        const auto poly_object =
+            source_right ? resolve_name_with_right(*shared_state_, process_.pid,
+                                                   poly_name, *source_right)
+                         : std::nullopt;
+        const auto existing =
+            task ? shared_state_->mach_namespaces.lookup(*task, target_name)
+                 : std::nullopt;
+        const auto existing_name =
+            task && poly_object
+                ? shared_state_->mach_namespaces.name_for(*task, *poly_object)
+                : std::nullopt;
+        if (!task) {
+          kernel_result = darwin::mach::invalid_task;
+        } else if (!right || !source_right || !poly_object ||
+                   target_name == xnu792::ipc::null_name ||
+                   target_name == xnu792::ipc::dead_name) {
+          kernel_result = darwin::mach::invalid_value;
+        } else if (existing && (existing->object != *poly_object ||
+                                *right == xnu792::ipc::Right::SendOnce)) {
+          kernel_result = darwin::mach::name_exists;
+        } else if (existing_name && *existing_name != target_name &&
+                   *right != xnu792::ipc::Right::SendOnce) {
+          kernel_result = darwin::mach::right_exists;
+        } else {
+          const auto moved =
+              disposition == 16U || disposition == 17U || disposition == 18U;
+          if (!moved && existing && *right == xnu792::ipc::Right::Send &&
+              existing->user_references[static_cast<std::size_t>(
+                  xnu792::ipc::Right::Send)] >=
+                  xnu792::ipc::maximum_send_user_references) {
+            kernel_result = darwin::mach::user_references_overflow;
+          }
+          bool consumed = kernel_result == 0;
+          if (consumed && moved) {
+            consumed = consume_moved_right_locked(
+                *shared_state_, process_.pid, poly_name, *source_right, true);
+            if (!consumed) {
+              kernel_result = darwin::mach::invalid_right;
+            }
+          }
+          const auto installed =
+              kernel_result == 0 && shared_state_->mach_namespaces.install(
+                                        *task, target_name, *poly_object,
+                                        xnu792::ipc::type_mask(*right));
+          if (!installed) {
+            if (moved && consumed) {
+              static_cast<void>(shared_state_->mach_namespaces.install(
+                  process_.pid, poly_name, *poly_object,
+                  xnu792::ipc::type_mask(*source_right)));
+            }
+            if (kernel_result == 0) {
+              kernel_result = darwin::mach::invalid_right;
+            }
+          } else if (disposition == 20U) { // MAKE_SEND
+            static_cast<void>(
+                shared_state_->mach_port_objects.increment_make_send_count(
+                    *poly_object));
+          }
+          if (installed && *right == xnu792::ipc::Right::Receive) {
+            static_cast<void>(
+                shared_state_->mach_port_objects.set_receive_owner(*poly_object,
+                                                                   *task));
+          } else if (!installed && moved && consumed &&
+                     *source_right == xnu792::ipc::Right::Receive) {
+            static_cast<void>(
+                shared_state_->mach_port_objects.set_receive_owner(
+                    *poly_object, process_.pid));
+          }
+        }
+      }
+    } else if (*message_id ==
+               mig_message_id(
+                   xnu792::mig::thread_act::Routine::thread_policy)) {
+      process_.thread_base_priority = static_cast<std::int32_t>(
+          memory_
+              .read32(message_address +
+                      xnu792::mig::thread_act::thread_policy_arguments[2]
+                          .request_offset)
+              .value_or(static_cast<std::uint32_t>(
+                  xnu792::scheduler::default_base_priority)));
+      if (task_priority_handler_) {
+        task_priority_handler_(process_.thread_base_priority);
+      }
+    } else if (*message_id ==
+               mig_message_id(
+                   xnu792::mig::task::Routine::task_set_special_port)) {
+      // task_set_special_port operates on the task named by the
+      // destination port, which is commonly a newly forked child,
+      // not on launchd's own task.
+      const auto &special_arguments =
+          xnu792::mig::task::task_set_special_port_arguments;
+      const auto which =
+          memory_.read32(message_address + special_arguments[1].request_offset)
+              .value_or(0);
+      const auto port_name =
+          memory_.read32(message_address + special_arguments[2].request_offset)
+              .value_or(0);
+      const auto descriptor_word =
+          memory_
+              .read32(message_address + special_arguments[2].request_offset +
+                      2U * sizeof(std::uint32_t))
+              .value_or(0);
+      const auto disposition =
+          (descriptor_word >> darwin::mig_wire::descriptor_disposition_shift) &
+          0xffU;
+      const auto transferred_right = right_for_disposition(disposition);
+      std::lock_guard mach_lock{shared_state_->mach_mutex};
+      const auto task_object =
+          shared_state_->mach_namespaces.resolve(process_.pid, *remote_port);
+      const auto target =
+          target_task_for_port(*shared_state_, process_.pid, *remote_port);
+      const auto port =
+          port_name == xnu792::ipc::null_name ? std::optional<std::uint32_t>{0}
+          : transferred_right
+              ? resolve_name_with_right(*shared_state_, process_.pid, port_name,
+                                        *transferred_right)
+              : std::nullopt;
+      if (!task_object || !target) {
+        kernel_result = 4; // KERN_INVALID_ARGUMENT
+      } else if (!port ||
+                 (port_name != xnu792::ipc::null_name &&
+                  (!transferred_right ||
+                   (*transferred_right != xnu792::ipc::Right::Send &&
+                    *transferred_right != xnu792::ipc::Right::SendOnce)))) {
+        kernel_result = 20; // KERN_INVALID_CAPABILITY
+      } else {
+        bool consumed = true;
+        if (disposition == 17U || disposition == 18U) {
+          consumed =
+              consume_moved_right_locked(*shared_state_, process_.pid,
+                                         port_name, *transferred_right, true);
+        }
+        if (!consumed) {
+          kernel_result = 17; // KERN_INVALID_RIGHT
+        } else {
+          shared_state_->task_special_ports[*task_object][which] = *port;
+        }
+      }
+      const auto owner =
+          task_object ? shared_state_->mach_port_objects.lookup(*task_object)
+                      : std::nullopt;
+      output_.write("[mach] task_set_special_port caller=" +
+                    std::to_string(process_.pid) + " task=" +
+                    std::to_string(task_object.value_or(0)) + " owner=" +
+                    std::to_string(owner ? owner->receive_owner : 0U) +
+                    " which=" + std::to_string(which) +
+                    " port=" + std::to_string(port.value_or(0)) + "\n");
+      const auto own_task_object = shared_state_->mach_namespaces.resolve(
+          process_.pid, process_.task_port);
+      if (kernel_result == 0 && task_object == own_task_object && which == 4) {
+        const auto still_local =
+            port && *port != 0
+                ? resolve_name_with_right(*shared_state_, process_.pid,
+                                          port_name, xnu792::ipc::Right::Send)
+                : std::optional<std::uint32_t>{};
+        process_.bootstrap_port = still_local && *still_local == *port
+                                      ? port_name
+                                      : xnu792::ipc::null_name;
+      }
+    } else if (*message_id ==
+               mig_message_id(xnu792::mig::vm_map::Routine::vm_deallocate)) {
+      memory_.unmap(memory_
+                        .read32(message_address +
+                                xnu792::mig::vm_map::vm_deallocate_arguments[1]
+                                    .request_offset)
+                        .value_or(0),
+                    memory_
+                        .read32(message_address +
+                                xnu792::mig::vm_map::vm_deallocate_arguments[2]
+                                    .request_offset)
+                        .value_or(0));
+    }
+    const std::array<std::uint32_t, 9> reply{
+        18,          36,          *local_port,   0, 0, *message_id + 100,
+        0x00000000U, 0x00000001U, kernel_result,
+    };
+    for (std::size_t index = 0; index < reply.size(); ++index) {
+      if (!memory_.write32(message_address +
+                               static_cast<std::uint32_t>(index * 4U),
+                           reply[index])) {
+        registers[0] = 0x10004008U;
+        return true;
+      }
+    }
+    registers[0] = 0;
+    return true;
+  }
+  if ((*message_id ==
+           mig_message_id(
+               xnu792::mig::mach_host::Routine::host_get_io_master) ||
+       *message_id ==
+           mig_message_id(
+               xnu792::mig::mach_host::Routine::host_get_clock_service) ||
+       *message_id ==
+           mig_message_id(xnu792::mig::task::Routine::task_get_special_port) ||
+       *message_id ==
+           mig_message_id(xnu792::mig::task::Routine::semaphore_create)) &&
+      registers[3] >= 40) {
+    // host_get_io_master, host_get_clock_service,
+    // task_get_special_port, and semaphore_create return a port.
+    const auto which =
+        *message_id == mig_message_id(
+                           xnu792::mig::task::Routine::task_get_special_port)
+            ? memory_.read32(
+                  message_address +
+                  xnu792::mig::task::task_get_special_port_arguments[1]
+                      .request_offset)
+            : std::optional<std::uint32_t>{};
+    std::uint32_t port = 0;
+    bool update_process_bootstrap = false;
+    if (*message_id ==
+        mig_message_id(xnu792::mig::mach_host::Routine::host_get_io_master)) {
+      port = process_.io_master_port;
+    } else if (*message_id ==
+               mig_message_id(
+                   xnu792::mig::mach_host::Routine::host_get_clock_service)) {
+      port = process_.clock_port;
+    } else if (*message_id ==
+               mig_message_id(xnu792::mig::task::Routine::semaphore_create)) {
+      const auto policy =
+          memory_
+              .read32(message_address +
+                      xnu792::mig::task::semaphore_create_arguments[2]
+                          .request_offset)
+              .value_or(8);
+      const auto initial_value = static_cast<std::int32_t>(
+          memory_
+              .read32(message_address +
+                      xnu792::mig::task::semaphore_create_arguments[3]
+                          .request_offset)
+              .value_or(0xffffffffU));
+      if (policy <= 7 && initial_value >= 0) {
+        std::lock_guard mach_lock{shared_state_->mach_mutex};
+        port = shared_state_->allocate_mach_object();
+        shared_state_->mach_semaphores.emplace(
+            port,
+            KernelSharedState::MachSemaphore{initial_value, process_.pid, {}});
+        static_cast<void>(shared_state_->mach_port_objects.create(port));
+        output_.write("[semaphore] create pid=" + std::to_string(process_.pid) +
+                      " port=" + std::to_string(port) +
+                      " value=" + std::to_string(initial_value) + "\n");
+      }
+    } else if (which) {
+      std::lock_guard mach_lock{shared_state_->mach_mutex};
+      const auto task_object =
+          shared_state_->mach_namespaces.resolve(process_.pid, *remote_port);
+      const auto own_task_object = shared_state_->mach_namespaces.resolve(
+          process_.pid, process_.task_port);
+      update_process_bootstrap = *which == 4 && task_object == own_task_object;
+      if (const auto task =
+              task_object ? shared_state_->task_special_ports.find(*task_object)
+                          : shared_state_->task_special_ports.end();
+          task != shared_state_->task_special_ports.end()) {
+        if (const auto special = task->second.find(*which);
+            special != task->second.end()) {
+          port = special->second;
+        }
+      }
+      if (*which == 4) {
+        output_.write(
+            "[mach] task_get_special_port pid=" + std::to_string(process_.pid) +
+            " task=" + std::to_string(task_object.value_or(0)) +
+            " port=" + std::to_string(port) + "\n");
+      }
+    }
+    if (port != 0) {
+      std::lock_guard mach_lock{shared_state_->mach_mutex};
+      port = shared_state_->mach_namespaces
+                 .copyout(process_.pid, port,
+                          xnu792::ipc::type_mask(xnu792::ipc::Right::Send))
+                 .value_or(0);
+    }
+    if (update_process_bootstrap && port != 0) {
+      process_.bootstrap_port = port;
+    }
+    const std::array<std::uint32_t, 10> reply{
+        0x80000012U, // complex + MOVE_SEND_ONCE
+        40,          *local_port, 0, 0, *message_id + 100,
+        1,    // one descriptor
+        port, // port descriptor name
+        0,
+        0x00110000U, // MOVE_SEND disposition, port descriptor
+    };
+    for (std::size_t index = 0; index < reply.size(); ++index) {
+      if (!memory_.write32(message_address +
+                               static_cast<std::uint32_t>(index * 4U),
+                           reply[index])) {
+        registers[0] = 0x10004008U;
+        return true;
+      }
+    }
+    registers[0] = 0;
+    return true;
+  }
+  return false;
+}
+
+} // namespace ilegacysim
