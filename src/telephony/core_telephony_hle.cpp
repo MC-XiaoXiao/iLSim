@@ -16,10 +16,6 @@ constexpr std::string_view core_telephony_image{
 constexpr std::string_view springboard_image{
     "/System/Library/CoreServices/SpringBoard.app/SpringBoard"};
 constexpr std::string_view application_directory{"Applications/"};
-// Fixed __nl_symbol_ptr slot in the iPhoneOS 1.0 SpringBoard executable. It
-// points at CoreTelephony's exported registration-status variable, whose first
-// word is an immortal CFString suitable for use as an opaque connection token.
-constexpr std::uint32_t springboard_registration_status_import{0x00087430U};
 constexpr std::uint32_t springboard_telephony_checked_in_method{0x0002a9f4U};
 constexpr std::string_view offline_sim_status_export{
     "_kCTSIMSupportSIMStatusNotInserted"};
@@ -41,8 +37,8 @@ constexpr std::array<std::string_view, 3> observer_operations{
 };
 
 // These server queries normally write a retained CFString through argument 2.
-// The offline connection is deliberately an opaque token, so every query that
-// would otherwise dereference it must terminate at this boundary.
+// The offline profile has a genuine connection object but no CommCenter-backed
+// values, so terminate the queries at this HLE boundary.
 constexpr std::array<std::string_view, 6> offline_server_string_queries{
     "__CTServerConnectionCopyFirmwareVersion",
     "__CTServerConnectionCopySIMIdentity",
@@ -86,14 +82,6 @@ void return_empty_server_string(UserlandHleCall& call) {
         return;
     }
     call.set_return(result);
-}
-
-std::uint32_t springboard_imported_object(UserlandHleCall& call,
-                                          std::uint32_t import_address) {
-    const auto exported_variable = call.memory().read32(import_address);
-    return exported_variable
-               ? call.memory().read32(*exported_variable).value_or(0)
-               : 0;
 }
 
 void return_server_value(UserlandHleCall& call, std::uint32_t value) {
@@ -178,28 +166,19 @@ void register_core_telephony_hle(UserlandHleRegistry& registry) {
                 call, exported_object(call, offline_sim_status_export));
         });
 
-    // Legacy clients gate their __CTServerConnection queries on a non-null
-    // connection. Use an immortal CoreTelephony CFString as the opaque token:
-    // the server HLEs never dereference it and retain/release remains valid.
-    // SpringBoard imports the variable through its fixed prebound slot; other
-    // applications resolve the same exported framework object directly.
-    registry.register_function(
-        std::string{core_telephony_image},
-        "__CTServerConnectionCreate",
-        [](UserlandHleCall& call) {
-            if (!is_offline_ui_client(call)) {
-                call.resume_original();
-                return;
-            }
-            const auto token = call.image_loaded(springboard_image)
-                                   ? springboard_imported_object(
-                                         call,
-                                         springboard_registration_status_import)
-                                   : exported_object(
-                                         call,
-                                         "_kCTRegistrationStatusNotRegistered");
-            call.set_return(token);
-        });
+    // Let the firmware construct its genuine CFRuntime server connection,
+    // including the dedicated receive right exposed by GetPort. The launchd
+    // Mach service exists even when the baseband transport is parked. Offline
+    // clients may subscribe locally, but registration cannot produce remote
+    // CommCenter updates and is therefore a successful no-op.
+    for (const auto symbol : {
+             "__CTServerConnectionRegisterForNotification",
+             "__CTServerConnectionUnregisterForNotification",
+         }) {
+        registry.register_function(
+            std::string{core_telephony_image}, symbol,
+            [](UserlandHleCall& call) { return_server_success(call); });
+    }
     registry.register_function(
         std::string{core_telephony_image},
         "__CTServerConnectionSetCTMMode",

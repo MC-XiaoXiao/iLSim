@@ -787,6 +787,30 @@ void boot(const std::vector<std::string> &args, Output &output) {
           state[darwin::arm_thread::cpsr_index] = thread.cpsr();
           return state;
         });
+    runtime.kernel->set_thread_state_update_handler(
+        [&runtimes](std::uint32_t pid, std::uint32_t slot,
+                    const darwin::arm_thread::GeneralState &state) {
+          const auto runtime = std::find_if(
+              runtimes.begin(), runtimes.end(), [pid](const auto &candidate) {
+                return candidate->kernel->process().pid == pid;
+              });
+          if (runtime == runtimes.end() || slot >= (*runtime)->cpus->size() ||
+              slot >= (*runtime)->allocated.size() ||
+              !(*runtime)->allocated[slot]) {
+            return false;
+          }
+          auto &thread = (*runtime)->cpus->cpu(slot);
+          std::copy_n(state.begin(), thread.registers().size(),
+                      thread.registers().begin());
+          thread.set_cpsr(state[darwin::arm_thread::cpsr_index] | 0x10U);
+          return true;
+        });
+    runtime.kernel->set_thread_runnable_handler(
+        [&scheduler](std::uint32_t pid, std::uint32_t slot, bool runnable) {
+          const XnuThreadId thread{pid, slot};
+          return runnable ? scheduler.resume_thread(thread)
+                          : scheduler.suspend_thread(thread);
+        });
     runtime.kernel->set_fork_handler(
         [&, runtime_ptr](Cpu &parent_cpu) -> std::optional<std::uint32_t> {
           const auto child_pid = next_pid++;
