@@ -656,7 +656,7 @@ void boot(const std::vector<std::string> &args, Output &output) {
       std::make_unique<CpuCluster>(maximum_guest_threads, *initial->memory);
   initial->kernel =
       std::make_unique<CompatibilityKernel>(*initial->memory, output, *rootfs);
-std::shared_ptr<SdlAudioSink> audio_sink;
+  std::shared_ptr<SdlAudioSink> audio_sink;
   if (SdlAudioSink::available()) {
     audio_sink = std::make_shared<SdlAudioSink>();
     initial->kernel->set_audio_sink(audio_sink);
@@ -1017,7 +1017,7 @@ std::shared_ptr<SdlAudioSink> audio_sink;
     touch_replay->start();
   }
   std::optional<RealtimePacer> realtime_pacer;
-std::vector<std::pair<std::chrono::steady_clock::time_point,
+  std::vector<std::pair<std::chrono::steady_clock::time_point,
                         std::filesystem::path>>
       scheduled_snapshots;
   if (!bounded_execution) {
@@ -1089,7 +1089,7 @@ std::vector<std::pair<std::chrono::steady_clock::time_point,
               SystemButtonInput{SystemButton::Lock, SystemButtonPhase::Up});
           output.line("[control] display lock requested");
           break;
-case LiveControlCommandKind::VolumeUp:
+        case LiveControlCommandKind::VolumeUp:
         case LiveControlCommandKind::VolumeDown: {
           const auto button = command.kind == LiveControlCommandKind::VolumeUp
                                   ? SystemButton::VolumeUp
@@ -1111,6 +1111,28 @@ case LiveControlCommandKind::VolumeUp:
                       " frame=" + std::to_string(frame.sequence));
           break;
         }
+        case LiveControlCommandKind::SnapshotSequence: {
+          const auto start = std::chrono::steady_clock::now();
+          for (std::size_t index = 0; index < command.snapshot_count; ++index) {
+            std::ostringstream suffix;
+            suffix << '-' << std::setfill('0') << std::setw(4) << index
+                   << ".ppm";
+            scheduled_snapshots.emplace_back(
+                start + command.snapshot_interval * index,
+                command.path.string() + suffix.str());
+          }
+          std::stable_sort(scheduled_snapshots.begin(),
+                           scheduled_snapshots.end(),
+                           [](const auto &left, const auto &right) {
+                             return left.first < right.first;
+                           });
+          output.line(
+              "[control] snapshot-sequence prefix=" + command.path.string() +
+              " interval-ms=" +
+              std::to_string(command.snapshot_interval.count()) +
+              " count=" + std::to_string(command.snapshot_count));
+          break;
+        }
         case LiveControlCommandKind::Status: {
           const auto frame = initial_runtime->kernel->display_snapshot();
           output.line(
@@ -1126,7 +1148,9 @@ case LiveControlCommandKind::VolumeUp:
           output.line("[control] commands: touch down|move|up|cancel x y; "
                       "tap x y [hold-ms]; unlock; "
                       "drag x1 y1 x2 y2 [duration-ms] [steps]; "
-                      "wake; lock; snapshot PATH; status; quit");
+                      "wake; lock; volume-up; volume-down; snapshot PATH; "
+                      "snapshot-sequence PATH-PREFIX INTERVAL-MS COUNT; "
+                      "status; quit");
           break;
         case LiveControlCommandKind::Quit:
           output.line("[control] quit requested");
@@ -1139,6 +1163,15 @@ case LiveControlCommandKind::VolumeUp:
       }
       if (hard_stop)
         break;
+    }
+    while (!scheduled_snapshots.empty() &&
+           std::chrono::steady_clock::now() >=
+               scheduled_snapshots.front().first) {
+      FrameFilePresenter snapshot_writer{scheduled_snapshots.front().second};
+      snapshot_writer.present(initial_runtime->kernel->display_snapshot());
+      output.line("[control] snapshot-sequence frame=" +
+                  scheduled_snapshots.front().second.string());
+      scheduled_snapshots.erase(scheduled_snapshots.begin());
     }
     if (realtime_pacer) {
       const auto current_time =

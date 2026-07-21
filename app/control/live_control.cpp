@@ -187,7 +187,7 @@ std::vector<LiveControlCommand> LiveControl::parse_line(std::string line) {
       return {error_command("lock does not accept arguments")};
     return {simple_command(LiveControlCommandKind::Lock)};
   }
-if (operation == "volume-up" || operation == "volume-down") {
+  if (operation == "volume-up" || operation == "volume-down") {
     std::string trailing;
     if (parser >> trailing) {
       return {error_command(operation + " does not accept arguments")};
@@ -205,6 +205,35 @@ if (operation == "volume-up" || operation == "volume-down") {
     LiveControlCommand command;
     command.kind = LiveControlCommandKind::Snapshot;
     command.path = std::move(path);
+    return {std::move(command)};
+  }
+  if (operation == "snapshot-sequence") {
+    std::string path_prefix;
+    std::int64_t interval_ms = 0;
+    std::size_t count = 0;
+    if (!(parser >> path_prefix >> interval_ms >> count)) {
+      return {error_command(
+          "snapshot-sequence requires PATH-PREFIX INTERVAL-MS COUNT")};
+    }
+    std::string trailing;
+    if (parser >> trailing) {
+      return {error_command("snapshot-sequence accepts exactly 3 arguments")};
+    }
+    constexpr std::int64_t maximum_interval_ms = 60'000;
+    constexpr std::size_t maximum_snapshot_count = 1'000;
+    if (interval_ms < 0 || interval_ms > maximum_interval_ms) {
+      return {error_command(
+          "snapshot-sequence interval must be between 0 and 60000 ms")};
+    }
+    if (count == 0 || count > maximum_snapshot_count) {
+      return {error_command(
+          "snapshot-sequence count must be between 1 and 1000")};
+    }
+    LiveControlCommand command;
+    command.kind = LiveControlCommandKind::SnapshotSequence;
+    command.path = std::move(path_prefix);
+    command.snapshot_interval = std::chrono::milliseconds{interval_ms};
+    command.snapshot_count = count;
     return {std::move(command)};
   }
   if (operation == "unlock") {

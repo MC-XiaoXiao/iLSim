@@ -17,6 +17,7 @@ enum class LiveControlCommandKind {
   VolumeUp,
   VolumeDown,
   Snapshot,
+  SnapshotSequence,
   Status,
   Help,
   Quit,
@@ -34,6 +35,8 @@ struct LiveControlCommand {
   std::vector<LiveTouchEvent> gesture;
   bool wake_display{};
   std::filesystem::path path;
+  std::chrono::milliseconds snapshot_interval{};
+  std::size_t snapshot_count{};
   std::string message;
 };
 
