@@ -14,8 +14,16 @@ using namespace mach_support;
 
 bool CompatibilityKernel::dispatch_mach_thread_lifecycle_message(
     Cpu &cpu, const MachMessageRequest &request) {
-  if (request.identifier !=
-      mig_message_id(xnu792::mig::thread_act::Routine::thread_terminate)) {
+  const auto terminates =
+      request.identifier ==
+      mig_message_id(xnu792::mig::thread_act::Routine::thread_terminate);
+  const auto suspends =
+      request.identifier ==
+      mig_message_id(xnu792::mig::thread_act::Routine::thread_suspend);
+  const auto resumes =
+      request.identifier ==
+      mig_message_id(xnu792::mig::thread_act::Routine::thread_resume);
+  if (!terminates && !suspends && !resumes) {
     return false;
   }
 
@@ -31,6 +39,33 @@ bool CompatibilityKernel::dispatch_mach_thread_lifecycle_message(
   }
 
   std::uint32_t kernel_result = darwin::mach::invalid_argument;
+  if ((suspends || resumes) && target && thread_runnable_handler_ &&
+      thread_runnable_handler_(target->first, target->second, resumes)) {
+    kernel_result = darwin::mach::success;
+  }
+  if (!terminates) {
+    output_.write("[thread] " +
+                  std::string(resumes ? "resume" : "suspend") +
+                  " caller=" + std::to_string(process_.pid) + " target=" +
+                  std::to_string(target ? target->first : 0U) + ":" +
+                  std::to_string(target ? target->second : 0U) + " result=" +
+                  std::to_string(kernel_result) + "\n");
+    const std::array<std::uint32_t, 9> reply{
+        18, 36, request.local_port, 0, 0, request.identifier + 100U,
+        0,  1,  kernel_result,
+    };
+    for (std::size_t index = 0; index < reply.size(); ++index) {
+      if (!memory_.write32(request.address +
+                               static_cast<std::uint32_t>(index * 4U),
+                           reply[index])) {
+        cpu.registers()[0] = darwin::mach_message::receive_invalid_data;
+        return true;
+      }
+    }
+    cpu.registers()[0] = darwin::mach::success;
+    return true;
+  }
+
   if (target) {
     const auto accepted =
         !thread_terminate_handler_ ||

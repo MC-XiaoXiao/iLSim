@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "ilegacysim/address_space.hpp"
+#include "ilegacysim/cpu.hpp"
 #include "ilegacysim/userland_hle.hpp"
 
 namespace ilegacysim {
@@ -15,7 +16,75 @@ namespace {
 
 constexpr std::string_view aeropuerto_image{
     "/System/Library/SystemConfiguration/Aeropuerto.bundle/Aeropuerto"};
+constexpr std::string_view springboard_image{
+    "/System/Library/CoreServices/SpringBoard.app/SpringBoard"};
 constexpr std::string_view interface_name{"en0"};
+
+// The 1.0 SpringBoard status controller is stripped, so these are its stable
+// preferred Mach-O addresses.  The native Aeropuerto bundle discovers Wi-Fi
+// devices through an IO80211 service which the simulator intentionally does
+// not expose.  Keep the stock status-controller implementation, but feed it
+// the association already represented by WifiState.
+constexpr std::uint32_t springboard_set_airport_strength{0x00029e24U};
+constexpr std::uint32_t springboard_set_shows_airport{0x00029e88U};
+constexpr std::uint32_t springboard_shows_airport{0x00029ef4U};
+constexpr std::uint32_t springboard_airport_strength{0x00029f1cU};
+constexpr std::uint32_t springboard_reflow_status_bar{0x00027fecU};
+
+constexpr std::uint32_t status_bar_controller_flags_offset{0x2dU};
+constexpr std::uint32_t status_bar_controller_strength_offset{0x44U};
+constexpr std::uint32_t status_bar_contents_airport_view_offset{0x40U};
+constexpr std::uint32_t airport_view_strength_offset{0x24U};
+constexpr std::uint32_t airport_view_flags_offset{0x28U};
+
+bool wifi_is_configured(const WifiSnapshot& snapshot) {
+    return snapshot.powered && snapshot.associated_access_point.has_value() &&
+           snapshot.ipv4.has_value();
+}
+
+std::uint32_t wifi_signal_bars(const WifiSnapshot& snapshot) {
+    if (!wifi_is_configured(snapshot)) return 0;
+    const auto rssi = snapshot.associated_access_point->rssi;
+    if (rssi >= -55) return 3;
+    if (rssi >= -70) return 2;
+    return 1;
+}
+
+void synchronize_status_bar_view(UserlandHleCall& call,
+                                 const WifiSnapshot& snapshot) {
+    const auto configured = wifi_is_configured(snapshot);
+    const auto bars = wifi_signal_bars(snapshot);
+    const auto contents = call.argument(0);
+    const auto controller = call.memory().read32(contents + 0x1cU).value_or(0);
+    const auto airport_view = call.memory()
+                                  .read32(contents +
+                                          status_bar_contents_airport_view_offset)
+                                  .value_or(0);
+    if (controller != 0) {
+        if (const auto flags = call.memory().read8(
+                controller + status_bar_controller_flags_offset)) {
+            const auto value = configured
+                                   ? static_cast<std::uint8_t>(*flags | 0x02U)
+                                   : static_cast<std::uint8_t>(*flags & ~0x02U);
+            static_cast<void>(call.memory().write8(
+                controller + status_bar_controller_flags_offset, value));
+        }
+        static_cast<void>(call.memory().write32(
+            controller + status_bar_controller_strength_offset, bars));
+    }
+    if (airport_view != 0) {
+        if (const auto flags = call.memory().read8(
+                airport_view + airport_view_flags_offset)) {
+            const auto value = configured
+                                   ? static_cast<std::uint8_t>(*flags | 0x01U)
+                                   : static_cast<std::uint8_t>(*flags & ~0x01U);
+            static_cast<void>(call.memory().write8(
+                airport_view + airport_view_flags_offset, value));
+        }
+        static_cast<void>(call.memory().write32(
+            airport_view + airport_view_strength_offset, bars));
+    }
+}
 
 }  // namespace
 
@@ -135,6 +204,43 @@ Apple80211Hle::Apple80211Hle(
         notify_change(before);
         call.set_return(apple80211_abi::success);
     });
+
+    registry.register_address(
+        std::string{springboard_image}, springboard_set_shows_airport,
+        "-[SBStatusBarController setShowsAirPort:]",
+        [this](UserlandHleCall& call) {
+            if (wifi_is_configured(state_->snapshot())) {
+                call.cpu().registers()[2] = 1;
+            }
+            call.resume_original_persistently();
+        });
+    registry.register_address(
+        std::string{springboard_image}, springboard_set_airport_strength,
+        "-[SBStatusBarController setAirPortStrength:]",
+        [this](UserlandHleCall& call) {
+            const auto bars = wifi_signal_bars(state_->snapshot());
+            if (bars != 0) call.cpu().registers()[2] = bars;
+            call.resume_original_persistently();
+        });
+    registry.register_address(
+        std::string{springboard_image}, springboard_shows_airport,
+        "-[SBStatusBarController showsAirPort]",
+        [this](UserlandHleCall& call) {
+            call.set_return(wifi_is_configured(state_->snapshot()) ? 1U : 0U);
+        });
+    registry.register_address(
+        std::string{springboard_image}, springboard_airport_strength,
+        "-[SBStatusBarController airPortStrength]",
+        [this](UserlandHleCall& call) {
+            call.set_return(wifi_signal_bars(state_->snapshot()));
+        });
+    registry.register_address(
+        std::string{springboard_image}, springboard_reflow_status_bar,
+        "-[SBStatusBarContentsView reflowContentViews]",
+        [this](UserlandHleCall& call) {
+            synchronize_status_bar_view(call, state_->snapshot());
+            call.resume_original_persistently();
+        });
 }
 
 void Apple80211Hle::reset() {

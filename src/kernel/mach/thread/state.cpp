@@ -42,13 +42,22 @@ bool write_words(AddressSpace &memory, std::uint32_t address,
 
 bool CompatibilityKernel::dispatch_mach_thread_state_message(
     Cpu &cpu, const MachMessageRequest &request) {
-  if (request.identifier !=
-      mig_message_id(xnu792::mig::thread_act::Routine::thread_get_state)) {
+  const auto gets_state =
+      request.identifier ==
+      mig_message_id(xnu792::mig::thread_act::Routine::thread_get_state);
+  const auto sets_state =
+      request.identifier ==
+          mig_message_id(xnu792::mig::thread_act::Routine::thread_set_state) ||
+      request.identifier ==
+          mig_message_id(xnu792::mig::thread_act::Routine::act_set_state);
+  if (!gets_state && !sets_state) {
     return false;
   }
 
   auto &registers = cpu.registers();
-  const auto &arguments = xnu792::mig::thread_act::thread_get_state_arguments;
+  const auto &arguments =
+      gets_state ? xnu792::mig::thread_act::thread_get_state_arguments
+                 : xnu792::mig::thread_act::thread_set_state_arguments;
   const auto flavor =
       memory_.read32(request.address + arguments[1].request_offset);
   const auto capacity =
@@ -63,6 +72,51 @@ bool CompatibilityKernel::dispatch_mach_thread_state_message(
     if (object) {
       owner = find_thread_owner(*shared_state_, *object);
     }
+  }
+
+  if (sets_state) {
+    darwin::arm_thread::GeneralState state{};
+    bool readable = flavor && capacity && owner &&
+                    *flavor == darwin::arm_thread::general_state_flavor &&
+                    *capacity >= darwin::arm_thread::general_state_word_count;
+    for (std::size_t index = 0; readable && index < state.size(); ++index) {
+      const auto value = memory_.read32(
+          request.address + arguments[2].request_offset +
+          static_cast<std::uint32_t>(index * sizeof(std::uint32_t)));
+      if (!value) {
+        readable = false;
+      } else {
+        state[index] = *value;
+      }
+    }
+    const auto updated =
+        readable && thread_state_update_handler_ &&
+        thread_state_update_handler_(owner->first, owner->second, state);
+    const std::array<std::uint32_t,
+                     simple_reply_size / sizeof(std::uint32_t)>
+        reply{
+            darwin::mig_wire::message_bits(
+                darwin::mig_wire::disposition_move_send_once),
+            simple_reply_size,
+            request.local_port,
+            0,
+            0,
+            request.identifier + 100,
+            0,
+            1,
+            updated ? mach_message_success : kernel_invalid_argument,
+        };
+    registers[0] = write_words(memory_, request.address, reply)
+                       ? mach_message_success
+                       : mach_receive_invalid_data;
+    if (updated) {
+      output_.write("[mach] thread_set_state caller=" +
+                    std::to_string(process_.pid) + " target=" +
+                    std::to_string(owner->first) + ":" +
+                    std::to_string(owner->second) + " flavor=" +
+                    std::to_string(*flavor) + "\n");
+    }
+    return true;
   }
 
   std::optional<darwin::arm_thread::GeneralState> state;

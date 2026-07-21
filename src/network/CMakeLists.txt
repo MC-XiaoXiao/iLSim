@@ -2,6 +2,7 @@ add_library(ilegacysim_network STATIC
     apple80211_hle.cpp
     darwin_network_abi.cpp
     darwin_route_socket.cpp
+    dns_configuration_hle.cpp
     host_network.cpp
     wifi_state.cpp)
 add_library(iLegacySim::network ALIAS ilegacysim_network)

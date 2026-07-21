@@ -571,6 +571,8 @@ void CompatibilityKernel::dispatch_bsd_events(Cpu &cpu, std::uint32_t number) {
     return;
   }
   case 93: { // select
+    constexpr std::uint64_t microseconds_per_second = 1'000'000ULL;
+    constexpr std::uint64_t nanoseconds_per_microsecond = 1'000ULL;
     const auto descriptor_count = registers[0];
     if (descriptor_count > 1024) {
       bsd_error(cpu, bsd_support::invalid_argument);
@@ -580,6 +582,7 @@ void CompatibilityKernel::dispatch_bsd_events(Cpu &cpu, std::uint32_t number) {
     std::uint32_t ready_count = 0;
     std::vector<std::uint32_t> requested_read_words(words);
     std::vector<std::uint32_t> requested_write_words(words);
+    bool watches_host_socket = false;
     for (std::uint32_t word_index = 0; word_index < words; ++word_index) {
       std::uint32_t ready_read_word = 0;
       std::uint32_t ready_write_word = 0;
@@ -594,6 +597,7 @@ void CompatibilityKernel::dispatch_bsd_events(Cpu &cpu, std::uint32_t number) {
           const auto fd = word_index * 32U + bit;
           if (fd >= descriptor_count || (*requested & (1U << bit)) == 0)
             continue;
+          watches_host_socket = watches_host_socket || host_sockets_.contains(fd);
           if (descriptor_readable(fd)) {
             ready_read_word |= 1U << bit;
             ++ready_count;
@@ -616,6 +620,7 @@ void CompatibilityKernel::dispatch_bsd_events(Cpu &cpu, std::uint32_t number) {
           if (fd >= descriptor_count || (*requested & (1U << bit)) == 0) {
             continue;
           }
+          watches_host_socket = watches_host_socket || host_sockets_.contains(fd);
           if (descriptor_writable(fd)) {
             ready_write_word |= 1U << bit;
             ++ready_count;
@@ -637,16 +642,39 @@ void CompatibilityKernel::dispatch_bsd_events(Cpu &cpu, std::uint32_t number) {
       bsd_success(cpu, ready_count);
       return;
     }
+    std::optional<std::uint64_t> timeout_deadline;
     if (registers[4] != 0) {
-      const auto seconds = memory_.read32(registers[4]);
-      const auto microseconds = memory_.read32(registers[4] + 4);
-      if (!seconds || !microseconds) {
+      const auto seconds_word = memory_.read32(registers[4]);
+      const auto microseconds_word = memory_.read32(registers[4] + 4);
+      if (!seconds_word || !microseconds_word) {
         bsd_error(cpu, bsd_support::bad_address);
         return;
       }
-      if (*seconds == 0 && *microseconds == 0) {
+      const auto seconds = static_cast<std::int32_t>(*seconds_word);
+      const auto microseconds = static_cast<std::int32_t>(*microseconds_word);
+      if (seconds < 0 || microseconds < 0 ||
+          static_cast<std::uint64_t>(microseconds) >=
+              microseconds_per_second) {
+        bsd_error(cpu, bsd_support::invalid_argument);
+        return;
+      }
+      const auto duration =
+          (static_cast<std::uint64_t>(seconds) * microseconds_per_second +
+           static_cast<std::uint64_t>(microseconds)) *
+          nanoseconds_per_microsecond;
+      if (duration == 0) {
         bsd_success(cpu, 0);
         return;
+      }
+      // Host sockets have a real poll source but still need the guest timer to
+      // wake a finite select when no packet arrives. Other virtual descriptors
+      // retain their existing provider-specific waiting behavior.
+      if (watches_host_socket) {
+        const auto now = shared_state_->clock.now();
+        timeout_deadline =
+            duration > std::numeric_limits<std::uint64_t>::max() - now
+                ? std::numeric_limits<std::uint64_t>::max()
+                : now + duration;
       }
     }
     process_.waiting_for_events = true;
@@ -657,7 +685,8 @@ void CompatibilityKernel::dispatch_bsd_events(Cpu &cpu, std::uint32_t number) {
                       registers[3],
                       std::move(requested_read_words),
                       std::move(requested_write_words),
-                      cpu.processor_id()};
+                      cpu.processor_id(),
+                      timeout_deadline};
     output_.write("[network] select wait pid=" + std::to_string(process_.pid) +
                   " nfds=" + std::to_string(descriptor_count) + "\n");
     bsd_success(cpu, 0);

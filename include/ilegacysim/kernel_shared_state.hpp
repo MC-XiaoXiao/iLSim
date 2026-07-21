@@ -153,6 +153,7 @@ struct PendingSelect {
   std::vector<std::uint32_t> read_words;
   std::vector<std::uint32_t> write_words;
   std::size_t processor{};
+  std::optional<std::uint64_t> deadline;
 };
 
 struct PendingSemaphoreWait {

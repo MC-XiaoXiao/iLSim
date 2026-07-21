@@ -159,6 +159,21 @@ void CompatibilityKernel::dispatch_bsd_filesystem(Cpu &cpu,
     const auto host = resolve_guest_path(*path);
     const auto flags = registers[1];
     output_.write("[vfs] open " + *path + "\n");
+    if (host_network_policy_ == HostNetworkPolicy::Host &&
+        (*path == "/etc/resolv.conf" ||
+         *path == "/var/run/resolv.conf")) {
+      const auto fd = allocate_file_descriptor();
+      if (!fd) {
+        bsd_error(cpu, 24); // EMFILE
+        return;
+      }
+      virtual_descriptors_.emplace(*fd, "resolver-config");
+      file_offsets_.emplace(*fd, 0);
+      file_status_flags_[*fd] = flags;
+      descriptor_flags_[*fd] = 0;
+      bsd_success(cpu, *fd);
+      return;
+    }
     if (bsd::baseband_device::is_path(*path) &&
         !shared_state_->baseband_device_state.may_open(process_.effective_uid ==
                                                        0)) {

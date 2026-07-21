@@ -100,6 +100,7 @@ private:
     std::uint32_t darwin_family_{};
     std::uint32_t darwin_type_{};
     std::optional<std::vector<std::byte>> presented_peer_address_;
+    bool presents_virtual_local_ipv4_address_{};
     bool receive_destination_address_{};
     bool receive_interface_{};
     bool receive_hop_limit_{};

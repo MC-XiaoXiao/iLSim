@@ -56,7 +56,7 @@ void CompatibilityKernel::dispatch_bsd_socket(Cpu &cpu, std::uint32_t number) {
         duplicate != duplicated_descriptors_.end()) {
       fd = duplicate->second;
     }
-    if (send_virtual_udp_message(cpu, fd, registers[1]))
+    if (send_socket_message(cpu, fd, registers[1]))
       return;
     const auto endpoint = socket_pair_endpoints_.find(fd);
     if (endpoint == socket_pair_endpoints_.end()) {
@@ -943,8 +943,16 @@ void CompatibilityKernel::dispatch_bsd_socket(Cpu &cpu, std::uint32_t number) {
       if (sent.status == HostSocketStatus::WouldBlock) {
         bsd_error(cpu, bsd_support::would_block);
       } else if (sent.status == HostSocketStatus::Error) {
+        output_.write("[network] sendto host fd=" + std::to_string(fd) +
+                      " bytes=" + std::to_string(bytes->size()) +
+                      " error=" + std::to_string(sent.darwin_error) + "\n");
         bsd_error(cpu, sent.darwin_error);
       } else {
+        if (socket_payload_trace_count_ < 32U) {
+          output_.write("[network] sendto host fd=" + std::to_string(fd) +
+                        " bytes=" + std::to_string(sent.transferred) + "\n");
+          ++socket_payload_trace_count_;
+        }
         bsd_success(cpu, static_cast<std::uint32_t>(sent.transferred));
       }
       return;

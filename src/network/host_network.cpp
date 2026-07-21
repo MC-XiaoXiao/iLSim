@@ -214,13 +214,19 @@ std::optional<in_addr> host_ipv4_resolver() {
 
 std::optional<HostAddress> to_host_address(
     std::span<const std::byte> bytes, HostNetworkPolicy policy,
-    bool binding, std::uint32_t& error, bool* dns_redirected = nullptr) {
+    bool binding, std::uint32_t& error, bool* dns_redirected = nullptr,
+    bool* local_address_redirected = nullptr) {
     if (dns_redirected) *dns_redirected = false;
+    if (local_address_redirected) *local_address_redirected = false;
     if (bytes.size() < 2) {
         error = darwin_error_invalid_argument;
         return std::nullopt;
     }
-    const auto declared_length = std::to_integer<std::uint8_t>(bytes[0]);
+    const auto encoded_length = std::to_integer<std::uint8_t>(bytes[0]);
+    // Some Darwin 8 callers pass the authoritative sockaddr size as the
+    // syscall argument while leaving the in-structure sa_len byte zero.
+    const auto declared_length =
+        encoded_length == 0 ? bytes.size() : encoded_length;
     const auto family = std::to_integer<std::uint8_t>(bytes[1]);
     if (declared_length > bytes.size()) {
         error = darwin_error_invalid_argument;
@@ -237,7 +243,14 @@ std::optional<HostAddress> to_host_address(
         address.sin_family = AF_INET;
         std::memcpy(&address.sin_port, bytes.data() + 2, sizeof(address.sin_port));
         std::memcpy(&address.sin_addr, bytes.data() + 4, sizeof(address.sin_addr));
-        if (!binding && policy == HostNetworkPolicy::Host &&
+        const auto guest_client_address = std::equal(
+            bytes.begin() + 4, bytes.begin() + 8,
+            virtual_network::client_address.begin());
+        if (binding && policy == HostNetworkPolicy::Host &&
+            guest_client_address) {
+            address.sin_addr.s_addr = htonl(INADDR_ANY);
+            if (local_address_redirected) *local_address_redirected = true;
+        } else if (!binding && policy == HostNetworkPolicy::Host &&
             ntohs(address.sin_port) == virtual_network::dns_port &&
             std::equal(
                 bytes.begin() + 4, bytes.begin() + 8,
@@ -465,13 +478,16 @@ HostSocketResult HostSocket::finish_connect() const {
 HostSocketResult HostSocket::bind(
     std::span<const std::byte> darwin_address) {
     std::uint32_t address_error = 0;
+    bool local_address_redirected = false;
     const auto address = to_host_address(
-        darwin_address, policy_, true, address_error);
+        darwin_address, policy_, true, address_error, nullptr,
+        &local_address_redirected);
     if (!address) return darwin_error_result(address_error);
     if (::bind(descriptor_, reinterpret_cast<const sockaddr*>(&address->storage),
                address->length) != 0) {
         return error_result(errno);
     }
+    presents_virtual_local_ipv4_address_ = local_address_redirected;
     return {};
 }
 
@@ -624,6 +640,13 @@ HostSocketResult HostSocket::receive(std::size_t capacity) {
             }
         }
     }
+    if (presents_virtual_local_ipv4_address_ &&
+        result.destination_address.size() ==
+            virtual_network::client_address.size()) {
+        std::copy(virtual_network::client_address.begin(),
+                  virtual_network::client_address.end(),
+                  result.destination_address.begin());
+    }
     if (!result.interface_index && receive_interface_) {
         result.interface_index = policy_ == HostNetworkPolicy::Loopback ? 1U : 2U;
     }
@@ -662,11 +685,16 @@ HostSocketResult HostSocket::set_option(
     }
     if (darwin_level == darwin::socket::option_level &&
         darwin_option == darwin::socket::option_reuse_port) {
+        const auto address_reuse = set_host_option(
+            SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+        if (address_reuse.status != HostSocketStatus::Success) {
+            return address_reuse;
+        }
 #if defined(SO_REUSEPORT)
         return set_host_option(
             SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled));
 #else
-        return darwin_error_result(42);  // ENOPROTOOPT
+        return {};
 #endif
     }
     if (darwin_level == darwin::network::protocol_ip &&
@@ -846,7 +874,14 @@ HostSocketResult HostSocket::local_address() const {
     socklen_t length = sizeof(address);
     const auto result = ::getsockname(
         descriptor_, reinterpret_cast<sockaddr*>(&address), &length);
-    return socket_address_result(result, errno, address, length);
+    auto output = socket_address_result(result, errno, address, length);
+    if (output.status == HostSocketStatus::Success &&
+        presents_virtual_local_ipv4_address_ && output.address.size() >= 8) {
+        std::copy(virtual_network::client_address.begin(),
+                  virtual_network::client_address.end(),
+                  output.address.begin() + 4);
+    }
+    return output;
 }
 
 HostSocketResult HostSocket::peer_address() const {

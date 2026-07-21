@@ -54,6 +54,11 @@ public:
   using ThreadStateQuery =
       std::function<std::optional<darwin::arm_thread::GeneralState>(
           std::uint32_t, std::uint32_t, std::uint32_t)>;
+  using ThreadStateUpdateHandler = std::function<bool(
+      std::uint32_t, std::uint32_t,
+      const darwin::arm_thread::GeneralState &)>;
+  using ThreadRunnableHandler =
+      std::function<bool(std::uint32_t, std::uint32_t, bool)>;
   using ForkHandler = std::function<std::optional<std::uint32_t>(Cpu &)>;
   using ExecHandler = std::function<bool(
       Cpu &, std::string, std::vector<std::string>, std::vector<std::string>)>;
@@ -85,6 +90,12 @@ public:
   }
   void set_thread_state_query(ThreadStateQuery query) {
     thread_state_query_ = std::move(query);
+  }
+  void set_thread_state_update_handler(ThreadStateUpdateHandler handler) {
+    thread_state_update_handler_ = std::move(handler);
+  }
+  void set_thread_runnable_handler(ThreadRunnableHandler handler) {
+    thread_runnable_handler_ = std::move(handler);
   }
   void set_fork_handler(ForkHandler handler) {
     fork_handler_ = std::move(handler);
@@ -283,8 +294,8 @@ private:
   bool deliver_pending_mach_locked(Cpu &cpu);
   bool receive_socket_message(Cpu &cpu, std::uint32_t fd,
                               std::uint32_t message_address);
-  bool send_virtual_udp_message(Cpu &cpu, std::uint32_t fd,
-                                std::uint32_t message_address);
+  bool send_socket_message(Cpu &cpu, std::uint32_t fd,
+                           std::uint32_t message_address);
   bool receive_socket_bytes(Cpu &cpu, std::uint32_t fd, std::uint32_t address,
                             std::uint32_t size,
                             std::uint32_t source_address = 0,
@@ -400,6 +411,8 @@ private:
   ThreadCreateHandler thread_create_handler_;
   ThreadTerminateHandler thread_terminate_handler_;
   ThreadStateQuery thread_state_query_;
+  ThreadStateUpdateHandler thread_state_update_handler_;
+  ThreadRunnableHandler thread_runnable_handler_;
   ForkHandler fork_handler_;
   ExecHandler exec_handler_;
   SpawnExecHandler spawn_exec_handler_;

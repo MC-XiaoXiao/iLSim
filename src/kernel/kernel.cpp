@@ -5,6 +5,7 @@
 #include "ilegacysim/bootstrap_mig_ids.hpp"
 #include "ilegacysim/core_telephony_hle.hpp"
 #include "ilegacysim/darwin_abi.hpp"
+#include "ilegacysim/dns_configuration_hle.hpp"
 #include "ilegacysim/darwin_kqueue_abi.hpp"
 #include "ilegacysim/darwin_network_abi.hpp"
 #include "ilegacysim/darwin_resource_abi.hpp"
@@ -78,6 +79,7 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
       mobile_framebuffer_hle_{userland_hle_, display_state_, surface_store_} {
   core_surface_hle_.set_shared_state(shared_state_);
   register_core_telephony_hle(userland_hle_);
+  register_dns_configuration_hle(userland_hle_);
   register_app_support_hle(userland_hle_);
   register_fig_movie_hle(userland_hle_);
   register_bluetooth_manager_hle(userland_hle_);
@@ -665,7 +667,10 @@ bool CompatibilityKernel::deliver_pending_io(Cpu &cpu) {
         }
       }
     }
-    if (ready_count == 0)
+    const auto timed_out =
+        pending->second.deadline &&
+        shared_state_->clock.now() >= *pending->second.deadline;
+    if (ready_count == 0 && !timed_out)
       return false;
     bool copied = true;
     for (std::size_t index = 0; index < ready_read_words.size(); ++index) {
@@ -842,6 +847,12 @@ std::optional<std::uint64_t> CompatibilityKernel::next_timer_deadline() const {
     }
   }
   for (const auto &[processor, wait] : pending_kevents_) {
+    static_cast<void>(processor);
+    if (wait.deadline && (!deadline || *wait.deadline < *deadline)) {
+      deadline = wait.deadline;
+    }
+  }
+  for (const auto &[processor, wait] : pending_selects_) {
     static_cast<void>(processor);
     if (wait.deadline && (!deadline || *wait.deadline < *deadline)) {
       deadline = wait.deadline;

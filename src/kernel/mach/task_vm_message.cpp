@@ -56,45 +56,59 @@ bool CompatibilityKernel::dispatch_mach_task_vm_message(
   const std::optional<std::uint32_t> remote_port{request.remote_port};
   const std::optional<std::uint32_t> local_port{request.local_port};
   const std::optional<std::uint32_t> message_id{request.identifier};
-  if (*message_id ==
-          mig_message_id(xnu792::mig::task::Routine::thread_create_running) &&
+  const auto creates_suspended_thread =
+      *message_id == mig_message_id(xnu792::mig::task::Routine::thread_create);
+  const auto creates_running_thread =
+      *message_id ==
+      mig_message_id(xnu792::mig::task::Routine::thread_create_running);
+  if ((creates_suspended_thread || creates_running_thread) &&
       registers[3] >= 40) {
     const auto &create_arguments =
         xnu792::mig::task::thread_create_running_arguments;
-    const auto flavor =
-        memory_.read32(message_address + create_arguments[1].request_offset)
-            .value_or(0);
-    const auto state_count =
-        memory_
-            .read32(message_address + create_arguments[2].request_count_offset)
-            .value_or(0);
     std::array<std::uint32_t, 16> state{};
-    bool valid_state = flavor == 1 && state_count >= 17;
-    for (std::size_t index = 0; valid_state && index < state.size(); ++index) {
-      const auto value = memory_.read32(
-          message_address + create_arguments[2].request_offset +
-          static_cast<std::uint32_t>(index * sizeof(std::uint32_t)));
-      if (!value) {
-        valid_state = false;
-      } else {
-        state[index] = *value;
+    std::uint32_t state_count = 0;
+    std::uint32_t guest_cpsr = 0x10U;
+    bool valid_state = creates_suspended_thread;
+    if (creates_running_thread) {
+      const auto flavor =
+          memory_.read32(message_address + create_arguments[1].request_offset)
+              .value_or(0);
+      state_count =
+          memory_
+              .read32(message_address +
+                      create_arguments[2].request_count_offset)
+              .value_or(0);
+      valid_state = flavor == 1 && state_count >= 17;
+      for (std::size_t index = 0; valid_state && index < state.size(); ++index) {
+        const auto value = memory_.read32(
+            message_address + create_arguments[2].request_offset +
+            static_cast<std::uint32_t>(index * sizeof(std::uint32_t)));
+        if (!value) {
+          valid_state = false;
+        } else {
+          state[index] = *value;
+        }
       }
+      guest_cpsr =
+          memory_
+              .read32(message_address + create_arguments[2].request_offset +
+                      16U * sizeof(std::uint32_t))
+              .value_or(0);
     }
-    const auto guest_cpsr =
-        memory_
-            .read32(message_address + create_arguments[2].request_offset +
-                    16U * sizeof(std::uint32_t))
-            .value_or(0);
     if (valid_state && thread_trace_count_ < 16) {
-      output_.write(
-          "[thread] create-running pid=" + std::to_string(process_.pid) +
-          " pc=" + std::to_string(state[15]) + " sp=" +
-          std::to_string(state[13]) + " lr=" + std::to_string(state[14]) +
-          " cpsr=" + std::to_string(guest_cpsr) + " r0=" +
-          std::to_string(state[0]) + " r1=" + std::to_string(state[1]) +
-          " r2=" + std::to_string(state[2]) +
-          " r3=" + std::to_string(state[3]) +
-          " count=" + std::to_string(state_count) + "\n");
+      output_.write("[thread] create-" +
+                    std::string(creates_suspended_thread ? "suspended" :
+                                                            "running") +
+                    " pid=" + std::to_string(process_.pid) + " pc=" +
+                    std::to_string(state[15]) + " sp=" +
+                    std::to_string(state[13]) + " lr=" +
+                    std::to_string(state[14]) + " cpsr=" +
+                    std::to_string(guest_cpsr) + " r0=" +
+                    std::to_string(state[0]) + " r1=" +
+                    std::to_string(state[1]) + " r2=" +
+                    std::to_string(state[2]) + " r3=" +
+                    std::to_string(state[3]) + " count=" +
+                    std::to_string(state_count) + "\n");
       ++thread_trace_count_;
     }
     const auto processor =
@@ -102,6 +116,17 @@ bool CompatibilityKernel::dispatch_mach_task_vm_message(
             ? thread_create_handler_(state, guest_cpsr | 0x10U)
             : std::nullopt;
     if (processor) {
+      if (creates_suspended_thread && thread_runnable_handler_ &&
+          !thread_runnable_handler_(process_.pid,
+                                    static_cast<std::uint32_t>(*processor),
+                                    false)) {
+        if (thread_terminate_handler_) {
+          static_cast<void>(thread_terminate_handler_(process_.pid,
+                                                      *processor));
+        }
+        registers[0] = 0x10004008U;
+        return true;
+      }
       std::uint32_t port_object = 0;
       std::uint32_t port_name = 0;
       {
@@ -141,7 +166,7 @@ bool CompatibilityKernel::dispatch_mach_task_vm_message(
         }
       }
       registers[0] = 0;
-      if (scheduler_preemption_query_ &&
+      if (creates_running_thread && scheduler_preemption_query_ &&
           scheduler_preemption_query_(cpu.processor_id())) {
         // Scheduler AST boundary. Unlike an explicit yield, this
         // preserves the remainder of the current first timeslice.

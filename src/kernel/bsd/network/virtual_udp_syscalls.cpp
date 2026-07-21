@@ -31,10 +31,11 @@ std::uint32_t socket_error(bsd::VirtualUdpStatus status) {
 
 } // namespace
 
-bool CompatibilityKernel::send_virtual_udp_message(
+bool CompatibilityKernel::send_socket_message(
     Cpu &cpu, std::uint32_t fd, std::uint32_t message_address) {
   const auto socket = virtual_udp_sockets_.find(fd);
-  if (socket == virtual_udp_sockets_.end())
+  const auto host = host_sockets_.find(fd);
+  if (socket == virtual_udp_sockets_.end() && host == host_sockets_.end())
     return false;
 
   using namespace darwin::socket;
@@ -88,26 +89,48 @@ bool CompatibilityKernel::send_virtual_udp_message(
     payload.insert(payload.end(), bytes->begin(), bytes->end());
   }
 
-  bsd::VirtualUdpStatus result{};
-  if (*name_length == 0) {
-    result = socket->second->send(payload);
-  } else {
-    const auto destination = memory_.read_bytes(*name_address, *name_length);
-    if (!destination) {
+  std::vector<std::byte> destination;
+  if (*name_length != 0) {
+    const auto address = memory_.read_bytes(*name_address, *name_length);
+    if (!address) {
       bsd_error(cpu, bsd_support::bad_address);
       return true;
     }
-    result = socket->second->send(payload, *destination);
+    destination = *address;
   }
-  if (result != bsd::VirtualUdpStatus::Success) {
-    bsd_error(cpu, socket_error(result));
+
+  if (host != host_sockets_.end()) {
+    const auto result = host->second->send(payload, destination);
+    if (result.status == HostSocketStatus::WouldBlock) {
+      bsd_error(cpu, bsd_support::would_block);
+      return true;
+    }
+    if (result.status == HostSocketStatus::Error) {
+      bsd_error(cpu, result.darwin_error);
+      return true;
+    }
+    bsd_success(cpu, static_cast<std::uint32_t>(result.transferred));
+    if (socket_payload_trace_count_ < 32U) {
+      output_.write("[network] sendmsg host fd=" + std::to_string(fd) +
+                    " bytes=" + std::to_string(result.transferred) + "\n");
+      ++socket_payload_trace_count_;
+    }
     return true;
   }
-  bsd_success(cpu, static_cast<std::uint32_t>(payload.size()));
-  if (socket_payload_trace_count_ < 32U) {
-    output_.write("[network] sendmsg virtual UDP fd=" + std::to_string(fd) +
-                  " bytes=" + std::to_string(payload.size()) + "\n");
-    ++socket_payload_trace_count_;
+
+  const auto result = destination.empty()
+                          ? socket->second->send(payload)
+                          : socket->second->send(payload, destination);
+  if (result != bsd::VirtualUdpStatus::Success) {
+    bsd_error(cpu, socket_error(result));
+  } else {
+    bsd_success(cpu, static_cast<std::uint32_t>(payload.size()));
+    if (socket_payload_trace_count_ < 32U) {
+      output_.write("[network] sendmsg virtual UDP fd=" +
+                    std::to_string(fd) + " bytes=" +
+                    std::to_string(payload.size()) + "\n");
+      ++socket_payload_trace_count_;
+    }
   }
   return true;
 }

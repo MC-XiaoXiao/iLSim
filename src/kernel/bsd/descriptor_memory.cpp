@@ -93,6 +93,23 @@ void CompatibilityKernel::dispatch_bsd_descriptor_memory(Cpu &cpu,
         random_state_ ^= random_state_ << 17U;
         byte = static_cast<std::byte>(random_state_ & 0xffU);
       }
+    } else if (const auto resolver = virtual_descriptors_.find(fd);
+               resolver != virtual_descriptors_.end() &&
+               resolver->second == "resolver-config") {
+      constexpr std::string_view configuration{"nameserver 10.0.2.3\n"};
+      const auto offset = std::min<std::size_t>(
+          file_offsets_[fd], configuration.size());
+      const auto count =
+          std::min<std::size_t>(size, configuration.size() - offset);
+      bytes.resize(count);
+      const auto begin = configuration.begin() +
+                         static_cast<std::ptrdiff_t>(offset);
+      std::transform(begin,
+                     begin + static_cast<std::ptrdiff_t>(count),
+                     bytes.begin(), [](char value) {
+                       return static_cast<std::byte>(value);
+                     });
+      file_offsets_[fd] = offset + count;
     } else if (const auto console_device = virtual_descriptors_.find(fd);
                console_device != virtual_descriptors_.end() &&
                console_device->second == "console") {
@@ -458,6 +475,10 @@ void CompatibilityKernel::dispatch_bsd_descriptor_memory(Cpu &cpu,
     } else if (const auto device = virtual_descriptors_.find(source);
                device != virtual_descriptors_.end()) {
       virtual_descriptors_.emplace(allocated, device->second);
+      if (const auto offset = file_offsets_.find(source);
+          offset != file_offsets_.end()) {
+        file_offsets_[allocated] = offset->second;
+      }
       if (const auto host = host_sockets_.find(source);
           host != host_sockets_.end()) {
         host_sockets_[allocated] = host->second;
@@ -611,6 +632,10 @@ void CompatibilityKernel::dispatch_bsd_descriptor_memory(Cpu &cpu,
     } else if (const auto device = virtual_descriptors_.find(source);
                device != virtual_descriptors_.end()) {
       virtual_descriptors_[destination] = device->second;
+      if (const auto offset = file_offsets_.find(source);
+          offset != file_offsets_.end()) {
+        file_offsets_[destination] = offset->second;
+      }
       if (const auto host = host_sockets_.find(source);
           host != host_sockets_.end()) {
         host_sockets_[destination] = host->second;
