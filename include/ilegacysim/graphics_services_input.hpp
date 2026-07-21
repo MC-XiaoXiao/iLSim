@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -10,6 +11,10 @@
 #include "ilegacysim/kernel_shared_state.hpp"
 #include "ilegacysim/system_button_input.hpp"
 #include "ilegacysim/touch_input.hpp"
+
+namespace ilegacysim {
+class UserlandHleRegistry;
+}
 
 namespace ilegacysim::graphics_services_input {
 
@@ -28,6 +33,13 @@ struct ServiceResolution {
   bool application_event_port{};
   std::string service_name;
 };
+
+// iPhone OS 1.0 SpringBoard keeps alert items in its own top-level window
+// stack without changing the foreground application lifecycle. Observe the
+// stripped alert-item callbacks so host input follows that system-owned layer.
+void register_springboard_alert_observers(
+    UserlandHleRegistry &registry,
+    std::function<void(std::uint32_t, bool)> observer);
 
 // Extracts the leading GSEventRecord type from a message with id 123. This is
 // shared by input injection and Mach tracing so application lifecycle events

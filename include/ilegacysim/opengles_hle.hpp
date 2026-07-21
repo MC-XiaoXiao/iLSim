@@ -21,6 +21,7 @@ namespace ilegacysim {
 class UserlandHleCall;
 class UserlandHleRegistry;
 class SurfaceStore;
+struct KernelSharedState;
 
 // High-level implementation of the public iPhoneOS 1.0 OpenGLES framework
 // ABI. It deliberately models EGL/GLES state rather than the PowerVR MBX
@@ -34,6 +35,7 @@ public:
     void reset();
     void inherit_state(const OpenGlesHle& parent);
     void set_display(std::shared_ptr<DisplayState> display);
+    void set_shared_state(std::shared_ptr<KernelSharedState> shared_state);
     [[nodiscard]] const GlesResourceStore& resources() const {
         return resources_;
     }
@@ -116,6 +118,7 @@ private:
         UserlandHleCall& call, const ContextState& context,
         std::uint32_t index) const;
     void draw(UserlandHleCall& call, bool indexed);
+    [[nodiscard]] bool display_write_allowed(UserlandHleCall& call) const;
     void register_egl(UserlandHleRegistry& registry);
     void register_gles(UserlandHleRegistry& registry);
     void unsupported(UserlandHleCall& call);
@@ -131,6 +134,7 @@ private:
     std::size_t unsupported_trace_count_{};
     std::shared_ptr<DisplayState> display_;
     std::shared_ptr<SurfaceStore> surface_store_;
+    std::shared_ptr<KernelSharedState> shared_state_;
 };
 
 }  // namespace ilegacysim

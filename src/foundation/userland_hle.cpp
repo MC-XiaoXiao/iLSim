@@ -190,7 +190,7 @@ void UserlandHleRegistry::register_function(std::string image_suffix,
   registrations_.push_back(
       Registration{static_cast<std::uint16_t>(registrations_.size() + 1U),
                    std::move(image_suffix), std::move(symbol), false,
-                   std::nullopt, std::move(handler)});
+                   std::nullopt, std::nullopt, std::move(handler)});
 }
 
 void UserlandHleRegistry::register_prefix(std::string image_suffix,
@@ -202,7 +202,34 @@ void UserlandHleRegistry::register_prefix(std::string image_suffix,
   registrations_.push_back(
       Registration{static_cast<std::uint16_t>(registrations_.size() + 1U),
                    std::move(image_suffix), std::move(symbol_prefix), true,
-                   std::nullopt, std::move(handler)});
+                   std::nullopt, std::nullopt, std::move(handler)});
+}
+
+void UserlandHleRegistry::register_objc_instance_method(
+    std::string image_suffix, std::string class_name, std::string selector,
+    std::string diagnostic_name, Handler handler) {
+  if (!handler || class_name.empty() || selector.empty() ||
+      diagnostic_name.empty() ||
+      registrations_.size() >= userland_hle_call_mask) {
+    throw std::runtime_error{
+        "invalid or exhausted userspace Objective-C HLE registration"};
+  }
+  const auto duplicate =
+      std::find_if(registrations_.begin(), registrations_.end(),
+                   [&](const Registration &registration) {
+                     return registration.image_suffix == image_suffix &&
+                            registration.objc_instance_method ==
+                                std::optional{std::pair{class_name, selector}};
+                   });
+  if (duplicate != registrations_.end()) {
+    throw std::runtime_error{"duplicate userspace Objective-C method: " +
+                             diagnostic_name};
+  }
+  registrations_.push_back(Registration{
+      static_cast<std::uint16_t>(registrations_.size() + 1U),
+      std::move(image_suffix), std::move(diagnostic_name), false, std::nullopt,
+      std::pair{std::move(class_name), std::move(selector)},
+      std::move(handler)});
 }
 
 void UserlandHleRegistry::register_address(std::string image_suffix,
@@ -227,7 +254,7 @@ void UserlandHleRegistry::register_address(std::string image_suffix,
   registrations_.push_back(
       Registration{static_cast<std::uint16_t>(registrations_.size() + 1U),
                    std::move(image_suffix), std::move(diagnostic_name), false,
-                   virtual_address, std::move(handler)});
+                   virtual_address, std::nullopt, std::move(handler)});
 }
 
 UserlandHleRegistry::Registration *
@@ -238,6 +265,8 @@ UserlandHleRegistry::select_registration(std::string_view image_path,
     if (!path_has_suffix(image_path, registration.image_suffix))
       continue;
     if (registration.virtual_address)
+      continue;
+    if (registration.objc_instance_method)
       continue;
     if (!registration.prefix && registration.symbol == symbol) {
       return &registration;
@@ -396,6 +425,62 @@ std::size_t UserlandHleRegistry::install_mapped_image(
     }
     if (!copied)
       continue;
+    installed_calls_.emplace(
+        runtime_address,
+        InstalledCall{registration.id, registration.symbol, thumb, *original});
+    ++patched;
+  }
+  for (const auto &registration : registrations_) {
+    if (!registration.objc_instance_method ||
+        !path_has_suffix(path, registration.image_suffix)) {
+      continue;
+    }
+    const auto &[class_name, selector] =
+        *registration.objc_instance_method;
+    const auto method =
+        image.find_objc_instance_method(class_name, selector);
+    if (!method) continue;
+    const bool thumb = (*method & 1U) != 0;
+    const auto preferred_address = *method & ~1U;
+    const auto segment = std::find_if(
+        image.segments().begin(), image.segments().end(),
+        [&](const MachSegment &candidate) {
+          return preferred_address >= candidate.vm_address &&
+                 preferred_address - candidate.vm_address <
+                     candidate.file_size;
+        });
+    if (segment == image.segments().end()) continue;
+    const auto address_file_offset =
+        static_cast<std::uint64_t>(segment->file_offset) +
+        (preferred_address - segment->vm_address);
+    const auto patch_size = thumb ? 2U : 4U;
+    if (address_file_offset < mapping_offset ||
+        address_file_offset + patch_size > mapping_file_end) {
+      continue;
+    }
+    const auto mapping_delta = address_file_offset - mapping_offset;
+    if (mapping_delta >
+        std::numeric_limits<std::uint32_t>::max() - mapping_address) {
+      continue;
+    }
+    const auto runtime_address =
+        mapping_address + static_cast<std::uint32_t>(mapping_delta);
+    if (installed_calls_.contains(runtime_address)) continue;
+    const auto original = memory_.read_bytes(runtime_address, patch_size);
+    if (!original) continue;
+    bool copied = false;
+    if (thumb) {
+      const auto instruction = little_endian_halfword(
+          static_cast<std::uint16_t>(0xdf00U | userland_hle_thumb_svc));
+      copied = memory_.copy_in(runtime_address, instruction);
+      if (copied) cpu.invalidate_cache_range(runtime_address, instruction.size());
+    } else {
+      const auto instruction = little_endian_word(
+          arm_svc_opcode | userland_hle_svc_namespace | registration.id);
+      copied = memory_.copy_in(runtime_address, instruction);
+      if (copied) cpu.invalidate_cache_range(runtime_address, instruction.size());
+    }
+    if (!copied) continue;
     installed_calls_.emplace(
         runtime_address,
         InstalledCall{registration.id, registration.symbol, thumb, *original});

@@ -78,12 +78,23 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
       mbx2d_hle_{userland_hle_, display_state_, surface_store_},
       mobile_framebuffer_hle_{userland_hle_, display_state_, surface_store_} {
   core_surface_hle_.set_shared_state(shared_state_);
+  opengles_hle_.set_shared_state(shared_state_);
+  mobile_framebuffer_hle_.set_shared_state(shared_state_);
   register_core_telephony_hle(userland_hle_);
   register_dns_configuration_hle(userland_hle_);
   register_app_support_hle(userland_hle_);
   register_fig_movie_hle(userland_hle_);
   register_bluetooth_manager_hle(userland_hle_);
   register_mbx_connect_hle(userland_hle_);
+  graphics_services_input::register_springboard_alert_observers(
+      userland_hle_, [this](std::uint32_t object, bool active) {
+        std::lock_guard lock{shared_state_->mach_mutex};
+        if (active) {
+          shared_state_->active_springboard_alert_items.insert(object);
+        } else {
+          shared_state_->active_springboard_alert_items.erase(object);
+        }
+      });
   layerkit_hle_.register_handlers(userland_hle_, shared_state_, output_);
   thread_ports_.emplace(0, process_.thread_port);
   if (!mach_task_identity::initialize_root(*shared_state_, process_)) {
@@ -937,6 +948,8 @@ void CompatibilityKernel::inherit_process_state(
   apple80211_hle_.set_wifi_state(wifi_state_);
   core_surface_hle_.set_display(display_state_);
   core_surface_hle_.set_shared_state(shared_state_);
+  opengles_hle_.set_shared_state(shared_state_);
+  mobile_framebuffer_hle_.set_shared_state(shared_state_);
   layerkit_hle_.set_shared_state(shared_state_);
   opengles_hle_.set_display(display_state_);
   mbx2d_hle_.set_display(display_state_);

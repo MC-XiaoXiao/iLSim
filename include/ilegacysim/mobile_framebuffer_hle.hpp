@@ -8,6 +8,7 @@
 namespace ilegacysim {
 
 class DisplayState;
+struct KernelSharedState;
 class UserlandHleCall;
 class UserlandHleRegistry;
 class SurfaceStore;
@@ -21,12 +22,14 @@ public:
     void reset();
     void inherit_state(const MobileFramebufferHle& parent);
     void set_display(std::shared_ptr<DisplayState> display);
+    void set_shared_state(std::shared_ptr<KernelSharedState> shared_state);
     [[nodiscard]] bool has_active_layers() const;
 
 private:
     void set_background_color(UserlandHleCall& call);
     void set_layer(UserlandHleCall& call);
     void submit_layers(UserlandHleCall& call);
+    [[nodiscard]] bool display_write_allowed(UserlandHleCall& call) const;
 
     struct Rectangle {
         float x{};
@@ -43,6 +46,7 @@ private:
 
     std::shared_ptr<DisplayState> display_;
     std::shared_ptr<SurfaceStore> surface_store_;
+    std::shared_ptr<KernelSharedState> shared_state_;
     std::map<std::uint32_t, LayerState> layers_;
     std::uint32_t next_swap_id_{1};
     std::uint32_t background_argb_{0xff000000U};

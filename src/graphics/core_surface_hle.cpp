@@ -204,6 +204,16 @@ void CoreSurfaceHle::submit(Buffer& buffer, UserlandHleCall& call) {
                                     core_surface_abi::bytes_per_bgra_pixel) {
         return;
     }
+    if (shared_state_) {
+        std::lock_guard lock{shared_state_->mach_mutex};
+        const auto process = shared_state_->processes.find(call.process_id());
+        if (process != shared_state_->processes.end() &&
+            process->second.executable_path.starts_with("/Applications/") &&
+            !active_application_owns_display_locked(*shared_state_,
+                                                    call.process_id())) {
+            return;
+        }
+    }
     const auto bytes = call.memory().read_bytes(buffer.base, buffer.allocation_size);
     if (!bytes || bytes->size() < static_cast<std::size_t>(
                                     iphone_2g_display_width) *

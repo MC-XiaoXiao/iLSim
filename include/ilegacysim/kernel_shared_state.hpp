@@ -573,6 +573,15 @@ struct KernelSharedState {
   std::optional<PendingApplicationSceneTransform>
       latest_application_scene_transform;
   std::optional<ActiveApplicationScene> active_application_scene;
+  // First-generation SpringBoard prewarms selected applications with the
+  // userspace `--suspended` argument. Their first activation message binds the
+  // remote event/scene plumbing but does not put that scene on the visual
+  // foreground stack. A later activation is a real foreground transition.
+  std::set<std::uint32_t> consumed_application_prewarm_activations;
+  // SpringBoard alert items are system-owned windows layered above any remote
+  // application scene. Track object identity so nested/repeated activation
+  // callbacks cannot restore application input prematurely.
+  std::set<std::uint32_t> active_springboard_alert_items;
   // UIKit creates a new full-screen CoreSurface after willResignActive and
   // asks SpringBoard to animate that surface. Preserve the final live scanout
   // so compatibility geometry used for touch routing cannot relayout the
@@ -640,5 +649,23 @@ struct KernelSharedState {
   mutable std::mutex socket_mutex;
   mutable std::mutex filesystem_mutex;
 };
+
+// The caller must hold mach_mutex. A remote application may own cached scene
+// state while suspended, and a prelaunched application may publish a scene
+// before SpringBoard promotes its event port. Only the intersection is the
+// currently visible, interactive application allowed to write the panel.
+[[nodiscard]] inline bool active_application_owns_display_locked(
+    const KernelSharedState &state, std::uint32_t process_id) {
+  if (state.application_touch_suspended ||
+      state.active_application_event_object == 0U ||
+      !state.active_application_scene ||
+      state.active_application_scene->process_id != process_id ||
+      !state.active_application_scene->touch_transform) {
+    return false;
+  }
+  const auto event_port =
+      state.mach_port_objects.lookup(state.active_application_event_object);
+  return event_port && event_port->receive_owner == process_id;
+}
 
 } // namespace ilegacysim

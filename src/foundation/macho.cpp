@@ -49,6 +49,33 @@ std::int32_t read_i32(std::span<const std::byte> bytes, std::size_t offset) {
     return static_cast<std::int32_t>(read_u32(bytes, offset));
 }
 
+std::optional<std::size_t> vm_file_offset(
+    std::span<const MachSegment> segments, std::uint32_t address,
+    std::size_t required_size) {
+    for (const auto& segment : segments) {
+        if (address < segment.vm_address ||
+            address - segment.vm_address >= segment.file_size) {
+            continue;
+        }
+        const auto delta = address - segment.vm_address;
+        if (required_size > segment.file_size - delta) return std::nullopt;
+        return static_cast<std::size_t>(segment.file_offset) + delta;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string_view> vm_c_string(
+    std::span<const std::byte> bytes, std::span<const MachSegment> segments,
+    std::uint32_t address) {
+    const auto offset = vm_file_offset(segments, address, 1U);
+    if (!offset || *offset >= bytes.size()) return std::nullopt;
+    auto end = *offset;
+    while (end < bytes.size() && bytes[end] != std::byte{0}) ++end;
+    if (end == bytes.size()) return std::nullopt;
+    return std::string_view{
+        reinterpret_cast<const char*>(bytes.data() + *offset), end - *offset};
+}
+
 std::string fixed_string(std::span<const std::byte> bytes, std::size_t offset, std::size_t length) {
     if (offset > bytes.size() || bytes.size() - offset < length) {
         throw std::runtime_error{"truncated Mach-O string"};
@@ -373,6 +400,110 @@ std::optional<std::uint16_t> MachOImage::read_vm_u16(std::uint32_t address) cons
         return static_cast<std::uint16_t>(
             std::to_integer<std::uint16_t>(bytes[offset]) |
             (std::to_integer<std::uint16_t>(bytes[offset + 1]) << 8U));
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint32_t> MachOImage::find_objc_instance_method(
+    std::string_view class_name, std::string_view selector) const {
+    constexpr std::uint32_t class_name_offset = 8U;
+    constexpr std::uint32_t class_method_lists_offset = 28U;
+    constexpr std::uint32_t method_list_header_size = 8U;
+    constexpr std::uint32_t method_size = 12U;
+    constexpr std::uint32_t maximum_method_lists = 4096U;
+    constexpr std::uint32_t maximum_methods_per_list = 4096U;
+
+    const auto executable = [&](std::uint32_t implementation) {
+        const auto address = implementation & ~1U;
+        return std::any_of(
+            segments_.begin(), segments_.end(), [&](const MachSegment& segment) {
+                return (segment.initial_protection & 4) != 0 &&
+                       address >= segment.vm_address &&
+                       address - segment.vm_address < segment.file_size;
+            });
+    };
+    const auto search_list = [&](std::uint32_t list)
+        -> std::optional<std::uint32_t> {
+        if (list > std::numeric_limits<std::uint32_t>::max() - 4U) {
+            return std::nullopt;
+        }
+        const auto count = read_vm_u32(list + 4U);
+        if (!count || *count > maximum_methods_per_list) return std::nullopt;
+        for (std::uint32_t index = 0; index < *count; ++index) {
+            const auto entry64 = static_cast<std::uint64_t>(list) +
+                                 method_list_header_size +
+                                 static_cast<std::uint64_t>(index) * method_size;
+            if (entry64 >
+                std::numeric_limits<std::uint32_t>::max() - 8U) {
+                return std::nullopt;
+            }
+            const auto entry = static_cast<std::uint32_t>(entry64);
+            const auto name = read_vm_u32(entry);
+            const auto implementation = read_vm_u32(entry + 8U);
+            if (!name || !implementation) return std::nullopt;
+            const auto candidate = vm_c_string(bytes_, segments_, *name);
+            if (candidate && *candidate == selector &&
+                executable(*implementation)) {
+                return implementation;
+            }
+        }
+        return std::nullopt;
+    };
+
+    for (const auto& segment : segments_) {
+        for (const auto& section : segment.sections) {
+            if (section.segment != "__OBJC" || section.name != "__class") {
+                continue;
+            }
+            // Objective-C 1 class records retained the offsets used below,
+            // but their trailing runtime fields make the total record stride
+            // vary between old toolchains. Scan aligned record candidates so
+            // semantic lookup does not bake in either the 40- or 48-byte form.
+            for (std::uint64_t section_offset = 0;
+                 section_offset + class_method_lists_offset +
+                         sizeof(std::uint32_t) <=
+                     section.size;
+                 section_offset += alignof(std::uint32_t)) {
+                const auto object64 =
+                    static_cast<std::uint64_t>(section.address) +
+                    section_offset;
+                if (object64 > std::numeric_limits<std::uint32_t>::max()) {
+                    break;
+                }
+                const auto object = static_cast<std::uint32_t>(object64);
+                const auto name = read_vm_u32(object + class_name_offset);
+                if (!name) continue;
+                const auto candidate = vm_c_string(bytes_, segments_, *name);
+                if (!candidate || *candidate != class_name) continue;
+                const auto lists =
+                    read_vm_u32(object + class_method_lists_offset);
+                if (!lists || *lists == 0U || *lists == 0xffffffffU) {
+                    continue;
+                }
+                // The common Objective-C 1.x form points directly at one
+                // method list. Some images instead use a null-terminated array
+                // of list pointers; accept both layouts.
+                if (const auto direct = search_list(*lists)) return direct;
+                for (std::uint32_t list_index = 0;
+                     list_index < maximum_method_lists; ++list_index) {
+                    const auto pointer_address =
+                        static_cast<std::uint64_t>(*lists) +
+                        static_cast<std::uint64_t>(list_index) *
+                            sizeof(std::uint32_t);
+                    if (pointer_address >
+                        std::numeric_limits<std::uint32_t>::max()) {
+                        break;
+                    }
+                    const auto pointer = read_vm_u32(
+                        static_cast<std::uint32_t>(pointer_address));
+                    if (!pointer || *pointer == 0U || *pointer == 0xffffffffU) {
+                        break;
+                    }
+                    if (const auto found = search_list(*pointer)) return found;
+                }
+                continue;
+            }
+        }
     }
     return std::nullopt;
 }

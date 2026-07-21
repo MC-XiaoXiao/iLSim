@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -13,6 +14,7 @@
 #include "ilegacysim/core_surface_abi.hpp"
 #include "ilegacysim/display.hpp"
 #include "ilegacysim/iokit_abi.hpp"
+#include "ilegacysim/kernel_shared_state.hpp"
 #include "ilegacysim/mobile_framebuffer_abi.hpp"
 #include "ilegacysim/output.hpp"
 #include "ilegacysim/surface_store.hpp"
@@ -68,13 +70,15 @@ MobileFramebufferHle::MobileFramebufferHle(
   add("_IOMobileFramebufferSwapSetBackgroundColor",
       [this](UserlandHleCall &call) { set_background_color(call); });
   add("_IOMobileFramebufferSwapEnd", [this](UserlandHleCall &call) {
-    submit_layers(call);
-    if (display_)
-      display_->present();
+    if (display_write_allowed(call)) {
+      submit_layers(call);
+      if (display_)
+        display_->present();
+    }
     call.set_return(iokit_abi::success);
   });
   add("_IOMobileFramebufferSwapSurface", [this](UserlandHleCall &call) {
-    if (display_)
+    if (display_ && display_write_allowed(call))
       display_->present();
     call.set_return(iokit_abi::success);
   });
@@ -113,6 +117,25 @@ void MobileFramebufferHle::inherit_state(const MobileFramebufferHle &parent) {
 
 void MobileFramebufferHle::set_display(std::shared_ptr<DisplayState> display) {
   display_ = std::move(display);
+}
+
+void MobileFramebufferHle::set_shared_state(
+    std::shared_ptr<KernelSharedState> shared_state) {
+  shared_state_ = std::move(shared_state);
+}
+
+bool MobileFramebufferHle::display_write_allowed(
+    UserlandHleCall &call) const {
+  if (!shared_state_)
+    return true;
+  std::lock_guard lock{shared_state_->mach_mutex};
+  const auto process = shared_state_->processes.find(call.process_id());
+  if (process == shared_state_->processes.end() ||
+      !process->second.executable_path.starts_with("/Applications/")) {
+    return true;
+  }
+  return active_application_owns_display_locked(*shared_state_,
+                                                call.process_id());
 }
 
 bool MobileFramebufferHle::has_active_layers() const {
@@ -299,7 +322,7 @@ void MobileFramebufferHle::set_background_color(UserlandHleCall &call) {
   const auto blue = channel(call.argument(3));
   const auto alpha = channel(call.argument(4));
   background_argb_ = (alpha << 24U) | (red << 16U) | (green << 8U) | blue;
-  if (display_)
+  if (display_ && display_write_allowed(call))
     display_->clear(background_argb_);
   call.set_return(iokit_abi::success);
 }

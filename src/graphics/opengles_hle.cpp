@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -15,6 +16,7 @@
 #include "ilegacysim/core_surface_abi.hpp"
 #include "ilegacysim/cpu.hpp"
 #include "ilegacysim/display.hpp"
+#include "ilegacysim/kernel_shared_state.hpp"
 #include "ilegacysim/output.hpp"
 #include "ilegacysim/surface_store.hpp"
 #include "ilegacysim/userland_hle.hpp"
@@ -107,6 +109,23 @@ void OpenGlesHle::inherit_state(const OpenGlesHle& parent) {
 
 void OpenGlesHle::set_display(std::shared_ptr<DisplayState> display) {
     display_ = std::move(display);
+}
+
+void OpenGlesHle::set_shared_state(
+    std::shared_ptr<KernelSharedState> shared_state) {
+    shared_state_ = std::move(shared_state);
+}
+
+bool OpenGlesHle::display_write_allowed(UserlandHleCall& call) const {
+    if (!shared_state_) return true;
+    std::lock_guard lock{shared_state_->mach_mutex};
+    const auto process = shared_state_->processes.find(call.process_id());
+    if (process == shared_state_->processes.end() ||
+        !process->second.executable_path.starts_with("/Applications/")) {
+        return true;
+    }
+    return active_application_owns_display_locked(*shared_state_,
+                                                  call.process_id());
 }
 
 OpenGlesHle::ThreadState& OpenGlesHle::thread(UserlandHleCall& call) {
@@ -466,6 +485,7 @@ void OpenGlesHle::draw(UserlandHleCall& call, bool indexed) {
             return;
         }
     }
+    if (!display_write_allowed(call)) return;
     if (!GlesSoftwareRasterizer::draw(*display_, vertices, mode, state)) {
         set_gl_error(call, gles_abi::invalid_operation);
     }
@@ -668,7 +688,7 @@ void OpenGlesHle::register_egl(UserlandHleRegistry& registry) {
             return;
         }
         ++frame_count_;
-        if (display_) display_->present();
+        if (display_ && display_write_allowed(call)) display_->present();
         egl_error_ = egl_success;
         call.set_return(egl_true);
     });
@@ -1163,6 +1183,7 @@ void OpenGlesHle::register_gles(UserlandHleRegistry& registry) {
             return;
         }
         if ((mask & gles_abi::color_buffer_bit) == 0) return;
+        if (!display_write_allowed(call)) return;
         const auto all_channels = std::all_of(
             context->color_mask.begin(), context->color_mask.end(),
             [](bool enabled) { return enabled; });

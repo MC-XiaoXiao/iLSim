@@ -8,6 +8,7 @@
 
 #include "ilegacysim/display.hpp"
 #include "ilegacysim/mig_wire_abi.hpp"
+#include "ilegacysim/userland_hle.hpp"
 
 namespace ilegacysim::graphics_services_input {
 namespace {
@@ -48,6 +49,9 @@ constexpr std::size_t path_location_offset = path_offset + 8;
 constexpr std::uint8_t path_index = 1;
 constexpr std::uint8_t path_identity = 2;
 constexpr std::uint8_t path_active_proximity = 3;
+
+constexpr std::string_view springboard_image{
+    "/System/Library/CoreServices/SpringBoard.app/SpringBoard"};
 
 void write_word(std::span<std::byte> bytes, std::size_t offset,
                 std::uint32_t value) {
@@ -192,6 +196,29 @@ void queue_simple_event_locked(KernelSharedState &state,
 
 } // namespace
 
+void register_springboard_alert_observers(
+    UserlandHleRegistry &registry,
+    std::function<void(std::uint32_t, bool)> observer) {
+  registry.register_objc_instance_method(
+      std::string{springboard_image}, "SBAlertItemsController",
+      "activateAlertItem:",
+      "-[SBAlertItemsController activateAlertItem:]",
+      [observer](UserlandHleCall &call) {
+        const auto object = call.argument(2);
+        observer(object, true);
+        call.resume_original_persistently();
+      });
+  registry.register_objc_instance_method(
+      std::string{springboard_image}, "SBAlertItemsController",
+      "deactivateAlertItem:",
+      "-[SBAlertItemsController deactivateAlertItem:]",
+      [observer = std::move(observer)](UserlandHleCall &call) {
+        const auto object = call.argument(2);
+        observer(object, false);
+        call.resume_original_persistently();
+      });
+}
+
 std::optional<std::uint32_t> event_type(std::span<const std::byte> message) {
   constexpr std::size_t event_type_offset =
       darwin::mig_wire::message_header_size;
@@ -268,7 +295,8 @@ EnqueueResult enqueue_touch(KernelSharedState &state, const TouchInput &input) {
                              std::isfinite(input.x) ? input.x : 0.0F,
                              std::isfinite(input.y) ? input.y : 0.0F};
   std::lock_guard lock{state.mach_mutex};
-  if (state.active_application_event_object != 0U &&
+  if (state.active_springboard_alert_items.empty() &&
+      state.active_application_event_object != 0U &&
       !state.application_touch_suspended) {
     const auto port =
         state.mach_port_objects.lookup(state.active_application_event_object);
@@ -449,6 +477,16 @@ void record_application_lifecycle_event_locked(
 
   if (event_type == application_did_become_active_event_type) {
     state.pending_application_event_object = destination;
+    const auto requests_userspace_prewarm =
+        std::find(application->second.arguments.begin(),
+                  application->second.arguments.end(), "--suspended") !=
+        application->second.arguments.end();
+    if (requests_userspace_prewarm &&
+        state.consumed_application_prewarm_activations
+            .insert(destination_port->receive_owner)
+            .second) {
+      return;
+    }
     std::optional<KernelSharedState::ApplicationTouchTransform> transform;
     if (state.latest_application_scene_transform &&
         state.latest_application_scene_transform->process_id ==
@@ -463,6 +501,27 @@ void record_application_lifecycle_event_locked(
                    destination_port->receive_owner);
                cached != state.application_scene_transforms.end()) {
       transform = cached->second;
+    }
+    // A suspended/event-only process can receive the same activation event as
+    // a foreground application while another committed scene remains front.
+    // Treat lifecycle delivery as intent, not proof of visibility: the
+    // existing foreground route remains authoritative until it resigns or the
+    // replacement has become the only committed scene.
+    const auto preserves_committed_foreground =
+        state.active_application_scene &&
+        state.active_application_scene->process_id !=
+            destination_port->receive_owner &&
+        state.active_application_scene->touch_transform &&
+        state.active_application_event_object ==
+            state.active_application_scene->event_object &&
+        !state.application_touch_suspended;
+    if (preserves_committed_foreground) {
+      if (state.latest_application_scene_transform &&
+          state.latest_application_scene_transform->process_id ==
+              destination_port->receive_owner) {
+        state.latest_application_scene_transform.reset();
+      }
+      return;
     }
     state.active_application_scene = KernelSharedState::ActiveApplicationScene{
         destination_port->receive_owner, destination, transform};

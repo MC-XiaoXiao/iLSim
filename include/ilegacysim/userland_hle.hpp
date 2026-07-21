@@ -9,6 +9,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace ilegacysim {
@@ -82,6 +83,13 @@ public:
                          Handler handler);
   void register_prefix(std::string image_suffix, std::string symbol_prefix,
                        Handler handler);
+  // Resolve a stripped Objective-C 1.x instance method by metadata name when
+  // the image is mapped. This avoids firmware-version-specific addresses.
+  void register_objc_instance_method(std::string image_suffix,
+                                     std::string class_name,
+                                     std::string selector,
+                                     std::string diagnostic_name,
+                                     Handler handler);
   // Register a stripped firmware entry point by its preferred Mach-O virtual
   // address. Bit 0 selects a Thumb entry, matching Mach symbol convention.
   void register_address(std::string image_suffix, std::uint32_t virtual_address,
@@ -121,6 +129,7 @@ private:
     std::string symbol;
     bool prefix{};
     std::optional<std::uint32_t> virtual_address;
+    std::optional<std::pair<std::string, std::string>> objc_instance_method;
     Handler handler;
   };
   struct InstalledCall {
