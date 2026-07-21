@@ -16,6 +16,10 @@ inline constexpr std::uint32_t maximum_flush_surface_count = 4096;
 // format word passed to SetSource/SetDestinationSurface.
 inline constexpr std::uint32_t pixel_format_bgra = 0x00060000U;
 
+// LayerKit uses RGB555 for opaque, memory-efficient image strips such as the
+// rows in the Settings wallpaper picker.
+inline constexpr std::uint32_t pixel_format_rgb555 = 0x00048000U;
+
 // The firmware MBX2D implementation accepts exactly these two capability
 // words in mbx2DEnable/Disable. LayerKit uses them for alpha composition and
 // the right-angle source transform respectively.

@@ -379,8 +379,18 @@ Mbx2dHle::resolve(const std::optional<Binding> &binding) const {
   if (surface->second.client_backing) {
     auto backing = *surface->second.client_backing;
     const auto pitch = binding->pitch;
-    const auto row_bytes =
-        static_cast<std::uint64_t>(backing.width) * bytes_per_pixel;
+    std::uint32_t client_bytes_per_pixel{};
+    if (binding->format == mbx2d_abi::pixel_format_bgra) {
+      backing.pixel_format = surface_pixel_format_bgra;
+      client_bytes_per_pixel = bytes_per_pixel;
+    } else if (binding->format == mbx2d_abi::pixel_format_rgb555) {
+      backing.pixel_format = surface_pixel_format_rgb555;
+      client_bytes_per_pixel = 2U;
+    } else {
+      return std::nullopt;
+    }
+    const auto row_bytes = static_cast<std::uint64_t>(backing.width) *
+                           client_bytes_per_pixel;
     if (pitch < row_bytes || backing.allocation_size < row_bytes) {
       return std::nullopt;
     }
@@ -481,24 +491,42 @@ Mbx2dHle::read_region(const ResolvedSurface &surface, std::int64_t x,
     return pixels;
   }
   if (!surface.backing ||
-      surface.backing->pixel_format != surface_pixel_format_bgra ||
-      surface.backing->bytes_per_row < surface.width * bytes_per_pixel) {
+      (surface.backing->pixel_format != surface_pixel_format_bgra &&
+       surface.backing->pixel_format != surface_pixel_format_rgb555)) {
     return std::nullopt;
   }
   const auto &backing = *surface.backing;
+  const auto backing_bytes_per_pixel =
+      backing.pixel_format == surface_pixel_format_bgra ? bytes_per_pixel : 2U;
+  if (backing.bytes_per_row < surface.width * backing_bytes_per_pixel)
+    return std::nullopt;
   const auto final_byte =
       static_cast<std::uint64_t>(y + height - 1) * backing.bytes_per_row +
-      static_cast<std::uint64_t>(x + width) * bytes_per_pixel;
+      static_cast<std::uint64_t>(x + width) * backing_bytes_per_pixel;
   if (final_byte > backing.allocation_size)
     return std::nullopt;
   for (std::int64_t row = 0; row < height; ++row) {
     const auto address = backing.base + static_cast<std::uint32_t>(
                                             (y + row) * backing.bytes_per_row +
-                                            x * bytes_per_pixel);
+                                            x * backing_bytes_per_pixel);
     const auto bytes = call.memory().read_bytes(
-        address, static_cast<std::size_t>(width) * bytes_per_pixel);
+        address, static_cast<std::size_t>(width) * backing_bytes_per_pixel);
     if (!bytes)
       return std::nullopt;
+    if (backing.pixel_format == surface_pixel_format_rgb555) {
+      for (std::int64_t column = 0; column < width; ++column) {
+        const auto byte = static_cast<std::size_t>(column) * 2U;
+        const auto packed =
+            std::to_integer<std::uint32_t>((*bytes)[byte]) |
+            (std::to_integer<std::uint32_t>((*bytes)[byte + 1U]) << 8U);
+        const auto red = ((packed >> 10U) & 0x1fU) * 255U / 31U;
+        const auto green = ((packed >> 5U) & 0x1fU) * 255U / 31U;
+        const auto blue = (packed & 0x1fU) * 255U / 31U;
+        pixels[static_cast<std::size_t>(row * width + column)] =
+            0xff000000U | (red << 16U) | (green << 8U) | blue;
+      }
+      continue;
+    }
     if constexpr (std::endian::native == std::endian::little) {
       std::memcpy(pixels.data() + static_cast<std::size_t>(row * width),
                   bytes->data(),
@@ -542,20 +570,36 @@ bool Mbx2dHle::write_region(const ResolvedSurface &surface, std::int64_t x,
     return true;
   }
   if (!surface.backing ||
-      surface.backing->pixel_format != surface_pixel_format_bgra ||
-      surface.backing->bytes_per_row < surface.width * bytes_per_pixel) {
+      (surface.backing->pixel_format != surface_pixel_format_bgra &&
+       surface.backing->pixel_format != surface_pixel_format_rgb555)) {
     return false;
   }
   const auto &backing = *surface.backing;
+  const auto backing_bytes_per_pixel =
+      backing.pixel_format == surface_pixel_format_bgra ? bytes_per_pixel : 2U;
+  if (backing.bytes_per_row < surface.width * backing_bytes_per_pixel)
+    return false;
   const auto final_byte =
       static_cast<std::uint64_t>(y + height - 1) * backing.bytes_per_row +
-      static_cast<std::uint64_t>(x + width) * bytes_per_pixel;
+      static_cast<std::uint64_t>(x + width) * backing_bytes_per_pixel;
   if (final_byte > backing.allocation_size)
     return false;
   std::vector<std::byte> encoded(static_cast<std::size_t>(width) *
-                                 bytes_per_pixel);
+                                 backing_bytes_per_pixel);
   for (std::int64_t row = 0; row < height; ++row) {
-    if constexpr (std::endian::native == std::endian::little) {
+    if (backing.pixel_format == surface_pixel_format_rgb555) {
+      for (std::int64_t column = 0; column < width; ++column) {
+        const auto pixel =
+            pixels[static_cast<std::size_t>(row * width + column)];
+        const auto red = ((pixel >> 16U) & 0xffU) * 31U / 255U;
+        const auto green = ((pixel >> 8U) & 0xffU) * 31U / 255U;
+        const auto blue = (pixel & 0xffU) * 31U / 255U;
+        const auto packed = (red << 10U) | (green << 5U) | blue;
+        const auto byte = static_cast<std::size_t>(column) * 2U;
+        encoded[byte] = static_cast<std::byte>(packed & 0xffU);
+        encoded[byte + 1U] = static_cast<std::byte>(packed >> 8U);
+      }
+    } else if constexpr (std::endian::native == std::endian::little) {
       std::memcpy(encoded.data(),
                   pixels.data() + static_cast<std::size_t>(row * width),
                   encoded.size());
@@ -572,7 +616,7 @@ bool Mbx2dHle::write_region(const ResolvedSurface &surface, std::int64_t x,
     }
     const auto address = backing.base + static_cast<std::uint32_t>(
                                             (y + row) * backing.bytes_per_row +
-                                            x * bytes_per_pixel);
+                                            x * backing_bytes_per_pixel);
     if (!call.memory().copy_in(address, encoded))
       return false;
   }

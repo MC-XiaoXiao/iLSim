@@ -22,6 +22,8 @@ constexpr std::uint32_t surface_fourcc(char a, char b, char c, char d) {
 
 inline constexpr std::uint32_t surface_pixel_format_bgra =
     surface_fourcc('B', 'G', 'R', 'A');
+inline constexpr std::uint32_t surface_pixel_format_rgb555 =
+    surface_fourcc('R', 'G', '1', '5');
 
 // Each process owns one SurfaceStore with process-local virtual addresses.
 // Stores inherited across fork/spawn share a registry of page backings so a
