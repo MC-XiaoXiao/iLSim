@@ -16,6 +16,7 @@ enum class Message : std::uint32_t {
   ConnectSetNotificationPort = 2818,
   ConnectMapMemory = 2819,
   RegistryEntrySetProperties = 2828,
+  ServiceGetBusyState = 2831,
   ServiceAddNotification = 2849,
   ServiceAddInterestNotification = 2850,
   ServiceOpenExtended = 2862,
@@ -34,6 +35,10 @@ inline constexpr std::uint32_t success = 0;
 inline constexpr std::uint32_t not_found = 0xe00002f0U;
 inline constexpr std::uint32_t bad_argument = 0xe00002c2U;
 inline constexpr std::uint32_t unsupported = 0xe00002c7U;
+
+// A zero busy count means the modeled I/O service tree has completed all
+// outstanding start/stop transitions.
+inline constexpr std::uint32_t service_busy_state_quiet = 0;
 
 inline constexpr std::uint32_t apple_h1clcd_service_type = 0;
 inline constexpr std::uint32_t power_root_service_type = 0;

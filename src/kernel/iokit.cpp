@@ -64,6 +64,9 @@ static_assert(
 static_assert(
     device_mig::id(device_mig::Routine::io_registry_entry_set_properties) ==
     static_cast<std::uint32_t>(iokit_abi::Message::RegistryEntrySetProperties));
+static_assert(
+    device_mig::id(device_mig::Routine::io_service_get_busy_state) ==
+    static_cast<std::uint32_t>(iokit_abi::Message::ServiceGetBusyState));
 static_assert(device_mig::id(device_mig::Routine::io_service_open) ==
               static_cast<std::uint32_t>(iokit_abi::Message::ServiceOpen));
 
@@ -604,6 +607,32 @@ handle_iokit_mach_request(AddressSpace &memory, Output &output,
         18,          40,          local_port, 0,      0, message_id + 100,
         0x00000000U, 0x00000001U, 0,          result,
     };
+    return write_reply(memory, message_address, reply);
+  }
+
+  if (message_id == static_cast<std::uint32_t>(
+                        iokit_abi::Message::ServiceGetBusyState)) {
+    // IOKitGetBusyState queries the master service plane as well as individual
+    // IOService objects. The modeled tree has no asynchronous service-start
+    // work, so its XNU getBusyState value is consistently quiet.
+    constexpr std::uint32_t reply_size = 40U;
+    if (receive_size < reply_size)
+      return mach_rcv_invalid_data;
+    const std::array<std::uint32_t, reply_size / sizeof(std::uint32_t)> reply{
+        mach_reply_bits,
+        reply_size,
+        local_port,
+        0,
+        0,
+        message_id + mig_reply_id_delta,
+        mach_ndr_native,
+        mach_ndr_little_endian,
+        iokit_abi::success,
+        iokit_abi::service_busy_state_quiet,
+    };
+    output.write("[iokit] busy-state pid=" + std::to_string(process.pid) +
+                 " service-object=" + std::to_string(remote_object) +
+                 " state=quiet\n");
     return write_reply(memory, message_address, reply);
   }
 
