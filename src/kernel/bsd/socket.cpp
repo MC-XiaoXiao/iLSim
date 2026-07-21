@@ -1051,7 +1051,9 @@ void CompatibilityKernel::dispatch_bsd_socket(Cpu &cpu, std::uint32_t number) {
   }
   case darwin::syscall::socket_pair: {
     if (registers[0] != darwin::socket::local ||
-        registers[1] != darwin::socket::stream) {
+        (registers[1] != darwin::socket::stream &&
+         registers[1] != darwin::socket::datagram &&
+         registers[1] != darwin::socket::sequenced_packet)) {
       bsd_error(cpu, 47); // EAFNOSUPPORT
       return;
     }
@@ -1082,6 +1084,7 @@ void CompatibilityKernel::dispatch_bsd_socket(Cpu &cpu, std::uint32_t number) {
     socket_pair_endpoints_.emplace(*second, std::move(endpoints.second));
     output_.write("[network] socketpair pid=" + std::to_string(process_.pid) +
                   " pair=" + std::to_string(pair) +
+                  " type=" + std::to_string(registers[1]) +
                   " fds=" + std::to_string(*first) + "," +
                   std::to_string(*second) + "\n");
     if (!memory_.write32(registers[3], *first) ||

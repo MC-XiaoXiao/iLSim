@@ -76,6 +76,10 @@ bool XnuScheduler::make_runnable(XnuThreadId thread) {
     const auto iterator = threads_.find(thread);
     if (iterator == threads_.end()) return false;
     auto& record = iterator->second;
+    if (record.suspend_count != 0) {
+        record.resume_runnable = true;
+        return true;
+    }
     if (record.info.state == XnuThreadState::Running || record.queued) return true;
     record.info.state = XnuThreadState::Runnable;
     record.info.remaining_quantum = quantum_for(record);
@@ -96,6 +100,43 @@ bool XnuScheduler::block(XnuThreadId thread) {
     record.info.state = XnuThreadState::Waiting;
     record.info.remaining_quantum = quantum_for(record);
     record.info.computation_metered = 0;
+    if (record.suspend_count != 0) record.resume_runnable = false;
+    return true;
+}
+
+bool XnuScheduler::suspend_thread(XnuThreadId thread) {
+    const auto iterator = threads_.find(thread);
+    if (iterator == threads_.end() ||
+        iterator->second.suspend_count ==
+            std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+
+    auto& record = iterator->second;
+    if (record.suspend_count++ != 0) return true;
+    record.resume_runnable =
+        record.info.state == XnuThreadState::Runnable ||
+        record.info.state == XnuThreadState::Running;
+    if (record.info.state != XnuThreadState::Waiting) {
+        remove_from_queue(thread, record);
+        record.info.state = XnuThreadState::Waiting;
+    }
+    return true;
+}
+
+bool XnuScheduler::resume_thread(XnuThreadId thread) {
+    const auto iterator = threads_.find(thread);
+    if (iterator == threads_.end() || iterator->second.suspend_count == 0)
+        return false;
+
+    auto& record = iterator->second;
+    --record.suspend_count;
+    if (record.suspend_count != 0 || !record.resume_runnable) return true;
+    record.resume_runnable = false;
+    record.info.state = XnuThreadState::Runnable;
+    record.info.remaining_quantum = quantum_for(record);
+    record.info.computation_metered = 0;
+    enqueue(thread, QueuePosition::Back);
     return true;
 }
 

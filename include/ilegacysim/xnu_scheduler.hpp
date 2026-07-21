@@ -130,6 +130,8 @@ public:
 
     bool make_runnable(XnuThreadId thread);
     bool block(XnuThreadId thread);
+    bool suspend_thread(XnuThreadId thread);
+    bool resume_thread(XnuThreadId thread);
     bool set_base_priority(XnuThreadId thread, std::int32_t priority);
     bool depress(XnuThreadId thread, std::uint64_t duration_ticks = 0);
     bool bind_thread(
@@ -182,6 +184,8 @@ private:
         std::optional<std::uint32_t> priority_usage_shift;
         std::optional<std::size_t> queued_processor;
         std::optional<std::uint64_t> depression_deadline;
+        std::uint32_t suspend_count{};
+        bool resume_runnable{};
         std::int32_t failsafe_saved_base_priority{};
         bool failsafe_saved_timeshare{};
         bool failsafe_saved_realtime{};
