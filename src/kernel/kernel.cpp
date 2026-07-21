@@ -67,7 +67,11 @@ constexpr std::uint32_t root_disk_device =
 CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
                                          std::filesystem::path rootfs)
     : memory_{memory}, output_{output}, rootfs_{std::move(rootfs)},
-      hfs_metadata_{rootfs_}, userland_hle_{memory_, output_},
+      hfs_metadata_{rootfs_},
+      audio_subsystem_{std::make_shared<AudioSubsystem>(rootfs_)},
+      userland_hle_{memory_, output_},
+      audio_toolbox_hle_{userland_hle_, audio_subsystem_},
+      celestial_audio_hle_{userland_hle_, audio_subsystem_},
       apple80211_hle_{
           userland_hle_, wifi_state_,
           [this](const WifiSnapshot &before, const WifiSnapshot &after) {
@@ -945,6 +949,9 @@ void CompatibilityKernel::inherit_process_state(
   shared_state_ = parent.shared_state_;
   display_state_ = parent.display_state_;
   wifi_state_ = parent.wifi_state_;
+  audio_subsystem_ = parent.audio_subsystem_;
+  audio_toolbox_hle_.set_subsystem(audio_subsystem_);
+  celestial_audio_hle_.set_subsystem(audio_subsystem_);
   apple80211_hle_.set_wifi_state(wifi_state_);
   core_surface_hle_.set_display(display_state_);
   core_surface_hle_.set_shared_state(shared_state_);

@@ -187,6 +187,15 @@ std::vector<LiveControlCommand> LiveControl::parse_line(std::string line) {
       return {error_command("lock does not accept arguments")};
     return {simple_command(LiveControlCommandKind::Lock)};
   }
+if (operation == "volume-up" || operation == "volume-down") {
+    std::string trailing;
+    if (parser >> trailing) {
+      return {error_command(operation + " does not accept arguments")};
+    }
+    return {simple_command(operation == "volume-up"
+                               ? LiveControlCommandKind::VolumeUp
+                               : LiveControlCommandKind::VolumeDown)};
+  }
   if (operation == "snapshot") {
     std::string path;
     std::getline(parser, path);

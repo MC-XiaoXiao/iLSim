@@ -29,6 +29,8 @@ class UserlandHleRegistry;
 
 class UserlandHleCall {
 public:
+  using Continuation = std::function<void(UserlandHleCall &)>;
+
   [[nodiscard]] std::uint32_t argument(std::size_t index) const;
   [[nodiscard]] std::optional<std::string>
   string_argument(std::size_t index, std::size_t maximum_size = 4096) const;
@@ -43,12 +45,19 @@ public:
   [[nodiscard]] bool
   image_loaded_beneath(std::string_view directory) const;
   void set_return(std::uint32_t value);
+  // Continue at another registered guest entry while preserving the caller's
+  // link register. This supports compatibility adapters that finish through
+  // the firmware's own implementation instead of duplicating it on the host.
+  [[nodiscard]] bool tail_call_registered(std::string_view symbol);
   // Stop intercepting this entry in the current process and execute the
   // original guest implementation from its first instruction.
   void resume_original();
   // Execute the original implementation through a small trampoline while
   // retaining the entry interception for later calls.
   void resume_original_persistently();
+  // As above, then invoke a host continuation before returning to the guest
+  // caller. The continuation may tail-call another registered guest entry.
+  void resume_original_persistently(Continuation continuation);
 
   [[nodiscard]] Cpu &cpu() const { return cpu_; }
   [[nodiscard]] AddressSpace &memory() const { return memory_; }
@@ -70,6 +79,8 @@ private:
   std::string_view symbol_;
   bool resume_original_{};
   bool resume_original_persistently_{};
+  std::optional<std::uint32_t> tail_call_address_;
+  Continuation original_continuation_;
 };
 
 class UserlandHleRegistry {
@@ -123,6 +134,8 @@ public:
   void inherit_mappings(const UserlandHleRegistry &parent);
 
 private:
+  friend class UserlandHleCall;
+
   struct Registration {
     std::uint16_t id{};
     std::string image_suffix;
@@ -143,6 +156,14 @@ private:
                                                   std::string_view symbol);
   [[nodiscard]] const Registration *find_registration(std::uint16_t id) const;
   [[nodiscard]] std::uint32_t ensure_string_page();
+  [[nodiscard]] std::optional<std::uint32_t>
+  install_continuation(Cpu &cpu, std::uint32_t return_address,
+                       UserlandHleCall::Continuation continuation);
+
+  struct PendingContinuation {
+    std::uint32_t return_address{};
+    UserlandHleCall::Continuation handler;
+  };
 
   AddressSpace &memory_;
   Output &output_;
@@ -157,6 +178,9 @@ private:
   std::uint32_t data_cursor_{};
   std::map<std::uint32_t, std::uint32_t> persistent_trampolines_;
   std::uint32_t persistent_trampoline_cursor_{0x60000000U};
+  std::map<std::uint32_t, PendingContinuation> pending_continuations_;
+  std::vector<std::uint32_t> available_continuation_trampolines_;
+  std::uint32_t continuation_trampoline_cursor_{0x61000000U};
   // Keep one diagnostic per concrete intercepted symbol. A flat call-count
   // limit hid late framework activity after early startup repeatedly called
   // only a few functions.

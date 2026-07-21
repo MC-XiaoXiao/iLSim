@@ -42,6 +42,7 @@
 #include "ilegacysim/sdl_display.hpp"
 #include "ilegacysim/touch_replay.hpp"
 #include "ilegacysim/xnu_scheduler.hpp"
+#include "sdl_audio_sink.hpp"
 
 namespace {
 
@@ -655,6 +656,14 @@ void boot(const std::vector<std::string> &args, Output &output) {
       std::make_unique<CpuCluster>(maximum_guest_threads, *initial->memory);
   initial->kernel =
       std::make_unique<CompatibilityKernel>(*initial->memory, output, *rootfs);
+std::shared_ptr<SdlAudioSink> audio_sink;
+  if (SdlAudioSink::available()) {
+    audio_sink = std::make_shared<SdlAudioSink>();
+    initial->kernel->set_audio_sink(audio_sink);
+    output.line("[audio] backend=sdl open=lazy");
+  } else {
+    output.line("[audio] backend=none");
+  }
   initial->kernel->set_process_arguments({binary}, initial_environment);
   initial->kernel->enqueue_baseband_input(baseband_input);
   if (baseband_input_path) {
@@ -1008,6 +1017,9 @@ void boot(const std::vector<std::string> &args, Output &output) {
     touch_replay->start();
   }
   std::optional<RealtimePacer> realtime_pacer;
+std::vector<std::pair<std::chrono::steady_clock::time_point,
+                        std::filesystem::path>>
+      scheduled_snapshots;
   if (!bounded_execution) {
     realtime_pacer.emplace(initial_runtime->kernel->current_absolute_time());
     const auto host_wall_time =
@@ -1077,6 +1089,20 @@ void boot(const std::vector<std::string> &args, Output &output) {
               SystemButtonInput{SystemButton::Lock, SystemButtonPhase::Up});
           output.line("[control] display lock requested");
           break;
+case LiveControlCommandKind::VolumeUp:
+        case LiveControlCommandKind::VolumeDown: {
+          const auto button = command.kind == LiveControlCommandKind::VolumeUp
+                                  ? SystemButton::VolumeUp
+                                  : SystemButton::VolumeDown;
+          initial_runtime->kernel->enqueue_system_button(
+              SystemButtonInput{button, SystemButtonPhase::Down});
+          initial_runtime->kernel->enqueue_system_button(
+              SystemButtonInput{button, SystemButtonPhase::Up});
+          output.line(command.kind == LiveControlCommandKind::VolumeUp
+                          ? "[control] volume up requested"
+                          : "[control] volume down requested");
+          break;
+        }
         case LiveControlCommandKind::Snapshot: {
           FrameFilePresenter snapshot_writer{command.path};
           const auto frame = initial_runtime->kernel->display_snapshot();

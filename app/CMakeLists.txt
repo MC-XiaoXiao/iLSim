@@ -1,8 +1,10 @@
+add_subdirectory(audio)
 add_subdirectory(control)
 add_subdirectory(runtime)
 
 add_executable(ilegacysim main.cpp)
 target_link_libraries(ilegacysim PRIVATE
+    iLegacySim::app_audio
     iLegacySim::app_control
     iLegacySim::app_runtime
     iLegacySim::core

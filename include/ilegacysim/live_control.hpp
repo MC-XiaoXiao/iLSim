@@ -14,6 +14,8 @@ enum class LiveControlCommandKind {
   Gesture,
   Wake,
   Lock,
+  VolumeUp,
+  VolumeDown,
   Snapshot,
   Status,
   Help,

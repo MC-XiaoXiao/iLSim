@@ -19,6 +19,8 @@ namespace {
 
 constexpr std::uint32_t arm_svc_opcode = 0xef000000U;
 constexpr std::uint32_t arm_thumb_state_bit = 1U << 5U;
+constexpr std::uint16_t continuation_hle_call = userland_hle_call_mask;
+constexpr std::string_view continuation_symbol{"<guest-continuation>"};
 constexpr std::uint32_t first_string_page_candidate = 0x3fff0000U;
 constexpr std::uint32_t lowest_string_page_candidate = 0x3f000000U;
 constexpr std::uint32_t first_data_page_candidate = 0x50000000U;
@@ -162,10 +164,25 @@ void UserlandHleCall::set_return(std::uint32_t value) {
   cpu_.registers()[0] = value;
 }
 
+bool UserlandHleCall::tail_call_registered(std::string_view symbol) {
+  const auto address = registry_.symbol_address(symbol);
+  if (!address) return false;
+  const auto installed = registry_.installed_calls_.find(*address);
+  if (installed == registry_.installed_calls_.end()) return false;
+  tail_call_address_ = *address | (installed->second.thumb ? 1U : 0U);
+  return true;
+}
+
 void UserlandHleCall::resume_original() { resume_original_ = true; }
 
 void UserlandHleCall::resume_original_persistently() {
   resume_original_persistently_ = true;
+}
+
+void UserlandHleCall::resume_original_persistently(
+    Continuation continuation) {
+  resume_original_persistently_ = true;
+  original_continuation_ = std::move(continuation);
 }
 
 UserlandHleRegistry::UserlandHleRegistry(AddressSpace &memory, Output &output)
@@ -484,6 +501,7 @@ std::size_t UserlandHleRegistry::install_mapped_image(
     installed_calls_.emplace(
         runtime_address,
         InstalledCall{registration.id, registration.symbol, thumb, *original});
+    installed_symbols_.insert_or_assign(registration.symbol, runtime_address);
     ++patched;
   }
   if (patched != 0) {
@@ -506,6 +524,41 @@ bool UserlandHleRegistry::dispatch(Cpu &cpu, std::uint32_t process_id,
   // immediate and are selected by their two-byte entry address; ARM HLEs
   // retain the encoded registration id used by the original implementation.
   const auto entry = cpu.registers()[15] - (thumb ? 2U : 4U);
+  if (!thumb &&
+      (svc_immediate & userland_hle_call_mask) == continuation_hle_call) {
+    const auto pending = pending_continuations_.find(entry);
+    if (pending == pending_continuations_.end()) return false;
+    auto continuation = std::move(pending->second);
+    pending_continuations_.erase(pending);
+    available_continuation_trampolines_.push_back(entry);
+
+    auto &registers = cpu.registers();
+    registers[14] = continuation.return_address;
+    UserlandHleCall call{*this, cpu, memory_, output_, process_id,
+                         continuation_symbol};
+    continuation.handler(call);
+    if (call.tail_call_address_) {
+      const auto target = *call.tail_call_address_;
+      registers[15] = target & ~1U;
+      auto cpsr = cpu.cpsr();
+      if ((target & 1U) != 0) {
+        cpsr |= arm_thumb_state_bit;
+      } else {
+        cpsr &= ~arm_thumb_state_bit;
+      }
+      cpu.set_cpsr(cpsr);
+      return true;
+    }
+    registers[15] = continuation.return_address & ~1U;
+    auto cpsr = cpu.cpsr();
+    if ((continuation.return_address & 1U) != 0) {
+      cpsr |= arm_thumb_state_bit;
+    } else {
+      cpsr &= ~arm_thumb_state_bit;
+    }
+    cpu.set_cpsr(cpsr);
+    return true;
+  }
   const auto installed = installed_calls_.find(entry);
   const auto id =
       thumb && installed != installed_calls_.end()
@@ -534,6 +587,18 @@ bool UserlandHleRegistry::dispatch(Cpu &cpu, std::uint32_t process_id,
   registration->handler(call);
 
   auto &registers = cpu.registers();
+  if (call.tail_call_address_) {
+    const auto target = *call.tail_call_address_;
+    registers[15] = target & ~1U;
+    auto cpsr = cpu.cpsr();
+    if ((target & 1U) != 0) {
+      cpsr |= arm_thumb_state_bit;
+    } else {
+      cpsr &= ~arm_thumb_state_bit;
+    }
+    cpu.set_cpsr(cpsr);
+    return true;
+  }
   if (call.resume_original_persistently_) {
     if (installed == installed_calls_.end() || installed->second.thumb ||
         installed->second.original.size() != sizeof(std::uint32_t)) {
@@ -567,6 +632,12 @@ bool UserlandHleRegistry::dispatch(Cpu &cpu, std::uint32_t process_id,
       persistent_trampoline_cursor_ += static_cast<std::uint32_t>(code.size());
     }
     registers[15] = trampoline->second;
+    if (call.original_continuation_) {
+      const auto continuation = install_continuation(
+          cpu, registers[14], std::move(call.original_continuation_));
+      if (!continuation) return false;
+      registers[14] = *continuation;
+    }
     cpu.set_cpsr(cpu.cpsr() & ~arm_thumb_state_bit);
     return true;
   }
@@ -604,6 +675,35 @@ bool UserlandHleRegistry::dispatch(Cpu &cpu, std::uint32_t process_id,
   }
   cpu.set_cpsr(cpsr);
   return true;
+}
+
+std::optional<std::uint32_t> UserlandHleRegistry::install_continuation(
+    Cpu &cpu, std::uint32_t return_address,
+    UserlandHleCall::Continuation continuation) {
+  if (!continuation) return std::nullopt;
+  std::uint32_t address{};
+  if (!available_continuation_trampolines_.empty()) {
+    address = available_continuation_trampolines_.back();
+    available_continuation_trampolines_.pop_back();
+  } else {
+    address = continuation_trampoline_cursor_;
+    continuation_trampoline_cursor_ += sizeof(std::uint32_t);
+  }
+  const auto page = address & ~(AddressSpace::page_size - 1U);
+  if (!memory_.mapped(page, AddressSpace::page_size) &&
+      !memory_.map(page, AddressSpace::page_size,
+                   MemoryPermission::Read | MemoryPermission::Write |
+                       MemoryPermission::Execute)) {
+    return std::nullopt;
+  }
+  const auto instruction = little_endian_word(
+      arm_svc_opcode | userland_hle_svc_namespace | continuation_hle_call);
+  if (!memory_.copy_in(address, instruction)) return std::nullopt;
+  cpu.invalidate_cache_range(address, instruction.size());
+  pending_continuations_.emplace(
+      address,
+      PendingContinuation{return_address, std::move(continuation)});
+  return address;
 }
 
 std::uint32_t UserlandHleRegistry::ensure_string_page() {
@@ -750,6 +850,9 @@ void UserlandHleRegistry::reset_mappings() {
   data_cursor_ = 0;
   persistent_trampolines_.clear();
   persistent_trampoline_cursor_ = 0x60000000U;
+  pending_continuations_.clear();
+  available_continuation_trampolines_.clear();
+  continuation_trampoline_cursor_ = 0x61000000U;
   traced_symbols_.clear();
 }
 
@@ -764,6 +867,11 @@ void UserlandHleRegistry::inherit_mappings(const UserlandHleRegistry &parent) {
   data_cursor_ = parent.data_cursor_;
   persistent_trampolines_ = parent.persistent_trampolines_;
   persistent_trampoline_cursor_ = parent.persistent_trampoline_cursor_;
+  pending_continuations_.clear();
+  available_continuation_trampolines_ =
+      parent.available_continuation_trampolines_;
+  continuation_trampoline_cursor_ =
+      parent.continuation_trampoline_cursor_;
 }
 
 } // namespace ilegacysim

@@ -18,6 +18,9 @@
 #include <vector>
 
 #include "ilegacysim/address_space.hpp"
+#include "ilegacysim/audio.hpp"
+#include "ilegacysim/audio_toolbox_hle.hpp"
+#include "ilegacysim/celestial_audio_hle.hpp"
 #include "ilegacysim/apple80211_hle.hpp"
 #include "ilegacysim/core_surface_hle.hpp"
 #include "ilegacysim/cpu.hpp"
@@ -126,6 +129,9 @@ public:
   consume_scheduler_yield(std::size_t processor_id);
   void set_display_presenter(DisplayState::Presenter presenter) {
     display_state_->set_presenter(std::move(presenter));
+  }
+  void set_audio_sink(std::shared_ptr<AudioSink> sink) {
+    audio_subsystem_->set_sink(std::move(sink));
   }
   [[nodiscard]] DisplayFrame display_snapshot() const {
     return display_state_->snapshot();
@@ -360,7 +366,10 @@ private:
   std::shared_ptr<DisplayState> display_state_{
       std::make_shared<DisplayState>()};
   std::shared_ptr<WifiState> wifi_state_{std::make_shared<WifiState>()};
+  std::shared_ptr<AudioSubsystem> audio_subsystem_;
   UserlandHleRegistry userland_hle_;
+  AudioToolboxHle audio_toolbox_hle_;
+  CelestialAudioHle celestial_audio_hle_;
   Apple80211Hle apple80211_hle_;
   std::shared_ptr<SurfaceStore> surface_store_{
       std::make_shared<SurfaceStore>()};
