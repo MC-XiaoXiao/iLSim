@@ -31,6 +31,9 @@
 namespace ilegacysim {
 
 void CompatibilityKernel::release_process_mach_rights() {
+  scene_coordinator_->retire_process(process_.pid);
+  presentation_tracker_->retire_process(
+      process_.pid, surface_store_->publication_watermark());
   std::lock_guard mach_lock{shared_state_->mach_mutex};
   auto entries = shared_state_->mach_namespaces.entries(process_.pid);
 

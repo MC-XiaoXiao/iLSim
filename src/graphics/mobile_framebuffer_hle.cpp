@@ -18,6 +18,7 @@
 #include "ilegacysim/mobile_framebuffer_abi.hpp"
 #include "ilegacysim/output.hpp"
 #include "ilegacysim/presentation_tracker.hpp"
+#include "ilegacysim/scene_coordinator.hpp"
 #include "ilegacysim/surface_store.hpp"
 #include "ilegacysim/userland_hle.hpp"
 
@@ -135,6 +136,11 @@ void MobileFramebufferHle::set_presentation_tracker(
   presentation_tracker_ = std::move(presentations);
 }
 
+void MobileFramebufferHle::set_scene_coordinator(
+    std::shared_ptr<SceneCoordinator> scenes) {
+  scene_coordinator_ = std::move(scenes);
+}
+
 bool MobileFramebufferHle::display_write_allowed(
     UserlandHleCall &call) const {
   if (!shared_state_)
@@ -145,8 +151,12 @@ bool MobileFramebufferHle::display_write_allowed(
       !process->second.executable_path.starts_with("/Applications/")) {
     return true;
   }
-  return active_application_owns_display_locked(*shared_state_,
-                                                call.process_id());
+  return active_application_owns_display_locked(
+      *shared_state_, call.process_id(),
+      scene_coordinator_
+          ? std::optional<bool>{
+                scene_coordinator_->client_scene_active(call.process_id())}
+          : std::nullopt);
 }
 
 bool MobileFramebufferHle::has_active_layers() const {
@@ -332,6 +342,8 @@ void MobileFramebufferHle::record_presentation(UserlandHleCall &call) {
     const auto backing = surface_store_->find(state.surface_id);
     if (!backing)
       continue;
+    const auto scale_x = state.source.width / state.destination.width;
+    const auto scale_y = state.source.height / state.destination.height;
     presented_layers.push_back(PresentationLayer{
         order,
         state.surface_id,
@@ -341,10 +353,18 @@ void MobileFramebufferHle::record_presentation(UserlandHleCall &call) {
         PresentationRectangle{state.destination.x, state.destination.y,
                               state.destination.width,
                               state.destination.height},
+        PresentationTransform{
+            scale_x, 0.0F, 0.0F, scale_y,
+            state.source.x - state.destination.x * scale_x,
+            state.source.y - state.destination.y * scale_y},
         state.flags});
   }
+  auto logical_client_scene = scene_coordinator_
+                                  ? scene_coordinator_->active_client_scene()
+                                  : std::nullopt;
   static_cast<void>(presentation_tracker_->record(
-      call.process_id(), std::move(presented_layers)));
+      call.process_id(), std::move(presented_layers),
+      std::move(logical_client_scene)));
 }
 
 void MobileFramebufferHle::set_background_color(UserlandHleCall &call) {

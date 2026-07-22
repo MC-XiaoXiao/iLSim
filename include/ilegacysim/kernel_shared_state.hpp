@@ -656,15 +656,19 @@ struct KernelSharedState {
 
 // The caller must hold mach_mutex. A remote application may own cached scene
 // state while suspended, and a prelaunched application may publish a scene
-// before SpringBoard promotes its event port. Only the intersection is the
-// currently visible, interactive application allowed to write the panel.
+// before SpringBoard promotes its event port. Only the intersection with a
+// currently active semantic scene is the visible App allowed to write the
+// panel. A disengaged migrated_scene_committed retains the legacy transform
+// fallback.
 [[nodiscard]] inline bool active_application_owns_display_locked(
-    const KernelSharedState &state, std::uint32_t process_id) {
+    const KernelSharedState &state, std::uint32_t process_id,
+    std::optional<bool> migrated_scene_committed = std::nullopt) {
   if (state.application_touch_suspended ||
       state.active_application_event_object == 0U ||
       !state.active_application_scene ||
       state.active_application_scene->process_id != process_id ||
-      !state.active_application_scene->touch_transform) {
+      !migrated_scene_committed.value_or(
+          state.active_application_scene->touch_transform.has_value())) {
     return false;
   }
   const auto event_port =

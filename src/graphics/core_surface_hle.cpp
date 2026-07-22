@@ -15,6 +15,7 @@
 #include "ilegacysim/iokit_abi.hpp"
 #include "ilegacysim/kernel_shared_state.hpp"
 #include "ilegacysim/output.hpp"
+#include "ilegacysim/scene_coordinator.hpp"
 #include "ilegacysim/surface_store.hpp"
 #include "ilegacysim/userland_hle.hpp"
 
@@ -70,6 +71,11 @@ void CoreSurfaceHle::set_display(std::shared_ptr<DisplayState> display) {
 void CoreSurfaceHle::set_shared_state(
     std::shared_ptr<KernelSharedState> shared_state) {
     shared_state_ = std::move(shared_state);
+}
+
+void CoreSurfaceHle::set_scene_coordinator(
+    std::shared_ptr<SceneCoordinator> scenes) {
+    scene_coordinator_ = std::move(scenes);
 }
 
 bool CoreSurfaceHle::refresh_default_scanout(AddressSpace& memory) {
@@ -210,8 +216,13 @@ void CoreSurfaceHle::submit(Buffer& buffer, UserlandHleCall& call) {
         const auto process = shared_state_->processes.find(call.process_id());
         if (process != shared_state_->processes.end() &&
             process->second.executable_path.starts_with("/Applications/") &&
-            !active_application_owns_display_locked(*shared_state_,
-                                                    call.process_id())) {
+            !active_application_owns_display_locked(
+                *shared_state_, call.process_id(),
+                scene_coordinator_
+                    ? std::optional<bool>{
+                          scene_coordinator_->client_scene_active(
+                              call.process_id())}
+                    : std::nullopt)) {
             return;
         }
     }

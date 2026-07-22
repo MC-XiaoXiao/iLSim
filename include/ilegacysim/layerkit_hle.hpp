@@ -8,6 +8,7 @@ namespace ilegacysim {
 
 struct KernelSharedState;
 class Output;
+class SceneCoordinator;
 class UserlandHleRegistry;
 
 // Owns the firmware-facing LayerKit hooks and their cross-command scene
@@ -17,14 +18,17 @@ class LayerKitHle {
 public:
   void register_handlers(UserlandHleRegistry &registry,
                          std::shared_ptr<KernelSharedState> shared_state,
+                         std::shared_ptr<SceneCoordinator> scenes,
                          Output &output);
   void set_shared_state(std::shared_ptr<KernelSharedState> shared_state);
+  void set_scene_coordinator(std::shared_ptr<SceneCoordinator> scenes);
   void reset();
   void inherit_state(const LayerKitHle &parent);
 
 private:
   LayerKitRootCompatibility compatibility_;
   std::shared_ptr<KernelSharedState> shared_state_;
+  std::shared_ptr<SceneCoordinator> scene_coordinator_;
 };
 
 } // namespace ilegacysim

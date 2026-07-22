@@ -440,7 +440,8 @@ void CompatibilityKernel::dispatch_mach_message(Cpu &cpu) {
           if (graphics_event_type) {
             graphics_services_input::record_application_lifecycle_event_locked(
                 *shared_state_, process_.pid, remote_object,
-                *graphics_event_type, exit_snapshot_pixels);
+                *graphics_event_type, exit_snapshot_pixels,
+                scene_coordinator_.get());
           }
           if (service_resolution.object != 0 &&
               (service_resolution.application_event_port ||

@@ -34,6 +34,11 @@ std::uint32_t SurfaceStore::allocate_identifier() {
     return registry_->next_identifier++;
 }
 
+std::uint64_t SurfaceStore::publication_watermark() const {
+    std::lock_guard lock{registry_->mutex};
+    return registry_->publication_watermark;
+}
+
 bool SurfaceStore::publish(AddressSpace& memory, Backing backing) {
     if (backing.id == 0 || backing.base == 0 ||
         backing.allocation_size == 0) {
@@ -56,6 +61,8 @@ bool SurfaceStore::publish(AddressSpace& memory, Backing backing) {
         if (registry_->objects.contains(backing.id)) return false;
         backing.provenance.publication_sequence =
             registry_->next_publication_sequence++;
+        registry_->publication_watermark =
+            backing.provenance.publication_sequence;
         if (registry_->next_publication_sequence == 0U)
             registry_->next_publication_sequence = 1U;
         SharedObject object;

@@ -18,6 +18,7 @@
 #include "ilegacysim/display.hpp"
 #include "ilegacysim/kernel_shared_state.hpp"
 #include "ilegacysim/output.hpp"
+#include "ilegacysim/scene_coordinator.hpp"
 #include "ilegacysim/surface_store.hpp"
 #include "ilegacysim/userland_hle.hpp"
 
@@ -116,6 +117,11 @@ void OpenGlesHle::set_shared_state(
     shared_state_ = std::move(shared_state);
 }
 
+void OpenGlesHle::set_scene_coordinator(
+    std::shared_ptr<SceneCoordinator> scenes) {
+    scene_coordinator_ = std::move(scenes);
+}
+
 bool OpenGlesHle::display_write_allowed(UserlandHleCall& call) const {
     if (!shared_state_) return true;
     std::lock_guard lock{shared_state_->mach_mutex};
@@ -124,8 +130,12 @@ bool OpenGlesHle::display_write_allowed(UserlandHleCall& call) const {
         !process->second.executable_path.starts_with("/Applications/")) {
         return true;
     }
-    return active_application_owns_display_locked(*shared_state_,
-                                                  call.process_id());
+    return active_application_owns_display_locked(
+        *shared_state_, call.process_id(),
+        scene_coordinator_
+            ? std::optional<bool>{
+                  scene_coordinator_->client_scene_active(call.process_id())}
+            : std::nullopt);
 }
 
 OpenGlesHle::ThreadState& OpenGlesHle::thread(UserlandHleCall& call) {

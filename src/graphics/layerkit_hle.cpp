@@ -5,6 +5,7 @@
 #include "ilegacysim/graphics_services_input.hpp"
 #include "ilegacysim/kernel_shared_state.hpp"
 #include "ilegacysim/output.hpp"
+#include "ilegacysim/scene_coordinator.hpp"
 #include "ilegacysim/userland_hle.hpp"
 
 #include <cstdint>
@@ -21,8 +22,10 @@ constexpr const char *layerkit_image = "LayerKit.framework/LayerKit";
 
 void LayerKitHle::register_handlers(
     UserlandHleRegistry &registry,
-    std::shared_ptr<KernelSharedState> shared_state, Output &output) {
+    std::shared_ptr<KernelSharedState> shared_state,
+    std::shared_ptr<SceneCoordinator> scenes, Output &output) {
   shared_state_ = std::move(shared_state);
+  scene_coordinator_ = std::move(scenes);
   registry.register_function(layerkit_image, "_LKRenderDecodeInt8",
                              [](UserlandHleCall &call) {
     const auto decoder = call.argument(0);
@@ -88,19 +91,27 @@ void LayerKitHle::register_handlers(
                 position_x, position_y, width, height, device.display_width,
                 device.display_height)) {
           static_cast<void>(call.write32(object + 0x10U, placement->position_y));
-          graphics_services_input::record_application_scene_transform(
-              *shared_state_, call.process_id(), context,
-              KernelSharedState::ApplicationTouchTransform{
-                  placement->presentation_offset_x,
-                  placement->presentation_offset_y,
-                  placement->screen_origin_y});
+          const auto client_process_id =
+              graphics_services_input::record_application_scene_transform(
+                  *shared_state_, call.process_id(), context,
+                  KernelSharedState::ApplicationTouchTransform{
+                      placement->presentation_offset_x,
+                      placement->presentation_offset_y,
+                      placement->screen_origin_y});
+          if (client_process_id && scene_coordinator_) {
+            scene_coordinator_->commit_client_scene(
+                *client_process_id,
+                SceneTransform{1.0F, 0.0F, 0.0F, 1.0F,
+                               -placement->presentation_offset_x,
+                               -placement->presentation_offset_y});
+          }
         }
         if (const auto replacement = compatibility_.observe_commit(
                 context, current_layer_id, call.argument(1), render_flags,
                 call.argument(3), children, root_handle_cached)) {
           if (call.write32(context + 0x3cU, *replacement)) {
             graphics_services_input::activate_resolved_application(
-                *shared_state_, call.process_id());
+                *shared_state_, call.process_id(), scene_coordinator_.get());
             output.write("[layerkit] reconnected detached root context=" +
                          std::to_string(context) +
                          " layer=" + std::to_string(*replacement) + "\n");
@@ -113,6 +124,11 @@ void LayerKitHle::register_handlers(
 void LayerKitHle::set_shared_state(
     std::shared_ptr<KernelSharedState> shared_state) {
   shared_state_ = std::move(shared_state);
+}
+
+void LayerKitHle::set_scene_coordinator(
+    std::shared_ptr<SceneCoordinator> scenes) {
+  scene_coordinator_ = std::move(scenes);
 }
 
 void LayerKitHle::reset() { compatibility_ = {}; }

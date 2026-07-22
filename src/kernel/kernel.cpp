@@ -82,8 +82,11 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
       mobile_framebuffer_hle_{userland_hle_, display_state_, surface_store_,
                               presentation_tracker_} {
   core_surface_hle_.set_shared_state(shared_state_);
+  core_surface_hle_.set_scene_coordinator(scene_coordinator_);
   opengles_hle_.set_shared_state(shared_state_);
+  opengles_hle_.set_scene_coordinator(scene_coordinator_);
   mobile_framebuffer_hle_.set_shared_state(shared_state_);
+  mobile_framebuffer_hle_.set_scene_coordinator(scene_coordinator_);
   register_core_telephony_hle(userland_hle_);
   register_dns_configuration_hle(userland_hle_);
   register_app_support_hle(userland_hle_);
@@ -98,7 +101,8 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
           shared_state_->active_springboard_alert_items.erase(object);
         }
       });
-  layerkit_hle_.register_handlers(userland_hle_, shared_state_, output_);
+  layerkit_hle_.register_handlers(userland_hle_, shared_state_,
+                                  scene_coordinator_, output_);
   thread_ports_.emplace(0, process_.thread_port);
   if (!mach_task_identity::initialize_root(*shared_state_, process_)) {
     throw std::runtime_error{"failed to initialize root Mach task identity"};
@@ -139,7 +143,8 @@ void CompatibilityKernel::enqueue_baseband_input(
 
 void CompatibilityKernel::enqueue_touch_input(const TouchInput &input) {
   const auto result =
-      graphics_services_input::enqueue_touch(*shared_state_, input);
+      graphics_services_input::enqueue_touch(*shared_state_, input,
+                                             scene_coordinator_.get());
   const auto phase = [phase = input.phase] {
     switch (phase) {
     case TouchPhase::Down:
@@ -181,7 +186,8 @@ void CompatibilityKernel::enqueue_system_button(
         *shared_state_,
         input.button == SystemButton::Lock
             ? KernelSharedState::ApplicationSuspensionReason::Lock
-            : KernelSharedState::ApplicationSuspensionReason::Home);
+            : KernelSharedState::ApplicationSuspensionReason::Home,
+        scene_coordinator_.get());
   }
   const auto result =
       graphics_services_input::enqueue_system_button(*shared_state_, input);
@@ -1024,6 +1030,7 @@ void CompatibilityKernel::inherit_process_state(
   shared_state_ = parent.shared_state_;
   display_state_ = parent.display_state_;
   presentation_tracker_ = parent.presentation_tracker_;
+  scene_coordinator_ = parent.scene_coordinator_;
   wifi_state_ = parent.wifi_state_;
   audio_service_ = parent.audio_service_;
   audio_toolbox_hle_.set_service(audio_service_);
@@ -1031,10 +1038,14 @@ void CompatibilityKernel::inherit_process_state(
   apple80211_hle_.set_wifi_state(wifi_state_);
   core_surface_hle_.set_display(display_state_);
   core_surface_hle_.set_shared_state(shared_state_);
+  core_surface_hle_.set_scene_coordinator(scene_coordinator_);
   opengles_hle_.set_shared_state(shared_state_);
+  opengles_hle_.set_scene_coordinator(scene_coordinator_);
   mobile_framebuffer_hle_.set_shared_state(shared_state_);
   mobile_framebuffer_hle_.set_presentation_tracker(presentation_tracker_);
+  mobile_framebuffer_hle_.set_scene_coordinator(scene_coordinator_);
   layerkit_hle_.set_shared_state(shared_state_);
+  layerkit_hle_.set_scene_coordinator(scene_coordinator_);
   opengles_hle_.set_display(display_state_);
   mbx2d_hle_.set_display(display_state_);
   mobile_framebuffer_hle_.set_display(display_state_);

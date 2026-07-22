@@ -20,6 +20,7 @@ namespace ilegacysim {
 
 class UserlandHleCall;
 class UserlandHleRegistry;
+class SceneCoordinator;
 class SurfaceStore;
 struct KernelSharedState;
 
@@ -36,6 +37,7 @@ public:
     void inherit_state(const OpenGlesHle& parent);
     void set_display(std::shared_ptr<DisplayState> display);
     void set_shared_state(std::shared_ptr<KernelSharedState> shared_state);
+    void set_scene_coordinator(std::shared_ptr<SceneCoordinator> scenes);
     [[nodiscard]] const GlesResourceStore& resources() const {
         return resources_;
     }
@@ -135,6 +137,7 @@ private:
     std::shared_ptr<DisplayState> display_;
     std::shared_ptr<SurfaceStore> surface_store_;
     std::shared_ptr<KernelSharedState> shared_state_;
+    std::shared_ptr<SceneCoordinator> scene_coordinator_;
 };
 
 }  // namespace ilegacysim

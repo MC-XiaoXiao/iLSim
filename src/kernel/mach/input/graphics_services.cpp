@@ -8,6 +8,7 @@
 
 #include "ilegacysim/display.hpp"
 #include "ilegacysim/mig_wire_abi.hpp"
+#include "ilegacysim/scene_coordinator.hpp"
 #include "ilegacysim/userland_hle.hpp"
 
 namespace ilegacysim::graphics_services_input {
@@ -290,7 +291,8 @@ ServiceResolution record_bootstrap_reply_locked(
                            service_name};
 }
 
-EnqueueResult enqueue_touch(KernelSharedState &state, const TouchInput &input) {
+EnqueueResult enqueue_touch(KernelSharedState &state, const TouchInput &input,
+                            const SceneCoordinator *scenes) {
   const TouchInput sanitized{input.phase,
                              std::isfinite(input.x) ? input.x : 0.0F,
                              std::isfinite(input.y) ? input.y : 0.0F};
@@ -305,22 +307,41 @@ EnqueueResult enqueue_touch(KernelSharedState &state, const TouchInput &input) {
     if (port && process != state.processes.end() && !process->second.exited &&
         process->second.executable_path.starts_with("/Applications/")) {
       auto application_input = sanitized;
-      if (state.active_application_scene &&
-          state.active_application_scene->process_id == port->receive_owner &&
-          state.active_application_scene->event_object ==
-              state.active_application_event_object &&
-          state.active_application_scene->touch_transform) {
-        const auto &transform =
-            *state.active_application_scene->touch_transform;
-        application_input.x -= transform.presentation_offset_x;
-        application_input.y -= transform.presentation_offset_y;
+      if (scenes) {
+        const auto scene = scenes->client_scene(port->receive_owner);
+        if (scene && scene->state == ClientSceneState::Active) {
+          if (scene->input_transform) {
+            const auto [x, y] =
+                scene->input_transform->map(sanitized.x, sanitized.y);
+            application_input.x = x;
+            application_input.y = y;
+          }
+          queue_locked(state, state.active_application_event_object,
+                       application_input);
+          return EnqueueResult::Queued;
+        }
+        // Preserve the Mach route while the semantic client is suspended or
+        // only committed, but keep the host event with SpringBoard.
+      } else {
+        if (state.active_application_scene &&
+            state.active_application_scene->process_id ==
+                port->receive_owner &&
+            state.active_application_scene->event_object ==
+                state.active_application_event_object &&
+            state.active_application_scene->touch_transform) {
+          const auto &transform =
+              *state.active_application_scene->touch_transform;
+          application_input.x -= transform.presentation_offset_x;
+          application_input.y -= transform.presentation_offset_y;
+        }
+        queue_locked(state, state.active_application_event_object,
+                     application_input);
+        return EnqueueResult::Queued;
       }
-      queue_locked(state, state.active_application_event_object,
-                   application_input);
-      return EnqueueResult::Queued;
+    } else {
+      state.active_application_event_object = 0U;
+      state.application_touch_suspended = false;
     }
-    state.active_application_event_object = 0U;
-    state.application_touch_suspended = false;
   }
   const auto service =
       state.bootstrap_service_objects.find(std::string{system_event_service});
@@ -355,7 +376,8 @@ EnqueueResult enqueue_system_button(KernelSharedState &state,
 
 void suspend_active_application(
     KernelSharedState &state,
-    KernelSharedState::ApplicationSuspensionReason reason) {
+    KernelSharedState::ApplicationSuspensionReason reason,
+    SceneCoordinator *scenes) {
   std::lock_guard lock{state.mach_mutex};
   state.application_touch_suspended =
       state.active_application_event_object != 0U;
@@ -370,23 +392,36 @@ void suspend_active_application(
   if (state.active_application_scene) {
     state.suspended_application_scene_process_id =
         state.active_application_scene->process_id;
+    if (scenes) {
+      scenes->suspend_client_scene(
+          state.active_application_scene->process_id);
+    }
     return;
   }
   if (const auto active_port = state.mach_port_objects.lookup(
           state.active_application_event_object)) {
     state.suspended_application_scene_process_id = active_port->receive_owner;
+    if (scenes)
+      scenes->suspend_client_scene(active_port->receive_owner);
   }
 }
 
 void activate_resolved_application(KernelSharedState &state,
-                                   std::uint32_t process_id) {
+                                   std::uint32_t process_id,
+                                   SceneCoordinator *scenes) {
   std::lock_guard lock{state.mach_mutex};
+  const auto scene_committed =
+      scenes ? scenes->client_scene(process_id).has_value()
+             : state.active_application_scene &&
+                   state.active_application_scene->touch_transform.has_value();
   if (state.active_application_scene &&
       state.active_application_scene->process_id == process_id &&
-      state.active_application_scene->touch_transform) {
+      scene_committed) {
     state.active_application_event_object =
         state.active_application_scene->event_object;
     state.application_touch_suspended = false;
+    if (scenes)
+      scenes->activate_client_scene(process_id);
   }
 }
 
@@ -398,14 +433,14 @@ void reset_application_scene_context(KernelSharedState &state,
       std::pair{render_process_id, context});
 }
 
-void record_application_scene_transform(
+std::optional<std::uint32_t> record_application_scene_transform(
     KernelSharedState &state, std::uint32_t render_process_id,
     std::uint32_t context,
     const KernelSharedState::ApplicationTouchTransform &transform) {
   if (!std::isfinite(transform.presentation_offset_x) ||
       !std::isfinite(transform.presentation_offset_y) ||
       !std::isfinite(transform.screen_origin_y)) {
-    return;
+    return std::nullopt;
   }
   std::lock_guard lock{state.mach_mutex};
   const auto context_key = std::pair{render_process_id, context};
@@ -417,7 +452,7 @@ void record_application_scene_transform(
     const auto pending_port =
         state.mach_port_objects.lookup(state.pending_application_event_object);
     if (!pending_port) {
-      return;
+      return std::nullopt;
     }
     process_id = pending_port->receive_owner;
   }
@@ -426,12 +461,12 @@ void record_application_scene_transform(
   // App can publish its first live root before didBecomeActive arrives.
   if (state.application_touch_suspended &&
       state.suspended_application_scene_process_id == process_id) {
-    return;
+    return std::nullopt;
   }
   const auto process = state.processes.find(process_id);
   if (process == state.processes.end() || process->second.exited ||
       !process->second.executable_path.starts_with("/Applications/")) {
-    return;
+    return std::nullopt;
   }
   if (owner == state.application_scene_context_owners.end()) {
     state.application_scene_context_owners.emplace(context_key, process_id);
@@ -448,6 +483,7 @@ void record_application_scene_transform(
     state.active_application_event_object =
         state.active_application_scene->event_object;
   }
+  return process_id;
 }
 
 void release_application_process_locked(KernelSharedState &state,
@@ -505,7 +541,8 @@ void release_application_process_locked(KernelSharedState &state,
 void record_application_lifecycle_event_locked(
     KernelSharedState &state, std::uint32_t sender_pid,
     std::uint32_t destination, std::uint32_t event_type,
-    std::span<const std::uint32_t> exit_snapshot_pixels) {
+    std::span<const std::uint32_t> exit_snapshot_pixels,
+    SceneCoordinator *scenes) {
   if (event_type != application_did_become_active_event_type &&
       event_type != application_will_resign_active_event_type) {
     return;
@@ -553,6 +590,9 @@ void record_application_lifecycle_event_locked(
                cached != state.application_scene_transforms.end()) {
       transform = cached->second;
     }
+    const auto semantic_scene_committed =
+        scenes &&
+        scenes->client_scene(destination_port->receive_owner).has_value();
     // A suspended/event-only process can receive the same activation event as
     // a foreground application while another committed scene remains front.
     // Treat lifecycle delivery as intent, not proof of visibility: the
@@ -562,7 +602,9 @@ void record_application_lifecycle_event_locked(
         state.active_application_scene &&
         state.active_application_scene->process_id !=
             destination_port->receive_owner &&
-        state.active_application_scene->touch_transform &&
+        (scenes ? scenes->client_scene_active(
+                       state.active_application_scene->process_id)
+                : state.active_application_scene->touch_transform.has_value()) &&
         state.active_application_event_object ==
             state.active_application_scene->event_object &&
         !state.application_touch_suspended;
@@ -576,9 +618,11 @@ void record_application_lifecycle_event_locked(
     }
     state.active_application_scene = KernelSharedState::ActiveApplicationScene{
         destination_port->receive_owner, destination, transform};
-    if (transform) {
+    if (scenes ? semantic_scene_committed : transform.has_value()) {
       state.active_application_event_object = destination;
       state.application_touch_suspended = false;
+      if (scenes)
+        scenes->activate_client_scene(destination_port->receive_owner);
     } else {
       state.active_application_event_object = 0;
       state.application_touch_suspended = false;
@@ -597,6 +641,8 @@ void record_application_lifecycle_event_locked(
       state.pending_application_exit_snapshot.reset();
     }
   } else {
+    if (scenes)
+      scenes->suspend_client_scene(destination_port->receive_owner);
     state.application_touch_suspended = true;
     state.suspended_application_scene_process_id =
         destination_port->receive_owner;

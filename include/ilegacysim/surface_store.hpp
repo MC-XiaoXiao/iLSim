@@ -59,6 +59,7 @@ public:
     void reset();
     void inherit_state(const SurfaceStore& parent);
     [[nodiscard]] std::uint32_t allocate_identifier();
+    [[nodiscard]] std::uint64_t publication_watermark() const;
     [[nodiscard]] bool publish(AddressSpace& memory, Backing backing);
     [[nodiscard]] std::optional<SharedMapping> shared_mapping(
         std::uint32_t id) const;
@@ -82,6 +83,7 @@ private:
         std::map<std::uint32_t, SharedObject> objects;
         std::uint32_t next_identifier{1};
         std::uint64_t next_publication_sequence{1};
+        std::uint64_t publication_watermark{};
     };
 
     mutable std::mutex mutex_;

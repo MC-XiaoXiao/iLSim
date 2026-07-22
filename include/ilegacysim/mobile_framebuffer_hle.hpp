@@ -9,6 +9,7 @@ namespace ilegacysim {
 
 class DisplayState;
 class PresentationTracker;
+class SceneCoordinator;
 struct KernelSharedState;
 class UserlandHleCall;
 class UserlandHleRegistry;
@@ -27,6 +28,7 @@ public:
     void set_shared_state(std::shared_ptr<KernelSharedState> shared_state);
     void set_presentation_tracker(
         std::shared_ptr<PresentationTracker> presentations);
+    void set_scene_coordinator(std::shared_ptr<SceneCoordinator> scenes);
     [[nodiscard]] bool has_active_layers() const;
 
 private:
@@ -53,6 +55,7 @@ private:
     std::shared_ptr<SurfaceStore> surface_store_;
     std::shared_ptr<PresentationTracker> presentation_tracker_;
     std::shared_ptr<KernelSharedState> shared_state_;
+    std::shared_ptr<SceneCoordinator> scene_coordinator_;
     std::map<std::uint32_t, LayerState> layers_;
     std::uint32_t next_swap_id_{1};
     std::uint32_t background_argb_{0xff000000U};

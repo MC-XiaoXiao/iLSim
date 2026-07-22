@@ -36,6 +36,7 @@
 #include "ilegacysim/opengles_hle.hpp"
 #include "ilegacysim/output.hpp"
 #include "ilegacysim/presentation_tracker.hpp"
+#include "ilegacysim/scene_coordinator.hpp"
 #include "ilegacysim/surface_store.hpp"
 #include "ilegacysim/system_button_input.hpp"
 #include "ilegacysim/touch_input.hpp"
@@ -391,6 +392,8 @@ private:
       std::make_shared<SurfaceStore>()};
   std::shared_ptr<PresentationTracker> presentation_tracker_{
       std::make_shared<PresentationTracker>()};
+  std::shared_ptr<SceneCoordinator> scene_coordinator_{
+      std::make_shared<SceneCoordinator>()};
   CoreSurfaceHle core_surface_hle_;
   OpenGlesHle opengles_hle_;
   Mbx2dHle mbx2d_hle_;

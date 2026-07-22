@@ -8,6 +8,7 @@ add_library(ilegacysim_foundation STATIC
     macho.cpp
     output.cpp
     process_loader.cpp
+    scene_coordinator.cpp
     userland_hle.cpp
     virtual_clock.cpp)
 add_library(iLegacySim::foundation ALIAS ilegacysim_foundation)
