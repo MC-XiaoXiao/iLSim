@@ -535,8 +535,14 @@ std::uint32_t modify_port_references_locked(KernelSharedState &state,
       return kern_success;
     if (delta != -1)
       return kern_invalid_value;
-    cancel_dead_name_notification_locked(state, task, name);
     static_cast<void>(state.mach_namespaces.remove_type(task, name, mask));
+    // A receive name may temporarily be composite with a send-once right when
+    // it is also used as a notification endpoint.  Releasing only that
+    // send-once right does not delete the name, so its dead-name request must
+    // remain registered.
+    if (!state.mach_namespaces.contains(task, name)) {
+      cancel_dead_name_notification_locked(state, task, name);
+    }
     enqueue_send_once_notification_locked(state, entry->object);
     return kern_success;
   }
