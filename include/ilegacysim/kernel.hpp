@@ -35,6 +35,7 @@
 #include "ilegacysim/mobile_framebuffer_hle.hpp"
 #include "ilegacysim/opengles_hle.hpp"
 #include "ilegacysim/output.hpp"
+#include "ilegacysim/presentation_tracker.hpp"
 #include "ilegacysim/surface_store.hpp"
 #include "ilegacysim/system_button_input.hpp"
 #include "ilegacysim/touch_input.hpp"
@@ -388,6 +389,8 @@ private:
   Apple80211Hle apple80211_hle_;
   std::shared_ptr<SurfaceStore> surface_store_{
       std::make_shared<SurfaceStore>()};
+  std::shared_ptr<PresentationTracker> presentation_tracker_{
+      std::make_shared<PresentationTracker>()};
   CoreSurfaceHle core_surface_hle_;
   OpenGlesHle opengles_hle_;
   Mbx2dHle mbx2d_hle_;

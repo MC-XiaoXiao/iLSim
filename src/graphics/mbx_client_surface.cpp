@@ -22,7 +22,7 @@ std::uint32_t Mbx2dHle::allocate_client_surface(
             handle, 0, false,
             SurfaceStore::Backing{
                 0, base, allocation_size, width, 0, 0,
-                0}});
+                0, {}}});
     return handle;
 }
 

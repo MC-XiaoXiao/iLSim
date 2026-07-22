@@ -79,7 +79,8 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
       core_surface_hle_{userland_hle_, display_state_, surface_store_},
       opengles_hle_{userland_hle_, display_state_, surface_store_},
       mbx2d_hle_{userland_hle_, display_state_, surface_store_},
-      mobile_framebuffer_hle_{userland_hle_, display_state_, surface_store_} {
+      mobile_framebuffer_hle_{userland_hle_, display_state_, surface_store_,
+                              presentation_tracker_} {
   core_surface_hle_.set_shared_state(shared_state_);
   opengles_hle_.set_shared_state(shared_state_);
   mobile_framebuffer_hle_.set_shared_state(shared_state_);
@@ -1022,6 +1023,7 @@ void CompatibilityKernel::inherit_process_state(
     const CompatibilityKernel &parent, std::uint32_t child_pid) {
   shared_state_ = parent.shared_state_;
   display_state_ = parent.display_state_;
+  presentation_tracker_ = parent.presentation_tracker_;
   wifi_state_ = parent.wifi_state_;
   audio_service_ = parent.audio_service_;
   audio_toolbox_hle_.set_service(audio_service_);
@@ -1031,6 +1033,7 @@ void CompatibilityKernel::inherit_process_state(
   core_surface_hle_.set_shared_state(shared_state_);
   opengles_hle_.set_shared_state(shared_state_);
   mobile_framebuffer_hle_.set_shared_state(shared_state_);
+  mobile_framebuffer_hle_.set_presentation_tracker(presentation_tracker_);
   layerkit_hle_.set_shared_state(shared_state_);
   opengles_hle_.set_display(display_state_);
   mbx2d_hle_.set_display(display_state_);

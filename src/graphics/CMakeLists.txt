@@ -13,6 +13,7 @@ add_library(ilegacysim_graphics STATIC
     mbx3d_quad_hle.cpp
     mobile_framebuffer_hle.cpp
     opengles_hle.cpp
+    presentation_tracker.cpp
     sdl_display.cpp
     sdl_input.cpp
     surface_store.cpp)

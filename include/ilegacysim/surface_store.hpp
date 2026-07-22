@@ -31,6 +31,15 @@ inline constexpr std::uint32_t surface_pixel_format_rgb555 =
 // space without assuming that both tasks chose the same virtual address.
 class SurfaceStore {
 public:
+    struct Provenance {
+        // The task that first published the backing. Importers retain this
+        // identity instead of replacing it with the compositor's task.
+        std::uint32_t producer_process_id{};
+        // Assigned by the shared registry at publication time so reused
+        // process or transport identifiers still describe distinct surfaces.
+        std::uint64_t publication_sequence{};
+    };
+
     struct Backing {
         std::uint32_t id{};
         std::uint32_t base{};
@@ -39,6 +48,7 @@ public:
         std::uint32_t height{};
         std::uint32_t bytes_per_row{};
         std::uint32_t pixel_format{};
+        Provenance provenance;
     };
 
     struct SharedMapping {
@@ -71,6 +81,7 @@ private:
         mutable std::mutex mutex;
         std::map<std::uint32_t, SharedObject> objects;
         std::uint32_t next_identifier{1};
+        std::uint64_t next_publication_sequence{1};
     };
 
     mutable std::mutex mutex_;

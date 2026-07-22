@@ -51,15 +51,19 @@ bool SurfaceStore::publish(AddressSpace& memory, Backing backing) {
     auto pages = memory.share_pages(mapping_address, mapping_size);
     if (!pages) return false;
 
-    SharedObject object;
-    object.metadata = backing;
-    object.metadata.base = 0;
-    object.page_offset = page_offset;
-    object.mapping_size = mapping_size;
-    object.pages = std::move(*pages);
     {
         std::lock_guard lock{registry_->mutex};
         if (registry_->objects.contains(backing.id)) return false;
+        backing.provenance.publication_sequence =
+            registry_->next_publication_sequence++;
+        if (registry_->next_publication_sequence == 0U)
+            registry_->next_publication_sequence = 1U;
+        SharedObject object;
+        object.metadata = backing;
+        object.metadata.base = 0;
+        object.page_offset = page_offset;
+        object.mapping_size = mapping_size;
+        object.pages = std::move(*pages);
         registry_->objects.emplace(backing.id, std::move(object));
         if (registry_->next_identifier <= backing.id)
             registry_->next_identifier = backing.id + 1U;

@@ -17,6 +17,7 @@
 #include "ilegacysim/kernel_shared_state.hpp"
 #include "ilegacysim/mobile_framebuffer_abi.hpp"
 #include "ilegacysim/output.hpp"
+#include "ilegacysim/presentation_tracker.hpp"
 #include "ilegacysim/surface_store.hpp"
 #include "ilegacysim/userland_hle.hpp"
 
@@ -31,10 +32,14 @@ constexpr std::string_view framebuffer_image{
 
 MobileFramebufferHle::MobileFramebufferHle(
     UserlandHleRegistry &registry, std::shared_ptr<DisplayState> display,
-    std::shared_ptr<SurfaceStore> surfaces)
+    std::shared_ptr<SurfaceStore> surfaces,
+    std::shared_ptr<PresentationTracker> presentations)
     : display_{std::move(display)},
       surface_store_{surfaces ? std::move(surfaces)
-                              : std::make_shared<SurfaceStore>()} {
+                              : std::make_shared<SurfaceStore>()},
+      presentation_tracker_{
+          presentations ? std::move(presentations)
+                        : std::make_shared<PresentationTracker>()} {
   const auto add = [&](std::string symbol,
                        UserlandHleRegistry::Handler handler) {
     registry.register_function(std::string{framebuffer_image},
@@ -72,6 +77,7 @@ MobileFramebufferHle::MobileFramebufferHle(
   add("_IOMobileFramebufferSwapEnd", [this](UserlandHleCall &call) {
     if (display_write_allowed(call)) {
       submit_layers(call);
+      record_presentation(call);
       if (display_)
         display_->present();
     }
@@ -122,6 +128,11 @@ void MobileFramebufferHle::set_display(std::shared_ptr<DisplayState> display) {
 void MobileFramebufferHle::set_shared_state(
     std::shared_ptr<KernelSharedState> shared_state) {
   shared_state_ = std::move(shared_state);
+}
+
+void MobileFramebufferHle::set_presentation_tracker(
+    std::shared_ptr<PresentationTracker> presentations) {
+  presentation_tracker_ = std::move(presentations);
 }
 
 bool MobileFramebufferHle::display_write_allowed(
@@ -310,6 +321,30 @@ void MobileFramebufferHle::submit_layers(UserlandHleCall &call) {
     }
   }
   display_->replace_pixels(std::move(composed));
+}
+
+void MobileFramebufferHle::record_presentation(UserlandHleCall &call) {
+  if (!presentation_tracker_)
+    return;
+  std::vector<PresentationLayer> presented_layers;
+  presented_layers.reserve(layers_.size());
+  for (const auto &[order, state] : layers_) {
+    const auto backing = surface_store_->find(state.surface_id);
+    if (!backing)
+      continue;
+    presented_layers.push_back(PresentationLayer{
+        order,
+        state.surface_id,
+        backing->provenance,
+        PresentationRectangle{state.source.x, state.source.y,
+                              state.source.width, state.source.height},
+        PresentationRectangle{state.destination.x, state.destination.y,
+                              state.destination.width,
+                              state.destination.height},
+        state.flags});
+  }
+  static_cast<void>(presentation_tracker_->record(
+      call.process_id(), std::move(presented_layers)));
 }
 
 void MobileFramebufferHle::set_background_color(UserlandHleCall &call) {

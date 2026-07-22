@@ -166,8 +166,9 @@ std::uint32_t CoreSurfaceHle::create_buffer(
     for (const auto& [offset, value] : fields) {
         if (!call.memory().write32(client + offset, value)) return 0;
     }
-    const auto backing = SurfaceStore::Backing{
-        id, base, size, width, height, pitch, surface_pixel_format_bgra};
+    auto backing = SurfaceStore::Backing{
+        id, base, size, width, height, pitch, surface_pixel_format_bgra, {}};
+    backing.provenance.producer_process_id = call.process_id();
     if (publish && !surfaces_->publish(call.memory(), backing)) return 0;
     std::vector<std::uint32_t> preserved_exit_snapshot_pixels;
     if (shared_state_ && publish && owns_memory &&
