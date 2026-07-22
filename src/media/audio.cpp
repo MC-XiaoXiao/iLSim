@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <limits>
 #include <span>
 #include <string>
+#include <utility>
 
 #include "ilegacysim/audio_toolbox_hle.hpp"
 
@@ -210,7 +212,8 @@ AudioPlayResult AudioService::play_system_sound(std::uint32_t sound_id) {
 }
 
 AudioPlayResult AudioService::play_audio_file(
-    const std::filesystem::path &guest_path, bool replace_current) {
+    const std::filesystem::path &guest_path, bool replace_current,
+    float device_volume) {
   std::shared_ptr<AudioSink> sink;
   std::optional<AudioBuffer> buffer;
   AudioPlayResult result;
@@ -219,7 +222,8 @@ AudioPlayResult AudioService::play_audio_file(
     std::lock_guard lock{mutex_};
     buffer = load_file_locked(guest_path, result);
     sink = sink_;
-    current_volume = category_volumes_["Ringtone"];
+    current_volume = category_volumes_["Ringtone"] *
+                     std::clamp(device_volume, 0.0F, 1.0F);
   }
   if (!buffer)
     return result;
@@ -261,7 +265,17 @@ AudioPlayResult AudioService::queue_pcm(AudioBuffer buffer,
   // Firmware mediaserverd has already applied its category gain to this PCM.
   // The backend contributes only the emulated physical-device scalar.
   const auto gain = std::clamp(device_volume, 0.0F, 1.0F);
-  if (!sink->play(apply_volume(std::move(buffer), gain))) {
+  auto output = apply_volume(std::move(buffer), gain);
+  // A queued SDL device naturally renders silence when it underruns. Enqueuing
+  // every silent hardware period only creates latency when guest virtual time
+  // advances faster than host playback time, potentially hiding the next
+  // audible buffer behind stale silence.
+  if (std::ranges::none_of(output.samples,
+                           [](std::int16_t sample) { return sample != 0; })) {
+    result.status = AudioPlayStatus::Queued;
+    return result;
+  }
+  if (!sink->play(output)) {
     result.status = AudioPlayStatus::SinkError;
     result.detail = sink->last_error();
     return result;
@@ -278,6 +292,44 @@ void AudioService::stop_playback() {
   }
   if (sink)
     sink->stop();
+}
+
+void AudioService::observe_service_source_file(
+    std::filesystem::path guest_path) {
+  if (!guest_path.is_absolute())
+    return;
+  auto extension = guest_path.extension().string();
+  std::ranges::transform(extension, extension.begin(),
+                         [](unsigned char character) {
+                           return static_cast<char>(std::tolower(character));
+                         });
+  constexpr std::array supported_extensions{
+      std::string_view{".aif"}, std::string_view{".aiff"},
+      std::string_view{".caf"}, std::string_view{".m4a"},
+      std::string_view{".mov"}, std::string_view{".mp3"},
+      std::string_view{".wav"}};
+  if (std::ranges::find(supported_extensions, extension) ==
+      supported_extensions.end()) {
+    return;
+  }
+  std::lock_guard lock{mutex_};
+  pending_service_source_ = std::move(guest_path);
+}
+
+AudioPlayResult
+AudioService::play_observed_service_source(float device_volume) {
+  std::optional<std::filesystem::path> source;
+  {
+    std::lock_guard lock{mutex_};
+    source = std::exchange(pending_service_source_, std::nullopt);
+  }
+  if (!source) {
+    AudioPlayResult result;
+    result.status = AudioPlayStatus::ResourceUnavailable;
+    result.detail = "media service has no observed audio source";
+    return result;
+  }
+  return play_audio_file(*source, true, device_volume);
 }
 
 void AudioService::observe_category_volume(std::string category, float value) {

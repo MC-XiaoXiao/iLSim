@@ -58,6 +58,7 @@ private:
   void start_io(UserlandHleCall &call);
   void stop_io(UserlandHleCall &call);
   void complete_io_proc(UserlandHleCall &call, std::uint32_t process_id);
+  [[nodiscard]] float device_output_gain(std::uint32_t device) const;
 
   struct IoProcRegistration {
     std::uint32_t callback{};
@@ -74,15 +75,17 @@ private:
     std::uint64_t next_deadline{};
     std::uint64_t sample_time{};
     std::uint64_t callback_count{};
+    std::uint32_t peak_since_report{};
     std::optional<std::size_t> processor;
     bool running{};
     bool in_flight{};
+    bool source_playback{};
   };
 
   UserlandHleRegistry &registry_;
   std::shared_ptr<AudioService> service_;
   std::uint32_t buffer_frame_size_{1024};
-  float output_volume_{1.0F};
+  std::map<std::uint32_t, float> device_volumes_;
   std::map<std::uint64_t, std::uint32_t> hardware_control_states_;
   std::map<std::uint32_t, IoProcRegistration> io_procs_;
   std::vector<std::size_t> retired_io_proc_threads_;

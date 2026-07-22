@@ -66,10 +66,18 @@ public:
   [[nodiscard]] AudioPlayResult play_system_sound(std::uint32_t sound_id);
   [[nodiscard]] AudioPlayResult
   play_audio_file(const std::filesystem::path &guest_path,
-                  bool replace_current = false);
+                  bool replace_current = false,
+                  float device_volume = 1.0F);
   [[nodiscard]] AudioPlayResult queue_pcm(AudioBuffer buffer,
                                           float device_volume = 1.0F);
   void stop_playback();
+
+  // The guest media service owns source selection and playback lifecycle.
+  // Record the compressed source it opened so a host decoder can stand in for
+  // codec/DSP hardware that is absent from the emulator.
+  void observe_service_source_file(std::filesystem::path guest_path);
+  [[nodiscard]] AudioPlayResult
+  play_observed_service_source(float device_volume = 1.0F);
 
   void observe_category_volume(std::string category, float value);
   [[nodiscard]] float category_volume(std::string_view category) const;
@@ -112,6 +120,7 @@ private:
   std::map<std::uint32_t, std::filesystem::path> system_sounds_;
   std::map<std::uint32_t, AudioBuffer> decoded_sounds_;
   std::map<std::filesystem::path, AudioBuffer> decoded_files_;
+  std::optional<std::filesystem::path> pending_service_source_;
   struct PlayerState {
     AudioClientObject queue;
     float rate{};

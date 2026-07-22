@@ -283,6 +283,18 @@ void CoreAudioHle::reset() {
   retired_io_proc_threads_.clear();
 }
 
+float CoreAudioHle::device_output_gain(std::uint32_t device) const {
+  const auto volume = device_volumes_.find(device);
+  const auto gain = volume == device_volumes_.end() ? 1.0F : volume->second;
+  for (const auto property : {device_mute_property, mute_property}) {
+    const auto key = (static_cast<std::uint64_t>(device) << 32U) | property;
+    const auto control = hardware_control_states_.find(key);
+    if (control != hardware_control_states_.end() && control->second != 0)
+      return 0.0F;
+  }
+  return gain;
+}
+
 std::optional<std::uint64_t> CoreAudioHle::next_io_proc_deadline() const {
   std::optional<std::uint64_t> deadline;
   for (const auto &[process_id, registration] : io_procs_) {
@@ -411,6 +423,8 @@ void CoreAudioHle::complete_io_proc(UserlandHleCall &call,
   const auto byte_count =
       std::min(produced, registration.output_sample_bytes) & ~1U;
   AudioPlayResult result;
+  std::uint32_t peak = 0;
+  float applied_gain = 1.0F;
   if (device != nullptr && byte_count != 0) {
     if (const auto bytes =
             call.memory().read_bytes(registration.output_samples, byte_count)) {
@@ -426,13 +440,25 @@ void CoreAudioHle::complete_io_proc(UserlandHleCall &call,
             std::to_integer<std::uint16_t>((*bytes)[offset]) |
             static_cast<std::uint16_t>(
                 std::to_integer<std::uint16_t>((*bytes)[offset + 1U]) << 8U));
-        buffer.samples.push_back(std::bit_cast<std::int16_t>(encoded));
+        const auto sample = std::bit_cast<std::int16_t>(encoded);
+        buffer.samples.push_back(sample);
+        peak = std::max(
+            peak, sample == std::numeric_limits<std::int16_t>::min()
+                      ? 32768U
+                      : static_cast<std::uint32_t>(
+                            std::abs(static_cast<int>(sample))));
       }
-      if (service_)
-        result = service_->queue_pcm(std::move(buffer), output_volume_);
+      applied_gain = device_output_gain(registration.device);
+      if (registration.source_playback) {
+        result.status = AudioPlayStatus::Queued;
+      } else if (service_) {
+        result = service_->queue_pcm(std::move(buffer), applied_gain);
+      }
     }
   }
   ++registration.callback_count;
+  registration.peak_since_report =
+      std::max(registration.peak_since_report, peak);
   registration.sample_time += buffer_frame_size_;
   registration.in_flight = false;
   if (registration.callback_count == 1U ||
@@ -442,8 +468,11 @@ void CoreAudioHle::complete_io_proc(UserlandHleCall &call,
         "[coreaudio-device] io-proc pid=" + std::to_string(process_id) +
         " callbacks=" + std::to_string(registration.callback_count) +
         " bytes=" + std::to_string(byte_count) +
+        " peak=" + std::to_string(registration.peak_since_report) +
+        " gain=" + std::to_string(applied_gain) +
         " status=" + std::to_string(static_cast<unsigned>(result.status)) +
         (result.detail.empty() ? std::string{} : " detail=" + result.detail));
+    registration.peak_since_report = 0;
   }
 }
 
@@ -601,7 +630,9 @@ void CoreAudioHle::device_property(UserlandHleCall &call) {
   }
   if (property == volume_scalar_property) {
     std::array<std::byte, sizeof(float)> data{};
-    store32(data, 0, std::bit_cast<std::uint32_t>(output_volume_));
+    const auto value = device_volumes_.find(call.argument(0));
+    const auto volume = value == device_volumes_.end() ? 1.0F : value->second;
+    store32(data, 0, std::bit_cast<std::uint32_t>(volume));
     call.set_return(write_sized_data(call, call.argument(4), call.argument(5),
                                      data)
                         ? 0U
@@ -639,8 +670,10 @@ void CoreAudioHle::device_set_property(UserlandHleCall &call) {
              call.argument(5) >= sizeof(float)) {
     if (const auto encoded = call.memory().read32(call.argument(6))) {
       const auto value = std::bit_cast<float>(*encoded);
-      if (std::isfinite(value))
-        output_volume_ = std::clamp(value, 0.0F, 1.0F);
+      if (std::isfinite(value)) {
+        device_volumes_[call.argument(0)] =
+            std::clamp(value, 0.0F, 1.0F);
+      }
     }
   }
   log_property(call, "set", property, 0);
@@ -843,6 +876,22 @@ void CoreAudioHle::start_io(UserlandHleCall &call) {
   state.next_deadline = 0;
   state.sample_time = 0;
   state.callback_count = 0;
+  state.peak_since_report = 0;
+  state.source_playback = false;
+  if (service_) {
+    const auto source = service_->play_observed_service_source(
+        device_output_gain(state.device));
+    state.source_playback = source.status == AudioPlayStatus::Queued;
+    if (source.status != AudioPlayStatus::ResourceUnavailable) {
+      call.output().line(
+          "[coreaudio-device] source-playback pid=" +
+          std::to_string(call.process_id()) + " path=" +
+          source.guest_path.string() + " status=" +
+          std::to_string(static_cast<unsigned>(source.status)) +
+          (source.detail.empty() ? std::string{}
+                                 : " detail=" + source.detail));
+    }
+  }
   call.output().line("[coreaudio-device] io-proc start pid=" +
                      std::to_string(call.process_id()) + " frames=" +
                      std::to_string(buffer_frame_size_) + " bytes=" +
@@ -859,6 +908,8 @@ void CoreAudioHle::stop_io(UserlandHleCall &call) {
     return;
   }
   registration->second.running = false;
+  if (service_)
+    service_->stop_playback();
   if (registration->second.processor) {
     retired_io_proc_threads_.push_back(*registration->second.processor);
     registration->second.processor.reset();
