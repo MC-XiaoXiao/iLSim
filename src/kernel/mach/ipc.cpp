@@ -4,6 +4,7 @@
 #include "ilegacysim/darwin_network_abi.hpp"
 #include "ilegacysim/darwin_resource_abi.hpp"
 #include "ilegacysim/darwin_route_socket.hpp"
+#include "ilegacysim/graphics_services_input.hpp"
 #include "ilegacysim/kernel.hpp"
 #include "ilegacysim/kernel_clock.hpp"
 #include "ilegacysim/kernel_iokit.hpp"
@@ -151,6 +152,31 @@ bool CompatibilityKernel::deliver_pending_mach_locked(Cpu &cpu) {
       if (*right == xnu792::ipc::Right::Send) {
         release_inflight_send_right_locked(*shared_state_, *reply_object);
       }
+    }
+  }
+
+  // Bootstrap lookup bookkeeping belongs to the launchd reply, not the
+  // outgoing request. The destination of this queued response is the global
+  // reply-port object recorded with the lookup request; the optional
+  // reply_object field describes the reply right carried by the message and
+  // is not the lookup destination.
+  if (pending_message.sender_pid == 1U) {
+    const auto service_resolution =
+        graphics_services_input::record_bootstrap_reply_locked(
+            *shared_state_, pending_message.destination,
+            pending_message.port_transfers, process_.pid);
+    if (service_resolution.object != 0 &&
+        (service_resolution.application_event_port ||
+         service_resolution.service_name ==
+             graphics_services_input::system_event_service)) {
+      output_.write(
+          "[input] resolved service=" + service_resolution.service_name +
+          " object=" + std::to_string(service_resolution.object) +
+          " flushed=" + std::to_string(service_resolution.flushed_events) +
+          (service_resolution.application_event_port
+               ? " application-event-port"
+               : "") +
+          "\n");
     }
   }
 

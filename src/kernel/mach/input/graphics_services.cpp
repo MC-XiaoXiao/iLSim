@@ -240,9 +240,21 @@ void record_bootstrap_lookup_locked(KernelSharedState &state,
   }
 }
 
+void record_bootstrap_registration_locked(KernelSharedState &state,
+                                          std::string_view service_name) {
+  if (service_name.empty())
+    return;
+  auto &generation =
+      state.bootstrap_service_generations[std::string{service_name}];
+  ++generation;
+  if (generation == 0U)
+    generation = 1U;
+}
+
 ServiceResolution record_bootstrap_reply_locked(
     KernelSharedState &state, std::uint32_t reply_object,
-    std::span<const KernelSharedState::MachMessage::PortTransfer> transfers) {
+    std::span<const KernelSharedState::MachMessage::PortTransfer> transfers,
+    std::uint32_t receiver_process_id) {
   const auto pending =
       state.pending_bootstrap_service_lookups.find(reply_object);
   if (pending == state.pending_bootstrap_service_lookups.end())
@@ -254,8 +266,26 @@ ServiceResolution record_bootstrap_reply_locked(
       transfers.begin(), transfers.end(), [](const auto &transfer) {
         return transfer.right == xnu792::ipc::Right::Send;
       });
-  if (service == transfers.end())
-    return {};
+  const auto reply_port = state.mach_port_objects.lookup(reply_object);
+  const auto receiver = reply_port && reply_port->receive_owner != 0U
+                            ? reply_port->receive_owner
+                            : receiver_process_id;
+  if (service == transfers.end()) {
+    if (receiver != 0U) {
+      const auto generation =
+          state.bootstrap_service_generations[service_name];
+      state.pending_bootstrap_retries[receiver] =
+          PendingTimer::BootstrapRetry{service_name, generation};
+    }
+    return ServiceResolution{0, 0, false, service_name};
+  }
+  if (receiver != 0U) {
+    const auto retry = state.pending_bootstrap_retries.find(receiver);
+    if (retry != state.pending_bootstrap_retries.end() &&
+        retry->second.service_name == service_name) {
+      state.pending_bootstrap_retries.erase(retry);
+    }
+  }
 
   std::size_t flushed = 0;
   bool application_event_port = false;

@@ -170,10 +170,16 @@ enum class PendingTimerKind {
 };
 
 struct PendingTimer {
+  struct BootstrapRetry {
+    std::string service_name;
+    std::uint64_t observed_generation{};
+  };
+
   std::uint64_t deadline{};
   PendingTimerKind kind{PendingTimerKind::MachWaitUntil};
   std::optional<std::uint32_t> wakeup_time_address;
   bool calendar_clock{};
+  std::optional<BootstrapRetry> bootstrap_retry;
 };
 
 // A local stream endpoint is an open file description, not an fd.  dup(2),
@@ -557,6 +563,13 @@ struct KernelSharedState {
   // host devices can address the same global ipc_port objects.
   std::map<std::uint32_t, std::string> pending_bootstrap_service_lookups;
   std::map<std::string, std::uint32_t> bootstrap_service_objects;
+  // A failed bootstrap lookup is commonly followed by a bounded polling
+  // sleep while launchd starts an on-demand provider. Track the precise
+  // service condition so registration can wake that retry without waiting
+  // for an unrelated fixed timeout.
+  std::map<std::uint32_t, PendingTimer::BootstrapRetry>
+      pending_bootstrap_retries;
+  std::map<std::string, std::uint64_t> bootstrap_service_generations;
   // A Purple application registers a bootstrap service backed by its own
   // receive right. When SpringBoard resolves that service, retain the global
   // port object so host touch input can follow Purple's foreground routing.

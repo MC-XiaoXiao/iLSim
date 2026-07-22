@@ -53,9 +53,12 @@ event_type(std::span<const std::byte> message);
 void record_bootstrap_lookup_locked(KernelSharedState &state,
                                     std::uint32_t reply_object,
                                     std::string_view service_name);
+void record_bootstrap_registration_locked(KernelSharedState &state,
+                                          std::string_view service_name);
 [[nodiscard]] ServiceResolution record_bootstrap_reply_locked(
     KernelSharedState &state, std::uint32_t reply_object,
-    std::span<const KernelSharedState::MachMessage::PortTransfer> transfers);
+    std::span<const KernelSharedState::MachMessage::PortTransfer> transfers,
+    std::uint32_t receiver_process_id = 0);
 
 // Thread-safe host entry point. Input arriving before SpringBoard has resolved
 // its event service is retained and flushed as soon as launchd replies.

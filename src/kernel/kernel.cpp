@@ -644,11 +644,29 @@ bool CompatibilityKernel::deliver_pending_io(Cpu &cpu) {
     return true;
   }
   if (const auto timer = pending_timers_.find(cpu.processor_id());
-      timer != pending_timers_.end() &&
-      shared_state_->clock.now() >= timer->second.deadline) {
+      timer != pending_timers_.end()) {
+    bool bootstrap_ready = false;
+    if (timer->second.bootstrap_retry) {
+      std::lock_guard mach_lock{shared_state_->mach_mutex};
+      const auto generation = shared_state_->bootstrap_service_generations.find(
+          timer->second.bootstrap_retry->service_name);
+      bootstrap_ready =
+          generation != shared_state_->bootstrap_service_generations.end() &&
+          generation->second >
+              timer->second.bootstrap_retry->observed_generation;
+    }
+    if (shared_state_->clock.now() < timer->second.deadline &&
+        !bootstrap_ready) {
+      return false;
+    }
     const auto pending = timer->second;
     pending_timers_.erase(timer);
     process_.waiting_for_events = false;
+    if (bootstrap_ready) {
+      output_.write("[timer] bootstrap-retry-ready pid=" +
+                    std::to_string(process_.pid) + " service=" +
+                    pending.bootstrap_retry->service_name + "\n");
+    }
     if (pending.kind == PendingTimerKind::ClockSleep &&
         pending.wakeup_time_address) {
       const auto now = pending.calendar_clock ? shared_state_->clock.wall_time()

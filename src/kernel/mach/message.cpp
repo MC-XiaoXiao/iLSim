@@ -165,10 +165,17 @@ void CompatibilityKernel::dispatch_mach_message(Cpu &cpu) {
                                      application_will_resign_active_event_type) {
         exit_snapshot_pixels = display_state_->snapshot().pixels;
       }
-      if (*message_id ==
-          mig_message_id(xnu792::mig::bootstrap::Routine::look_up)) {
-        constexpr auto service_offset =
-            xnu792::mig::bootstrap::look_up_arguments[2].request_offset;
+      const auto bootstrap_lookup =
+          *message_id ==
+          mig_message_id(xnu792::mig::bootstrap::Routine::look_up);
+      const auto bootstrap_registration =
+          *message_id ==
+          mig_message_id(xnu792::mig::bootstrap::Routine::mig_register);
+      if (bootstrap_lookup || bootstrap_registration) {
+        const auto service_offset = bootstrap_lookup
+            ? xnu792::mig::bootstrap::look_up_arguments[2].request_offset
+            : xnu792::mig::bootstrap::mig_register_arguments[2]
+                  .request_offset;
         constexpr std::size_t maximum_service_length = 128;
         for (std::size_t index = 0; index < maximum_service_length &&
                                     service_offset + index < bytes->size();
@@ -430,32 +437,20 @@ void CompatibilityKernel::dispatch_mach_message(Cpu &cpu) {
             retain_inflight(transfer.object, transfer.right,
                             transfer.disposition);
           }
-          if (!bootstrap_service_name.empty() && reply_object) {
+          if (bootstrap_lookup && !bootstrap_service_name.empty() &&
+              reply_object) {
             graphics_services_input::record_bootstrap_lookup_locked(
                 *shared_state_, *reply_object, bootstrap_service_name);
           }
-          const auto service_resolution =
-              graphics_services_input::record_bootstrap_reply_locked(
-                  *shared_state_, remote_object, port_transfers);
+          if (bootstrap_registration && !bootstrap_service_name.empty()) {
+            graphics_services_input::record_bootstrap_registration_locked(
+                *shared_state_, bootstrap_service_name);
+          }
           if (graphics_event_type) {
             graphics_services_input::record_application_lifecycle_event_locked(
                 *shared_state_, process_.pid, remote_object,
                 *graphics_event_type, exit_snapshot_pixels,
                 scene_coordinator_.get());
-          }
-          if (service_resolution.object != 0 &&
-              (service_resolution.application_event_port ||
-               service_resolution.service_name ==
-                   graphics_services_input::system_event_service)) {
-            output_.write(
-                "[input] resolved service=" + service_resolution.service_name +
-                " object=" + std::to_string(service_resolution.object) +
-                " flushed=" +
-                std::to_string(service_resolution.flushed_events) +
-                (service_resolution.application_event_port
-                     ? " application-event-port"
-                     : "") +
-                "\n");
           }
           KernelSharedState::MachMessage queued;
           queued.bytes = *bytes;

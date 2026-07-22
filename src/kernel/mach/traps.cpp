@@ -205,8 +205,30 @@ void CompatibilityKernel::dispatch_mach(Cpu &cpu, std::uint32_t trap) {
     }
     registers[0] = 0; // KERN_SUCCESS
     if (deadline > now) {
-      pending_timers_[cpu.processor_id()] =
-          PendingTimer{deadline, PendingTimerKind::MachWaitUntil, std::nullopt};
+      std::optional<PendingTimer::BootstrapRetry> bootstrap_retry;
+      {
+        std::lock_guard mach_lock{shared_state_->mach_mutex};
+        const auto pending =
+            shared_state_->pending_bootstrap_retries.find(process_.pid);
+        if (pending != shared_state_->pending_bootstrap_retries.end()) {
+          bootstrap_retry = std::move(pending->second);
+          shared_state_->pending_bootstrap_retries.erase(pending);
+        }
+      }
+      // A missing service is not ready merely because launchd returned an
+      // empty transfer. Keep a small retry floor; the scheduler will still
+      // wake this timer early when the service generation advances. Turning
+      // every failed lookup into an immediate wake creates a guest-side busy
+      // loop for optional services such as com.apple.musicplayer.
+      constexpr std::uint64_t bootstrap_retry_backoff =
+          100ULL * darwin::mach::scheduler::nanoseconds_per_millisecond;
+      const auto effective_deadline =
+          bootstrap_retry
+              ? std::max(deadline, now + bootstrap_retry_backoff)
+              : deadline;
+      pending_timers_[cpu.processor_id()] = PendingTimer{
+          effective_deadline, PendingTimerKind::MachWaitUntil, std::nullopt,
+          false, std::move(bootstrap_retry)};
       process_.waiting_for_events = true;
       cpu.halt(Dynarmic::HaltReason::UserDefined5);
     }
@@ -227,7 +249,8 @@ void CompatibilityKernel::dispatch_mach(Cpu &cpu, std::uint32_t trap) {
                             static_cast<std::uint64_t>(option_time_ms) *
                                 nanoseconds_per_millisecond;
       pending_timers_[cpu.processor_id()] =
-          PendingTimer{deadline, PendingTimerKind::ThreadSwitch, std::nullopt};
+          PendingTimer{deadline, PendingTimerKind::ThreadSwitch, std::nullopt,
+                       false, std::nullopt};
       process_.waiting_for_events = true;
       cpu.halt(Dynarmic::HaltReason::UserDefined5);
       return;
@@ -293,7 +316,7 @@ void CompatibilityKernel::dispatch_mach(Cpu &cpu, std::uint32_t trap) {
     if (alarm_time > clock_now) {
       pending_timers_[cpu.processor_id()] = PendingTimer{
           deadline, PendingTimerKind::ClockSleep, wakeup_time_address,
-          calendar_clock};
+          calendar_clock, std::nullopt};
       process_.waiting_for_events = true;
       cpu.halt(Dynarmic::HaltReason::UserDefined5);
       return;
