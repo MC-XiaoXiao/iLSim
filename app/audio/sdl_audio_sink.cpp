@@ -174,6 +174,15 @@ bool SdlAudioSink::play(const AudioBuffer &buffer) {
 #endif
 }
 
+bool SdlAudioSink::has_pending_audio() const {
+  std::lock_guard lock{impl_->mutex};
+#if defined(ILEGACYSIM_HAS_SDL2)
+  return impl_->next_sample < impl_->queued_samples.size();
+#else
+  return false;
+#endif
+}
+
 void SdlAudioSink::set_gain(float gain) {
   std::lock_guard lock{impl_->mutex};
 #if defined(ILEGACYSIM_HAS_SDL2)

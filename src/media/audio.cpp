@@ -354,6 +354,7 @@ bool AudioService::observe_service_source_property(
   bool stop = false;
   {
     std::lock_guard lock{mutex_};
+    retire_finished_service_source_locked();
     auto &state = service_sources_[source];
     if (property == "uservolume") {
       state.user_volume = std::clamp(value, 0.0F, 1.0F);
@@ -400,8 +401,9 @@ bool AudioService::observe_service_source_property(
   return true;
 }
 
-bool AudioService::service_source_playing() const {
+bool AudioService::service_source_playing() {
   std::lock_guard lock{mutex_};
+  retire_finished_service_source_locked();
   return playing_service_source_id_.has_value();
 }
 
@@ -687,6 +689,20 @@ AudioService::canonical_category_locked(std::string_view category) const {
     result = alias->second;
   }
   return result;
+}
+
+void AudioService::retire_finished_service_source_locked() {
+  if (!playing_service_source_id_ ||
+      (sink_ && sink_->has_pending_audio())) {
+    return;
+  }
+
+  // A host-decoded fallback is finite even if the retired Fig client leaves
+  // its rate positive. Once the sink consumes the final sample, retire only
+  // the fallback ownership. The firmware IOProc can then resume supplying PCM,
+  // and a later positive rate for the same service object can queue it again.
+  playing_service_source_id_.reset();
+  playing_service_source_.reset();
 }
 
 void AudioService::load_system_volume_state() {

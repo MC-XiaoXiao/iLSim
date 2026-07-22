@@ -23,6 +23,10 @@ class AudioSink {
 public:
   virtual ~AudioSink() = default;
   [[nodiscard]] virtual bool play(const AudioBuffer &buffer) = 0;
+  // Reports whether the host backend still owns samples that have not reached
+  // the output device. Guest service state uses this completion boundary to
+  // hand control back to its normal PCM path after a decoded fallback ends.
+  [[nodiscard]] virtual bool has_pending_audio() const = 0;
   virtual void set_gain(float gain) = 0;
   virtual void stop() = 0;
   [[nodiscard]] virtual std::string last_error() const = 0;
@@ -85,7 +89,7 @@ public:
                                       std::uint32_t source);
   [[nodiscard]] bool observe_service_source_property(
       std::uint32_t source, std::string_view property, float value);
-  [[nodiscard]] bool service_source_playing() const;
+  [[nodiscard]] bool service_source_playing();
 
   void observe_category_volume(std::string category, float value);
   [[nodiscard]] float category_volume(std::string_view category) const;
@@ -120,6 +124,7 @@ private:
   void load_system_volume_state();
   [[nodiscard]] std::string
   canonical_category_locked(std::string_view category) const;
+  void retire_finished_service_source_locked();
   [[nodiscard]] AudioPlayResult
   play_audio_file_with_gain(const std::filesystem::path &guest_path,
                             bool replace_current, float gain);
