@@ -63,7 +63,10 @@ public:
 
 private:
     class Callbacks;
+    void ensure_jit();
+
     std::size_t processor_id_{};
+    Dynarmic::ExclusiveMonitor* monitor_{};
     std::unique_ptr<Callbacks> callbacks_;
     std::unique_ptr<Dynarmic::A32::Jit> jit_;
     Dynarmic::HaltReason requested_halt_reason_{};

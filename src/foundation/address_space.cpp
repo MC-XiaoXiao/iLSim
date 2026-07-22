@@ -1,6 +1,7 @@
 #include "ilegacysim/address_space.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <type_traits>
@@ -10,6 +11,12 @@ namespace {
 
 constexpr std::uint32_t page_base(std::uint32_t address) {
   return address & ~(AddressSpace::page_size - 1U);
+}
+
+constexpr std::uint8_t mapped_page_flag = 0x80U;
+
+constexpr std::uint8_t permission_bits(MemoryPermission permissions) {
+  return static_cast<std::uint8_t>(permissions);
 }
 
 bool range_overflows(std::uint32_t address, std::size_t size) {
@@ -28,7 +35,25 @@ std::uint64_t page_range_end(std::uint32_t address, std::size_t size) {
 } // namespace
 
 AddressSpace::AddressSpace()
-    : file_page_cache_{std::make_shared<FilePageCache>()} {}
+    : page_permissions_(page_count),
+      file_page_cache_{std::make_shared<FilePageCache>()} {}
+
+void AddressSpace::set_parallel_access(bool enabled) {
+  std::unique_lock lock{mutex_};
+  parallel_access_ = enabled;
+}
+
+AddressSpace::ReadLock AddressSpace::read_lock() const {
+  ReadLock lock{mutex_, std::defer_lock};
+  if (parallel_access_) lock.lock();
+  return lock;
+}
+
+AddressSpace::WriteLock AddressSpace::write_lock() {
+  WriteLock lock{mutex_, std::defer_lock};
+  if (parallel_access_) lock.lock();
+  return lock;
+}
 
 bool AddressSpace::map(std::uint32_t address, std::uint32_t size,
                        MemoryPermission permissions) {
@@ -37,8 +62,9 @@ bool AddressSpace::map(std::uint32_t address, std::uint32_t size,
   }
   const auto first = page_base(address);
   const auto end = page_range_end(address, size);
-  std::unique_lock lock{mutex_};
+  auto lock = write_lock();
   vm_map_.map_or(first, end, permissions);
+  add_page_permissions_locked(first, end, permissions);
   return true;
 }
 
@@ -48,19 +74,25 @@ bool AddressSpace::unmap(std::uint32_t address, std::uint32_t size) {
   }
   const auto first = page_base(address);
   const auto end = page_range_end(address, size);
-  std::unique_lock lock{mutex_};
+  auto lock = write_lock();
   vm_map_.unmap(first, end);
+  unmap_file_mappings_locked(first, end);
   auto page = pages_.lower_bound(first);
   while (page != pages_.end() && page->first < end) {
+    uncache_page_locked(page->first);
     page = pages_.erase(page);
   }
+  clear_page_permissions_locked(first, end);
   return true;
 }
 
 void AddressSpace::clear() {
-  std::unique_lock lock{mutex_};
+  auto lock = write_lock();
   vm_map_.clear();
   pages_.clear();
+  file_mappings_.clear();
+  for (auto &chunk : page_lookup_) chunk.reset();
+  std::fill(page_permissions_.begin(), page_permissions_.end(), 0U);
 }
 
 bool AddressSpace::protect(std::uint32_t address, std::uint32_t size,
@@ -70,8 +102,10 @@ bool AddressSpace::protect(std::uint32_t address, std::uint32_t size,
   }
   const auto first = page_base(address);
   const auto end = page_range_end(address, size);
-  std::unique_lock lock{mutex_};
-  return vm_map_.protect(first, end, permissions);
+  auto lock = write_lock();
+  if (!vm_map_.protect(first, end, permissions)) return false;
+  set_page_permissions_locked(first, end, permissions);
+  return true;
 }
 
 bool AddressSpace::copy_in(std::uint32_t address,
@@ -79,7 +113,8 @@ bool AddressSpace::copy_in(std::uint32_t address,
   if (range_overflows(address, data.size())) {
     return false;
   }
-  std::unique_lock lock{mutex_};
+  if (data.empty()) return true;
+  auto lock = write_lock();
   if (!range_accessible_locked(address, data.size(), MemoryPermission::None)) {
     return false;
   }
@@ -107,18 +142,18 @@ bool AddressSpace::map_file(std::uint32_t address, std::uint32_t size,
       address % page_size != 0 || file_offset % page_size != 0) {
     return false;
   }
-  const auto backings = file_page_cache_->load_pages(path, file_offset, size);
-  if (!backings) return false;
+  const auto backing = file_page_cache_->open_mapping(path, file_offset, size);
+  if (!backing) return false;
 
-  std::unique_lock lock{mutex_};
+  auto lock = write_lock();
   const auto end = page_range_end(address, size);
   if (vm_map_.overlaps(address, end)) return false;
-  for (std::size_t index = 0; index < backings->size(); ++index) {
-    const auto base = address +
-                      static_cast<std::uint32_t>(index * page_size);
-    pages_.emplace(base, Page{(*backings)[index], 0, true, false});
-  }
+  const auto [mapping, inserted] = file_mappings_.emplace(
+      address, FileMapping{end, file_offset, *backing});
+  static_cast<void>(mapping);
+  if (!inserted) return false;
   vm_map_.map_or(address, end, permissions);
+  add_page_permissions_locked(address, end, permissions);
   return true;
 }
 
@@ -129,23 +164,25 @@ AddressSpace::share_pages(std::uint32_t address, std::uint32_t size) {
     return std::nullopt;
   }
 
-  std::unique_lock lock{mutex_};
+  auto lock = write_lock();
   const auto end = page_range_end(address, size);
-  if (!vm_map_.accessible(address, end, MemoryPermission::None))
+  if (!range_accessible_locked(address, size, MemoryPermission::None))
     return std::nullopt;
 
   std::vector<std::shared_ptr<GuestPageBacking>> result;
   result.reserve(size / page_size);
   for (std::uint64_t base = address; base < end; base += page_size) {
-    auto &page = pages_[static_cast<std::uint32_t>(base)];
+    auto &page = ensure_page_locked(static_cast<std::uint32_t>(base));
     if (!page.backing) {
       page.backing = std::make_shared<GuestPageBacking>();
     } else if (page.file_cached ||
-               (!page.shared_writable && !page.backing.unique())) {
+               (page.copy_on_write_possible && !page.shared_writable &&
+                !page.backing.unique())) {
       page.backing = std::make_shared<GuestPageBacking>(*page.backing);
     }
     page.file_cached = false;
     page.shared_writable = true;
+    page.copy_on_write_possible = false;
     result.push_back(page.backing);
   }
   return result;
@@ -164,100 +201,321 @@ bool AddressSpace::map_page_backings(
     return false;
   }
 
-  std::unique_lock lock{mutex_};
+  auto lock = write_lock();
   const auto end = page_range_end(address, size);
   if (vm_map_.overlaps(address, end)) return false;
   const auto shared_writable = mode == PageMappingMode::Shared;
   for (std::size_t index = 0; index < backings.size(); ++index) {
     const auto base =
         address + static_cast<std::uint32_t>(index * page_size);
-    pages_.emplace(base, Page{backings[index], 0, false, shared_writable});
+    auto [page, inserted] = pages_.emplace(
+        base, Page{backings[index], 0, false, shared_writable,
+                   !shared_writable});
+    if (!inserted) return false;
+    cache_page_locked(base, page->second);
   }
   vm_map_.map_or(address, end, permissions);
+  add_page_permissions_locked(address, end, permissions);
   return true;
 }
 
 std::optional<std::vector<std::byte>>
 AddressSpace::read_bytes(std::uint32_t address, std::size_t size) const {
-  std::shared_lock lock{mutex_};
-  if (!range_accessible_locked(address, size, MemoryPermission::Read)) {
-    return std::nullopt;
-  }
-  std::vector<std::byte> result(size);
-  std::size_t copied = 0;
-  while (copied < size) {
-    const auto current = address + static_cast<std::uint32_t>(copied);
-    const auto *page = find_page_locked(current);
-    const auto offset = current & (page_size - 1U);
-    const auto chunk =
-        std::min<std::size_t>(page_size - offset, size - copied);
-    if (page != nullptr && page->backing) {
-      std::copy_n(page->backing->bytes.begin() + offset, chunk,
-                  result.begin() + static_cast<std::ptrdiff_t>(copied));
-    } else {
-      std::fill_n(result.begin() + static_cast<std::ptrdiff_t>(copied), chunk,
-                  std::byte{});
+  for (;;) {
+    {
+      auto lock = read_lock();
+      if (!range_accessible_locked(address, size, MemoryPermission::Read)) {
+        return std::nullopt;
+      }
+      if (!range_needs_file_fault_locked(address, size)) {
+        std::vector<std::byte> result(size);
+        std::size_t copied = 0;
+        while (copied < size) {
+          const auto current = address + static_cast<std::uint32_t>(copied);
+          const auto *page = find_page_locked(current);
+          const auto offset = current & (page_size - 1U);
+          const auto chunk =
+              std::min<std::size_t>(page_size - offset, size - copied);
+          if (page != nullptr && page->backing) {
+            std::copy_n(page->backing->bytes.begin() + offset, chunk,
+                        result.begin() + static_cast<std::ptrdiff_t>(copied));
+          } else {
+            std::fill_n(
+                result.begin() + static_cast<std::ptrdiff_t>(copied), chunk,
+                std::byte{});
+          }
+          copied += chunk;
+        }
+        return result;
+      }
     }
-    copied += chunk;
+    if (!const_cast<AddressSpace *>(this)->fault_file_pages(address, size)) {
+      return std::nullopt;
+    }
   }
-  return result;
 }
 
 std::optional<std::string>
 AddressSpace::read_c_string(std::uint32_t address,
                             std::size_t maximum_size) const {
-  std::shared_lock lock{mutex_};
   std::string result;
   result.reserve(std::min<std::size_t>(maximum_size, 256));
-  for (std::size_t i = 0; i < maximum_size; ++i) {
-    if (range_overflows(address, i + 1)) {
+  std::size_t consumed = 0;
+  while (consumed < maximum_size) {
+    if (range_overflows(address, consumed + 1U)) return std::nullopt;
+    const auto current = address + static_cast<std::uint32_t>(consumed);
+    bool needs_fault = false;
+    {
+      auto lock = read_lock();
+      if (!range_accessible_locked(current, 1, MemoryPermission::Read)) {
+        return std::nullopt;
+      }
+      const auto *page = find_page_locked(current);
+      if ((page == nullptr || !page->backing) &&
+          find_file_mapping_locked(current) != nullptr) {
+        needs_fault = true;
+      } else {
+        const auto offset = current & (page_size - 1U);
+        const auto chunk = std::min<std::size_t>(
+            page_size - offset, maximum_size - consumed);
+        if (page == nullptr || !page->backing) return result;
+        for (std::size_t index = 0; index < chunk; ++index) {
+          const auto value =
+              std::to_integer<char>(page->backing->bytes[offset + index]);
+          if (value == '\0') return result;
+          result.push_back(value);
+        }
+        consumed += chunk;
+      }
+    }
+    if (needs_fault &&
+        !const_cast<AddressSpace *>(this)->fault_file_pages(current, 1)) {
       return std::nullopt;
     }
-    const auto current = address + static_cast<std::uint32_t>(i);
-    if (!range_accessible_locked(current, 1, MemoryPermission::Read)) {
-      return std::nullopt;
-    }
-    const auto *page = find_page_locked(current);
-    const auto value = std::to_integer<char>(
-        read_byte_locked(page, current & (page_size - 1U)));
-    if (value == '\0') {
-      return result;
-    }
-    result.push_back(value);
   }
   return std::nullopt;
 }
 
 const AddressSpace::Page *
 AddressSpace::find_page_locked(std::uint32_t address) const {
-  const auto it = pages_.find(page_base(address));
-  return it == pages_.end() ? nullptr : &it->second;
+  const auto index = static_cast<std::size_t>(address / page_size);
+  const auto &chunk = page_lookup_[index / page_lookup_chunk_size];
+  return chunk ? (*chunk)[index % page_lookup_chunk_size] : nullptr;
 }
 
 AddressSpace::Page *AddressSpace::find_page_locked(std::uint32_t address) {
-  const auto it = pages_.find(page_base(address));
-  return it == pages_.end() ? nullptr : &it->second;
+  const auto index = static_cast<std::size_t>(address / page_size);
+  const auto &chunk = page_lookup_[index / page_lookup_chunk_size];
+  return chunk ? (*chunk)[index % page_lookup_chunk_size] : nullptr;
+}
+
+const AddressSpace::FileMapping *
+AddressSpace::find_file_mapping_locked(std::uint32_t address) const {
+  const auto after = file_mappings_.upper_bound(address);
+  if (after == file_mappings_.begin()) return nullptr;
+  const auto mapping = std::prev(after);
+  return address < mapping->second.end ? &mapping->second : nullptr;
 }
 
 AddressSpace::Page &AddressSpace::ensure_page_locked(std::uint32_t address) {
-  return pages_[page_base(address)];
+  const auto base = page_base(address);
+  auto [page, inserted] = pages_.try_emplace(base);
+  if (!page->second.backing) {
+    if (const auto *mapping = find_file_mapping_locked(base)) {
+      const auto mapping_start = static_cast<std::uint64_t>(
+          std::prev(file_mappings_.upper_bound(base))->first);
+      const auto file_offset =
+          mapping->file_offset + (static_cast<std::uint64_t>(base) -
+                                  mapping_start);
+      const auto byte_count = static_cast<std::uint32_t>(
+          std::min<std::uint64_t>(page_size,
+                                  mapping->backing->end_offset - file_offset));
+      auto backing = file_page_cache_->load_page(
+          mapping->backing, file_offset, byte_count);
+      // A resident AddressSpace page always owns fully initialized bytes.
+      // Page-in remains lazy at the range level, while ordinary guest reads
+      // no longer re-enter GuestPageBacking's one-time materialization lock.
+      backing->materialize();
+      page->second.backing = std::move(backing);
+      page->second.file_cached = true;
+      page->second.copy_on_write_possible = true;
+    }
+  }
+  if (inserted) cache_page_locked(base, page->second);
+  return page->second;
+}
+
+bool AddressSpace::range_needs_file_fault_locked(std::uint32_t address,
+                                                 std::size_t size) const {
+  if (size == 0 || range_overflows(address, size)) return false;
+  const auto first = page_base(address);
+  const auto end = page_range_end(address, size);
+  for (std::uint64_t base = first; base < end; base += page_size) {
+    const auto current = static_cast<std::uint32_t>(base);
+    const auto *page = find_page_locked(current);
+    if ((page == nullptr || !page->backing) &&
+        find_file_mapping_locked(current) != nullptr) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool AddressSpace::fault_file_pages(std::uint32_t address,
+                                    std::size_t size) {
+  if (size == 0 || range_overflows(address, size)) return size == 0;
+  auto lock = write_lock();
+  if (!range_accessible_locked(address, size, MemoryPermission::None)) {
+    return false;
+  }
+  const auto first = page_base(address);
+  const auto end = page_range_end(address, size);
+  for (std::uint64_t base = first; base < end; base += page_size) {
+    const auto current = static_cast<std::uint32_t>(base);
+    const auto *page = find_page_locked(current);
+    if (page != nullptr && page->backing) continue;
+
+    const auto mapping_after = file_mappings_.upper_bound(current);
+    if (mapping_after == file_mappings_.begin()) continue;
+    const auto mapping_entry = std::prev(mapping_after);
+    const auto mapping_start = mapping_entry->first;
+    const auto &mapping = mapping_entry->second;
+    if (current >= mapping.end) continue;
+
+    constexpr std::uint64_t cluster_bytes =
+        guest_file_prefetch_pages * page_size;
+    const auto current_file_offset =
+        mapping.file_offset +
+        (static_cast<std::uint64_t>(current) - mapping_start);
+    const auto cluster_file_start = std::max<std::uint64_t>(
+        mapping.backing->first_offset,
+        current_file_offset & ~(cluster_bytes - 1U));
+    const auto cluster_file_end = std::min<std::uint64_t>(
+        mapping.backing->end_offset, cluster_file_start + cluster_bytes);
+    const auto cluster_guest_start =
+        static_cast<std::uint64_t>(mapping_start) +
+        (cluster_file_start - mapping.file_offset);
+
+    for (std::uint64_t file_page = cluster_file_start,
+                       guest_page = cluster_guest_start;
+         file_page < cluster_file_end && guest_page < mapping.end;
+         file_page += page_size, guest_page += page_size) {
+      const auto guest_base = static_cast<std::uint32_t>(guest_page);
+      auto [resident, inserted] = pages_.try_emplace(guest_base);
+      if (!resident->second.backing) {
+        const auto byte_count = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(page_size,
+                                    cluster_file_end - file_page));
+        auto backing = file_page_cache_->load_page(
+            mapping.backing, file_page, byte_count);
+        // The vnode-style cluster fault publishes ready pages as one unit.
+        // GuestFileBacking performs only one host read for the cluster; the
+        // remaining calls consume its prefetched pages.
+        backing->materialize();
+        resident->second.backing = std::move(backing);
+        resident->second.file_cached = true;
+        resident->second.copy_on_write_possible = true;
+      }
+      if (inserted) cache_page_locked(guest_base, resident->second);
+    }
+  }
+  return true;
+}
+
+void AddressSpace::unmap_file_mappings_locked(std::uint32_t address,
+                                              std::uint64_t end) {
+  if (file_mappings_.empty()) return;
+  auto mapping = file_mappings_.lower_bound(address);
+  if (mapping != file_mappings_.begin()) {
+    const auto previous = std::prev(mapping);
+    if (previous->second.end > address) mapping = previous;
+  }
+
+  std::vector<std::pair<std::uint32_t, FileMapping>> replacements;
+  const auto make_backing = [](const GuestFileBacking &source,
+                               std::uint64_t first_offset,
+                               std::uint64_t end_offset) {
+    auto backing = std::make_shared<GuestFileBacking>(
+        source.path, first_offset, end_offset);
+    backing->cache_path = source.cache_path;
+    backing->file_size = source.file_size;
+    backing->modified = source.modified;
+    return backing;
+  };
+
+  while (mapping != file_mappings_.end() && mapping->first < end) {
+    const auto start = mapping->first;
+    const auto source = mapping->second;
+    if (source.end <= address) {
+      ++mapping;
+      continue;
+    }
+    mapping = file_mappings_.erase(mapping);
+
+    if (start < address) {
+      const auto left_file_end = std::min<std::uint64_t>(
+          source.backing->end_offset,
+          source.file_offset +
+              (static_cast<std::uint64_t>(address) - start));
+      replacements.emplace_back(
+          start, FileMapping{address, source.file_offset,
+                             make_backing(*source.backing, source.file_offset,
+                                          left_file_end)});
+    }
+    if (source.end > end) {
+      const auto right_start = static_cast<std::uint32_t>(end);
+      const auto right_file_offset =
+          source.file_offset + (end - static_cast<std::uint64_t>(start));
+      replacements.emplace_back(
+          right_start,
+          FileMapping{source.end, right_file_offset,
+                      make_backing(*source.backing, right_file_offset,
+                                   source.backing->end_offset)});
+    }
+  }
+  for (auto &replacement : replacements) {
+    file_mappings_.emplace(replacement.first,
+                           std::move(replacement.second));
+  }
+}
+
+void AddressSpace::cache_page_locked(std::uint32_t address, Page &page) {
+  const auto index = static_cast<std::size_t>(address / page_size);
+  auto &chunk = page_lookup_[index / page_lookup_chunk_size];
+  if (!chunk) chunk = std::make_unique<PageLookupChunk>();
+  (*chunk)[index % page_lookup_chunk_size] = &page;
+}
+
+void AddressSpace::uncache_page_locked(std::uint32_t address) {
+  const auto index = static_cast<std::size_t>(address / page_size);
+  auto &chunk = page_lookup_[index / page_lookup_chunk_size];
+  if (chunk) (*chunk)[index % page_lookup_chunk_size] = nullptr;
+}
+
+void AddressSpace::rebuild_page_lookup_locked() {
+  for (auto &chunk : page_lookup_) chunk.reset();
+  for (auto &[address, page] : pages_) cache_page_locked(address, page);
 }
 
 std::byte AddressSpace::read_byte_locked(const Page *page,
                                          std::uint32_t offset) {
-  return page != nullptr && page->backing ? page->backing->bytes[offset]
-                                           : std::byte{};
+  if (page == nullptr || !page->backing) return std::byte{};
+  return page->backing->bytes[offset];
 }
 
 GuestPageBacking &
 AddressSpace::writable_backing_locked(Page &page) {
   if (!page.backing) {
     page.backing = std::make_shared<GuestPageBacking>();
-  } else if (page.file_cached ||
-             (!page.shared_writable && !page.backing.unique())) {
-    page.backing = std::make_shared<GuestPageBacking>(*page.backing);
+  } else {
+    if (page.file_cached ||
+        (page.copy_on_write_possible && !page.shared_writable &&
+         !page.backing.unique())) {
+      page.backing = std::make_shared<GuestPageBacking>(*page.backing);
+    }
   }
   page.file_cached = false;
+  page.copy_on_write_possible = false;
   return *page.backing;
 }
 
@@ -269,8 +527,8 @@ void AddressSpace::mark_written_locked(std::uint32_t address,
   const auto last = page_base(
       address + static_cast<std::uint32_t>(size - 1U));
   for (std::uint64_t base = first; base <= last; base += page_size) {
-    pages_.at(static_cast<std::uint32_t>(base)).write_generation =
-        write_generation_;
+    auto *page = find_page_locked(static_cast<std::uint32_t>(base));
+    if (page != nullptr) page->write_generation = write_generation_;
   }
 }
 
@@ -284,34 +542,75 @@ bool AddressSpace::range_accessible_locked(std::uint32_t address,
     return true;
   }
   const auto first = page_base(address);
-  return vm_map_.accessible(first, page_range_end(address, size), access);
+  const auto end = page_range_end(address, size);
+  const auto required = permission_bits(access);
+  for (std::uint64_t base = first; base < end; base += page_size) {
+    const auto flags = page_permissions_[base / page_size];
+    if ((flags & mapped_page_flag) == 0U || (flags & required) != required)
+      return false;
+  }
+  return true;
 }
 
 template <typename T>
 std::optional<T> AddressSpace::read_integer(std::uint32_t address,
                                             MemoryPermission access) const {
   static_assert(std::is_unsigned_v<T>);
-  std::shared_lock lock{mutex_};
-  if (!range_accessible_locked(address, sizeof(T), access)) {
-    return std::nullopt;
+  for (;;) {
+    {
+      auto lock = read_lock();
+      if (!range_accessible_locked(address, sizeof(T), access)) {
+        return std::nullopt;
+      }
+      const auto offset = address & (page_size - 1U);
+      if (offset <= page_size - sizeof(T)) {
+        const auto *page = find_page_locked(address);
+        if (page != nullptr && page->backing) {
+          T value = 0;
+          for (std::size_t index = 0; index < sizeof(T); ++index) {
+            value |= static_cast<T>(
+                std::to_integer<T>(page->backing->bytes[offset + index])
+                << (index * 8U));
+          }
+          return value;
+        }
+        if (find_file_mapping_locked(address) == nullptr) return T{};
+      } else if (!range_needs_file_fault_locked(address, sizeof(T))) {
+        T value = 0;
+        for (std::size_t i = 0; i < sizeof(T); ++i) {
+          const auto current = address + static_cast<std::uint32_t>(i);
+          const auto *page = find_page_locked(current);
+          const auto byte = std::to_integer<T>(
+              read_byte_locked(page, current & (page_size - 1U)));
+          value |= static_cast<T>(byte << (i * 8U));
+        }
+        return value;
+      }
+    }
+    if (!const_cast<AddressSpace *>(this)->fault_file_pages(address,
+                                                            sizeof(T))) {
+      return std::nullopt;
+    }
   }
-  T value = 0;
-  for (std::size_t i = 0; i < sizeof(T); ++i) {
-    const auto current = address + static_cast<std::uint32_t>(i);
-    const auto *page = find_page_locked(current);
-    const auto byte = std::to_integer<T>(
-        read_byte_locked(page, current & (page_size - 1U)));
-    value |= static_cast<T>(byte << (i * 8U));
-  }
-  return value;
 }
 
 template <typename T>
 bool AddressSpace::write_integer(std::uint32_t address, T value) {
   static_assert(std::is_unsigned_v<T>);
-  std::unique_lock lock{mutex_};
+  auto lock = write_lock();
   if (!range_accessible_locked(address, sizeof(T), MemoryPermission::Write)) {
     return false;
+  }
+  const auto offset = address & (page_size - 1U);
+  if (offset <= page_size - sizeof(T)) {
+    auto &page = ensure_page_locked(address);
+    auto &backing = writable_backing_locked(page);
+    for (std::size_t index = 0; index < sizeof(T); ++index) {
+      backing.bytes[offset + index] = static_cast<std::byte>(
+          (value >> (index * 8U)) & static_cast<T>(0xffU));
+    }
+    page.write_generation = ++write_generation_;
+    return true;
   }
   for (std::size_t i = 0; i < sizeof(T); ++i) {
     const auto current = address + static_cast<std::uint32_t>(i);
@@ -327,19 +626,38 @@ template <typename T>
 bool AddressSpace::compare_exchange_integer(std::uint32_t address, T expected,
                                             T value) {
   static_assert(std::is_unsigned_v<T>);
-  std::unique_lock lock{mutex_};
+  auto lock = write_lock();
   if (!range_accessible_locked(address, sizeof(T),
                                MemoryPermission::Read |
                                    MemoryPermission::Write)) {
     return false;
   }
+  const auto offset = address & (page_size - 1U);
+  if (offset <= page_size - sizeof(T)) {
+    auto &page = ensure_page_locked(address);
+    T current_value = 0;
+    for (std::size_t index = 0; index < sizeof(T); ++index) {
+      current_value |= static_cast<T>(
+          std::to_integer<T>(read_byte_locked(
+              &page, offset + static_cast<std::uint32_t>(index)))
+          << (index * 8U));
+    }
+    if (current_value != expected) return false;
+    auto &backing = writable_backing_locked(page);
+    for (std::size_t index = 0; index < sizeof(T); ++index) {
+      backing.bytes[offset + index] = static_cast<std::byte>(
+          (value >> (index * 8U)) & static_cast<T>(0xffU));
+    }
+    page.write_generation = ++write_generation_;
+    return true;
+  }
   T current_value = 0;
   for (std::size_t i = 0; i < sizeof(T); ++i) {
     const auto current = address + static_cast<std::uint32_t>(i);
-    const auto *page = find_page_locked(current);
+    auto &page = ensure_page_locked(current);
     current_value |= static_cast<T>(
         std::to_integer<T>(
-            read_byte_locked(page, current & (page_size - 1U)))
+            read_byte_locked(&page, current & (page_size - 1U)))
         << (i * 8U));
   }
   if (current_value != expected) {
@@ -359,19 +677,37 @@ template <typename T>
 std::optional<T> AddressSpace::exchange_integer(std::uint32_t address,
                                                 T value) {
   static_assert(std::is_unsigned_v<T>);
-  std::unique_lock lock{mutex_};
+  auto lock = write_lock();
   if (!range_accessible_locked(address, sizeof(T),
                                MemoryPermission::Read |
                                    MemoryPermission::Write)) {
     return std::nullopt;
   }
+  const auto offset = address & (page_size - 1U);
+  if (offset <= page_size - sizeof(T)) {
+    auto &page = ensure_page_locked(address);
+    T previous = 0;
+    for (std::size_t index = 0; index < sizeof(T); ++index) {
+      previous |= static_cast<T>(
+          std::to_integer<T>(read_byte_locked(
+              &page, offset + static_cast<std::uint32_t>(index)))
+          << (index * 8U));
+    }
+    auto &backing = writable_backing_locked(page);
+    for (std::size_t index = 0; index < sizeof(T); ++index) {
+      backing.bytes[offset + index] = static_cast<std::byte>(
+          (value >> (index * 8U)) & static_cast<T>(0xffU));
+    }
+    page.write_generation = ++write_generation_;
+    return previous;
+  }
   T previous = 0;
   for (std::size_t index = 0; index < sizeof(T); ++index) {
     const auto current = address + static_cast<std::uint32_t>(index);
-    const auto *page = find_page_locked(current);
+    auto &page = ensure_page_locked(current);
     previous |= static_cast<T>(
         std::to_integer<T>(
-            read_byte_locked(page, current & (page_size - 1U)))
+            read_byte_locked(&page, current & (page_size - 1U)))
         << (index * 8U));
   }
   for (std::size_t index = 0; index < sizeof(T); ++index) {
@@ -417,7 +753,7 @@ bool AddressSpace::write64(std::uint32_t address, std::uint64_t value) {
 
 bool AddressSpace::accessible(std::uint32_t address, std::size_t size,
                               MemoryPermission access) const {
-  std::shared_lock lock{mutex_};
+  auto lock = read_lock();
   return range_accessible_locked(address, size, access);
 }
 
@@ -453,7 +789,7 @@ std::optional<std::uint32_t> AddressSpace::exchange32(std::uint32_t address,
 }
 
 bool AddressSpace::mapped(std::uint32_t address, std::size_t size) const {
-  std::shared_lock lock{mutex_};
+  auto lock = read_lock();
   return range_accessible_locked(address, size, MemoryPermission::None);
 }
 
@@ -463,28 +799,26 @@ std::optional<std::uint64_t> AddressSpace::range_write_generation(
   const auto first = page_base(address);
   const auto last = page_base(
       address + static_cast<std::uint32_t>(size - 1U));
-  std::shared_lock lock{mutex_};
-  if (!vm_map_.accessible(first, page_range_end(address, size),
-                          MemoryPermission::None)) {
+  auto lock = read_lock();
+  if (!range_accessible_locked(address, size, MemoryPermission::None)) {
     return std::nullopt;
   }
   std::uint64_t generation = 0;
   for (std::uint64_t base = first; base <= last; base += page_size) {
-    const auto page = pages_.find(static_cast<std::uint32_t>(base));
-    if (page != pages_.end()) {
-      generation = std::max(generation, page->second.write_generation);
-    }
+    const auto *page = find_page_locked(static_cast<std::uint32_t>(base));
+    if (page != nullptr)
+      generation = std::max(generation, page->write_generation);
   }
   return generation;
 }
 
 std::size_t AddressSpace::mapped_page_count() const {
-  std::shared_lock lock{mutex_};
+  auto lock = read_lock();
   return vm_map_.page_count(page_size);
 }
 
 std::size_t AddressSpace::resident_page_count() const {
-  std::shared_lock lock{mutex_};
+  auto lock = read_lock();
   return static_cast<std::size_t>(
       std::count_if(pages_.begin(), pages_.end(), [](const auto &entry) {
         return static_cast<bool>(entry.second.backing);
@@ -492,7 +826,7 @@ std::size_t AddressSpace::resident_page_count() const {
 }
 
 std::size_t AddressSpace::shared_page_count() const {
-  std::shared_lock lock{mutex_};
+  auto lock = read_lock();
   return static_cast<std::size_t>(
       std::count_if(pages_.begin(), pages_.end(), [](const auto &entry) {
         return entry.second.backing && !entry.second.backing.unique();
@@ -500,7 +834,7 @@ std::size_t AddressSpace::shared_page_count() const {
 }
 
 std::size_t AddressSpace::cached_file_mapping_count() const {
-  std::shared_lock lock{mutex_};
+  auto lock = read_lock();
   return static_cast<std::size_t>(
       std::count_if(pages_.begin(), pages_.end(), [](const auto &entry) {
         return entry.second.file_cached;
@@ -512,19 +846,56 @@ std::size_t AddressSpace::cached_file_page_count() const {
 }
 
 std::size_t AddressSpace::mapping_region_count() const {
-  std::shared_lock lock{mutex_};
+  auto lock = read_lock();
   return vm_map_.region_count();
 }
 
 std::unique_ptr<AddressSpace> AddressSpace::clone() const {
   auto result = std::make_unique<AddressSpace>();
-  std::shared_lock source_lock{mutex_};
+  std::unique_lock source_lock{mutex_};
   std::unique_lock destination_lock{result->mutex_};
   result->vm_map_ = vm_map_;
+  for (const auto &[address, page] : pages_) {
+    static_cast<void>(address);
+    if (page.backing && !page.shared_writable) {
+      page.copy_on_write_possible = true;
+    }
+  }
   result->pages_ = pages_;
+  result->file_mappings_ = file_mappings_;
+  result->rebuild_page_lookup_locked();
+  result->page_permissions_ = page_permissions_;
   result->write_generation_ = write_generation_;
   result->file_page_cache_ = file_page_cache_;
+  result->parallel_access_ = parallel_access_;
   return result;
+}
+
+void AddressSpace::add_page_permissions_locked(
+    std::uint32_t address, std::uint64_t end,
+    MemoryPermission permissions) {
+  const auto bits = permission_bits(permissions);
+  for (std::uint64_t base = address; base < end; base += page_size) {
+    page_permissions_[base / page_size] |=
+        static_cast<std::uint8_t>(mapped_page_flag | bits);
+  }
+}
+
+void AddressSpace::set_page_permissions_locked(
+    std::uint32_t address, std::uint64_t end,
+    MemoryPermission permissions) {
+  const auto flags = static_cast<std::uint8_t>(
+      mapped_page_flag | permission_bits(permissions));
+  for (std::uint64_t base = address; base < end; base += page_size) {
+    page_permissions_[base / page_size] = flags;
+  }
+}
+
+void AddressSpace::clear_page_permissions_locked(std::uint32_t address,
+                                                 std::uint64_t end) {
+  for (std::uint64_t base = address; base < end; base += page_size) {
+    page_permissions_[base / page_size] = 0U;
+  }
 }
 
 } // namespace ilegacysim

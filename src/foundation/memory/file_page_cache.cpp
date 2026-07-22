@@ -8,6 +8,9 @@
 namespace ilegacysim {
 namespace {
 
+constexpr std::uint64_t file_prefetch_bytes =
+    guest_file_prefetch_pages * guest_memory_page_size;
+
 [[nodiscard]] std::string stable_path(const std::filesystem::path &path) {
   std::error_code error;
   const auto canonical = std::filesystem::canonical(path, error);
@@ -16,15 +19,85 @@ namespace {
 
 } // namespace
 
+GuestPageBacking::GuestPageBacking(const GuestPageBacking &other) {
+  other.materialize();
+  const std::scoped_lock lock{other.mutex_};
+  bytes = other.bytes;
+}
+
+void GuestPageBacking::materialize() const {
+  if (!has_file_source_) return;
+  const std::scoped_lock page_lock{mutex_};
+  if (!file_backing_) return;
+
+  const auto file = file_backing_;
+  const std::scoped_lock file_lock{file->mutex};
+  std::fill(bytes.begin(), bytes.end(), std::byte{});
+  if (const auto prefetched_page = file->prefetched_pages.find(file_offset_);
+      prefetched_page != file->prefetched_pages.end()) {
+    bytes = prefetched_page->second;
+    file->prefetched_pages.erase(prefetched_page);
+  } else {
+    if (!file->stream) {
+      file->stream = std::make_shared<std::ifstream>(
+          file->path, std::ios::binary);
+    }
+
+    const auto aligned_start = file_offset_ & ~(file_prefetch_bytes - 1U);
+    const auto read_start = std::max(file->first_offset, aligned_start);
+    const auto read_size = std::min(file->end_offset - read_start,
+                                    file_prefetch_bytes);
+    const auto read_pages = static_cast<std::size_t>(
+        (read_size + guest_memory_page_size - 1U) /
+        guest_memory_page_size);
+    if (file->stream && file->stream->is_open()) file->stream->clear();
+    if (file->stream && file->stream->is_open() &&
+        read_start <= static_cast<std::uint64_t>(
+                          std::numeric_limits<std::streamoff>::max())) {
+      auto &stream = *file->stream;
+      stream.seekg(static_cast<std::streamoff>(read_start));
+      std::vector<std::byte> batch(static_cast<std::size_t>(read_size));
+      stream.read(reinterpret_cast<char *>(batch.data()),
+                  static_cast<std::streamsize>(batch.size()));
+      const auto received = static_cast<std::size_t>(stream.gcount());
+      if (!stream && !stream.eof()) {
+        std::fill(batch.begin(), batch.end(), std::byte{});
+      } else {
+        batch.resize(received);
+      }
+      for (std::size_t index = 0; index < read_pages; ++index) {
+        const auto offset = index * guest_memory_page_size;
+        GuestPageBytes page_bytes{};
+        if (offset < batch.size()) {
+          const auto count = std::min<std::size_t>(
+              guest_memory_page_size, batch.size() - offset);
+          std::copy_n(batch.begin() + static_cast<std::ptrdiff_t>(offset),
+                      count, page_bytes.begin());
+        }
+        const auto page_offset =
+            read_start + static_cast<std::uint64_t>(offset);
+        if (page_offset == file_offset_) {
+          bytes = page_bytes;
+        } else if (received > offset) {
+          file->prefetched_pages.emplace(page_offset,
+                                         std::move(page_bytes));
+        }
+      }
+    }
+  }
+  file_backing_.reset();
+}
+
 bool FilePageCache::Key::operator<(const Key &other) const {
   return std::tie(path, file_size, modified, file_offset, byte_count) <
          std::tie(other.path, other.file_size, other.modified,
                   other.file_offset, other.byte_count);
 }
 
-std::optional<std::vector<std::shared_ptr<GuestPageBacking>>>
-FilePageCache::load_pages(const std::filesystem::path &path,
-                          std::uint64_t file_offset, std::uint32_t size) {
+std::optional<std::shared_ptr<GuestFileBacking>>
+FilePageCache::open_mapping(const std::filesystem::path &path,
+                            std::uint64_t file_offset,
+                            std::uint32_t size) {
   if (size == 0 || file_offset % guest_memory_page_size != 0) {
     return std::nullopt;
   }
@@ -52,55 +125,63 @@ FilePageCache::load_pages(const std::filesystem::path &path,
     }
   }
 
+  const auto final_size = std::filesystem::file_size(path, error);
+  if (error || final_size != file_size) return std::nullopt;
+  const auto final_modified = std::filesystem::last_write_time(path, error);
+  if (error || final_modified != modified) return std::nullopt;
+
+  auto mapping = std::make_shared<GuestFileBacking>(
+      path, file_offset, file_offset + size);
+  mapping->cache_path = normalized_path;
+  mapping->file_size = file_size;
+  mapping->modified = modified;
+  return mapping;
+}
+
+std::shared_ptr<GuestPageBacking> FilePageCache::load_page(
+    const std::shared_ptr<GuestFileBacking> &mapping,
+    std::uint64_t file_offset, std::uint32_t byte_count) {
+  const Key key{mapping->cache_path, mapping->file_size, mapping->modified,
+                file_offset, byte_count};
+  {
+    const std::scoped_lock lock{mutex_};
+    if (const auto cached = pages_.find(key); cached != pages_.end()) {
+      return cached->second;
+    }
+  }
+
+  auto page = std::make_shared<GuestPageBacking>();
+  page->file_backing_ = mapping;
+  page->file_offset_ = file_offset;
+  page->file_byte_count_ = byte_count;
+  page->has_file_source_ = true;
+  {
+    const std::scoped_lock lock{mutex_};
+    const auto [entry, inserted] = pages_.try_emplace(key, page);
+    return inserted ? std::move(page) : entry->second;
+  }
+}
+
+std::optional<std::vector<std::shared_ptr<GuestPageBacking>>>
+FilePageCache::load_pages(const std::filesystem::path &path,
+                          std::uint64_t file_offset, std::uint32_t size) {
+  const auto mapping = open_mapping(path, file_offset, size);
+  if (!mapping) return std::nullopt;
+
   std::vector<std::shared_ptr<GuestPageBacking>> result;
   result.reserve(static_cast<std::size_t>(
       (static_cast<std::uint64_t>(size) + guest_memory_page_size - 1U) /
       guest_memory_page_size));
-  std::ifstream stream;
   for (std::uint64_t offset = file_offset;
        offset < file_offset + size; offset += guest_memory_page_size) {
     const auto byte_count = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(guest_memory_page_size,
                                 file_offset + size - offset));
-    const Key key{normalized_path, file_size, modified, offset, byte_count};
-    {
-      const std::scoped_lock lock{mutex_};
-      if (const auto cached = pages_.find(key); cached != pages_.end()) {
-        result.push_back(cached->second);
-        continue;
-      }
-    }
-
-    if (!stream.is_open()) {
-      stream.open(path, std::ios::binary);
-      if (!stream) return std::nullopt;
-    }
     if (offset > static_cast<std::uint64_t>(
                      std::numeric_limits<std::streamoff>::max())) {
       return std::nullopt;
     }
-    auto page = std::make_shared<GuestPageBacking>();
-    stream.clear();
-    stream.seekg(static_cast<std::streamoff>(offset));
-    stream.read(reinterpret_cast<char *>(page->bytes.data()),
-                static_cast<std::streamsize>(byte_count));
-    if (!stream ||
-        static_cast<std::size_t>(stream.gcount()) != byte_count) {
-      return std::nullopt;
-    }
-
-    {
-      const std::scoped_lock lock{mutex_};
-      const auto [entry, inserted] = pages_.try_emplace(key, page);
-      result.push_back(inserted ? std::move(page) : entry->second);
-    }
-  }
-
-  const auto final_size = std::filesystem::file_size(path, error);
-  if (error || final_size != file_size) return std::nullopt;
-  const auto final_modified = std::filesystem::last_write_time(path, error);
-  if (error || final_modified != modified) {
-    return std::nullopt;
+    result.push_back(load_page(*mapping, offset, byte_count));
   }
   return result;
 }

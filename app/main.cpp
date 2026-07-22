@@ -639,6 +639,7 @@ void boot(const std::vector<std::string> &args, Output &output) {
           : std::vector<std::byte>{};
 
   auto initial_memory = std::make_unique<AddressSpace>();
+  initial_memory->set_parallel_access(guest_processor_count > 1);
   ProcessLoader loader{*rootfs, *initial_memory};
   std::vector<std::string> initial_environment{
       "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/var/root",

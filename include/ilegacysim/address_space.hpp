@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <span>
@@ -28,8 +29,15 @@ struct MemoryFault {
 class AddressSpace {
 public:
   static constexpr std::uint32_t page_size = guest_memory_page_size;
+  static constexpr std::size_t page_count =
+      (std::uint64_t{1} << 32U) / page_size;
 
   AddressSpace();
+
+  // Selects the synchronization policy before guest execution starts. The
+  // physical single-core device runs all memory access on the scheduler
+  // thread; optional multi-core sessions retain shared/exclusive locking.
+  void set_parallel_access(bool enabled);
 
   bool map(std::uint32_t address, std::uint32_t size,
            MemoryPermission permissions);
@@ -120,7 +128,21 @@ private:
     std::uint64_t write_generation{};
     bool file_cached{};
     bool shared_writable{};
+    // Avoid an atomic shared_ptr use-count read on every guest store. This is
+    // set only when fork/file/private-object sharing can require a detach.
+    mutable bool copy_on_write_possible{};
   };
+  struct FileMapping {
+    std::uint64_t end{};
+    std::uint64_t file_offset{};
+    std::shared_ptr<GuestFileBacking> backing;
+  };
+  static constexpr std::size_t page_lookup_chunk_size = 1024;
+  static constexpr std::size_t page_lookup_chunk_count =
+      page_count / page_lookup_chunk_size;
+  using PageLookupChunk = std::array<Page *, page_lookup_chunk_size>;
+  using ReadLock = std::shared_lock<std::shared_mutex>;
+  using WriteLock = std::unique_lock<std::shared_mutex>;
 
   template <typename T>
   [[nodiscard]] std::optional<T> read_integer(std::uint32_t address,
@@ -137,15 +159,46 @@ private:
                                              MemoryPermission access) const;
   [[nodiscard]] const Page *find_page_locked(std::uint32_t address) const;
   [[nodiscard]] Page *find_page_locked(std::uint32_t address);
+  [[nodiscard]] const FileMapping *
+  find_file_mapping_locked(std::uint32_t address) const;
   [[nodiscard]] Page &ensure_page_locked(std::uint32_t address);
+  [[nodiscard]] bool range_needs_file_fault_locked(
+      std::uint32_t address, std::size_t size) const;
+  [[nodiscard]] bool fault_file_pages(std::uint32_t address,
+                                      std::size_t size);
+  void unmap_file_mappings_locked(std::uint32_t address, std::uint64_t end);
+  void cache_page_locked(std::uint32_t address, Page &page);
+  void uncache_page_locked(std::uint32_t address);
+  void rebuild_page_lookup_locked();
   [[nodiscard]] static std::byte read_byte_locked(const Page *page,
                                                   std::uint32_t offset);
   [[nodiscard]] static GuestPageBacking &writable_backing_locked(Page &page);
   void mark_written_locked(std::uint32_t address, std::size_t size);
+  void add_page_permissions_locked(std::uint32_t address, std::uint64_t end,
+                                   MemoryPermission permissions);
+  void set_page_permissions_locked(std::uint32_t address, std::uint64_t end,
+                                   MemoryPermission permissions);
+  void clear_page_permissions_locked(std::uint32_t address,
+                                     std::uint64_t end);
+  [[nodiscard]] ReadLock read_lock() const;
+  [[nodiscard]] WriteLock write_lock();
 
   mutable std::shared_mutex mutex_;
+  bool parallel_access_{true};
   VmMap vm_map_;
   std::map<std::uint32_t, Page> pages_;
+  // File-backed vm_map entries remain range metadata until a guest access
+  // faults an individual page into pages_. This mirrors XNU's vnode pager and
+  // avoids constructing thousands of page objects during mmap.
+  std::map<std::uint32_t, FileMapping> file_mappings_;
+  // Sparse two-level lookup for resident pages. Tree ownership preserves
+  // efficient range unmap while CPU callbacks avoid a tree search.
+  std::array<std::unique_ptr<PageLookupChunk>, page_lookup_chunk_count>
+      page_lookup_{};
+  // The interval map remains the source of truth for VM operations. This dense
+  // byte index is kept in sync so the per-instruction CPU callbacks can check
+  // the overwhelmingly common one-page access without a tree lookup.
+  std::vector<std::uint8_t> page_permissions_;
   std::uint64_t write_generation_{};
   std::shared_ptr<FilePageCache> file_page_cache_;
 };

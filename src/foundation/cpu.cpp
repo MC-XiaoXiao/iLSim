@@ -233,10 +233,14 @@ private:
 
 Cpu::Cpu(
     std::size_t processor_id, AddressSpace& memory, Dynarmic::ExclusiveMonitor& monitor)
-    : processor_id_{processor_id}, callbacks_{std::make_unique<Callbacks>(memory)} {
+    : processor_id_{processor_id}, monitor_{&monitor},
+      callbacks_{std::make_unique<Callbacks>(memory)} {}
+
+void Cpu::ensure_jit() {
+    if (jit_) return;
     Dynarmic::A32::UserConfig config{callbacks_.get()};
-    config.processor_id = processor_id;
-    config.global_monitor = &monitor;
+    config.processor_id = processor_id_;
+    config.global_monitor = monitor_;
     config.arch_version = Dynarmic::A32::ArchVersion::v6K;
     config.always_little_endian = true;
     config.enable_cycle_counting = true;
@@ -248,24 +252,32 @@ Cpu::Cpu(
 Cpu::~Cpu() = default;
 
 CpuRunResult Cpu::run(std::uint64_t ticks) {
+    ensure_jit();
     callbacks_->begin(ticks);
     return callbacks_->result(jit_->Run());
 }
 
 CpuRunResult Cpu::step() {
+    ensure_jit();
     callbacks_->begin(1);
     return callbacks_->result(jit_->Step());
 }
 
-void Cpu::reset() { jit_->Reset(); }
-void Cpu::clear_cache() { jit_->ClearCache(); }
+void Cpu::reset() {
+    ensure_jit();
+    jit_->Reset();
+}
+void Cpu::clear_cache() {
+    if (jit_) jit_->ClearCache();
+}
 void Cpu::invalidate_cache_range(std::uint32_t address, std::size_t length) {
-    if (length != 0) {
+    if (jit_ && length != 0) {
         jit_->InvalidateCacheRange(address, length);
     }
 }
 void Cpu::clear_halt() {
     requested_halt_reason_ = {};
+    if (!jit_) return;
     jit_->ClearHalt(Dynarmic::HaltReason::MemoryAbort |
                     Dynarmic::HaltReason::UserDefined1 |
                     Dynarmic::HaltReason::UserDefined2 |
@@ -278,7 +290,7 @@ void Cpu::clear_halt() {
 }
 void Cpu::halt(Dynarmic::HaltReason reason) {
     requested_halt_reason_ = requested_halt_reason_ | reason;
-    jit_->HaltExecution(reason);
+    if (jit_) jit_->HaltExecution(reason);
 }
 
 Dynarmic::HaltReason Cpu::consume_requested_halt_reason() {
@@ -287,10 +299,22 @@ Dynarmic::HaltReason Cpu::consume_requested_halt_reason() {
     return reason;
 }
 
-std::array<std::uint32_t, 16>& Cpu::registers() { return jit_->Regs(); }
-const std::array<std::uint32_t, 16>& Cpu::registers() const { return jit_->Regs(); }
-std::uint32_t Cpu::cpsr() const { return jit_->Cpsr(); }
-void Cpu::set_cpsr(std::uint32_t value) { jit_->SetCpsr(value); }
+std::array<std::uint32_t, 16>& Cpu::registers() {
+    ensure_jit();
+    return jit_->Regs();
+}
+const std::array<std::uint32_t, 16>& Cpu::registers() const {
+    const_cast<Cpu*>(this)->ensure_jit();
+    return jit_->Regs();
+}
+std::uint32_t Cpu::cpsr() const {
+    const_cast<Cpu*>(this)->ensure_jit();
+    return jit_->Cpsr();
+}
+void Cpu::set_cpsr(std::uint32_t value) {
+    ensure_jit();
+    jit_->SetCpsr(value);
+}
 void Cpu::set_svc_handler(SvcHandler handler) { callbacks_->set_svc_handler(std::move(handler)); }
 void Cpu::set_svc_dispatch_mode(SvcDispatchMode mode) {
     callbacks_->set_svc_dispatch_mode(mode);
