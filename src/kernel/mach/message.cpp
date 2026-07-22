@@ -1,4 +1,5 @@
 #include "ilegacysim/bootstrap_mig_ids.hpp"
+#include "ilegacysim/celestial_volume_protocol.hpp"
 #include "ilegacysim/darwin_abi.hpp"
 #include "ilegacysim/darwin_kqueue_abi.hpp"
 #include "ilegacysim/darwin_network_abi.hpp"
@@ -467,6 +468,16 @@ void CompatibilityKernel::dispatch_mach_message(Cpu &cpu) {
       }
     }
     if (routable) {
+      if (bytes) {
+        if (const auto update = celestial_volume_protocol::decode_reply(
+                *message_id, *bytes)) {
+          audio_service_->observe_category_volume(update->category,
+                                                   update->value);
+          output_.write("[audio] category-volume category=" +
+                        update->category + " value=" +
+                        std::to_string(update->value) + "\n");
+        }
+      }
       for (const auto &[address, size] : ool_deallocations) {
         static_cast<void>(memory_.unmap(address, size));
       }

@@ -92,6 +92,16 @@ bool XnuScheduler::make_runnable(XnuThreadId thread) {
     return true;
 }
 
+bool XnuScheduler::wake_thread(XnuThreadId thread) {
+    const auto iterator = threads_.find(thread);
+    if (iterator == threads_.end()) return false;
+    if (iterator->second.info.state == XnuThreadState::Running) {
+        iterator->second.wake_pending = true;
+        return true;
+    }
+    return make_runnable(thread);
+}
+
 bool XnuScheduler::block(XnuThreadId thread) {
     const auto iterator = threads_.find(thread);
     if (iterator == threads_.end()) return false;
@@ -356,12 +366,23 @@ bool XnuScheduler::complete_slice(
         return true;
     }
     if (completion == XnuSliceCompletion::Block) {
+        if (record.wake_pending) {
+            record.wake_pending = false;
+            record.info.state = XnuThreadState::Runnable;
+            record.info.remaining_quantum = quantum_for(record);
+            record.info.remaining_timeslices = 0;
+            record.info.timeslice_processor.reset();
+            enqueue(thread, QueuePosition::Back);
+            return true;
+        }
         record.info.state = XnuThreadState::Waiting;
         record.info.remaining_quantum = quantum_for(record);
         record.info.remaining_timeslices = 0;
         record.info.timeslice_processor.reset();
         return true;
     }
+
+    record.wake_pending = false;
 
     const auto quantum_expired = record.info.remaining_quantum == 0;
     if (completion == XnuSliceCompletion::Yield || quantum_expired) {

@@ -20,7 +20,10 @@ namespace {
 constexpr std::uint32_t arm_svc_opcode = 0xef000000U;
 constexpr std::uint32_t arm_thumb_state_bit = 1U << 5U;
 constexpr std::uint16_t continuation_hle_call = userland_hle_call_mask;
+constexpr std::uint16_t thread_callback_return_hle_call =
+    userland_hle_call_mask - 1U;
 constexpr std::string_view continuation_symbol{"<guest-continuation>"};
+constexpr std::string_view thread_callback_symbol{"<guest-thread-callback>"};
 constexpr std::uint32_t first_string_page_candidate = 0x3fff0000U;
 constexpr std::uint32_t lowest_string_page_candidate = 0x3f000000U;
 constexpr std::uint32_t first_data_page_candidate = 0x50000000U;
@@ -102,6 +105,73 @@ std::array<std::byte, 2> little_endian_halfword(std::uint16_t value) {
   };
 }
 
+bool append_utf8(std::string &output, std::uint32_t codepoint) {
+  if (codepoint <= 0x7fU) {
+    output.push_back(static_cast<char>(codepoint));
+  } else if (codepoint <= 0x7ffU) {
+    output.push_back(static_cast<char>(0xc0U | (codepoint >> 6U)));
+    output.push_back(static_cast<char>(0x80U | (codepoint & 0x3fU)));
+  } else if (codepoint <= 0xffffU) {
+    output.push_back(static_cast<char>(0xe0U | (codepoint >> 12U)));
+    output.push_back(
+        static_cast<char>(0x80U | ((codepoint >> 6U) & 0x3fU)));
+    output.push_back(static_cast<char>(0x80U | (codepoint & 0x3fU)));
+  } else if (codepoint <= 0x10ffffU) {
+    output.push_back(static_cast<char>(0xf0U | (codepoint >> 18U)));
+    output.push_back(
+        static_cast<char>(0x80U | ((codepoint >> 12U) & 0x3fU)));
+    output.push_back(
+        static_cast<char>(0x80U | ((codepoint >> 6U) & 0x3fU)));
+    output.push_back(static_cast<char>(0x80U | (codepoint & 0x3fU)));
+  } else {
+    return false;
+  }
+  return true;
+}
+
+std::optional<std::string>
+read_utf16_string(const AddressSpace &memory, std::uint32_t address,
+                  std::size_t maximum_size,
+                  std::optional<std::size_t> expected_units = std::nullopt) {
+  std::string result;
+  const auto limit = expected_units.value_or(maximum_size);
+  if (limit > maximum_size)
+    return std::nullopt;
+  for (std::size_t index = 0; index < limit; ++index) {
+    const auto offset = static_cast<std::uint64_t>(index) * 2U;
+    if (offset > std::numeric_limits<std::uint32_t>::max() - address)
+      return std::nullopt;
+    const auto first =
+        memory.read16(address + static_cast<std::uint32_t>(offset));
+    if (!first)
+      return std::nullopt;
+    if (*first == 0)
+      return expected_units ? std::nullopt : std::optional{result};
+    std::uint32_t codepoint = *first;
+    if (*first >= 0xd800U && *first <= 0xdbffU) {
+      if (++index >= limit)
+        return std::nullopt;
+      const auto second_offset = static_cast<std::uint64_t>(index) * 2U;
+      if (second_offset >
+          std::numeric_limits<std::uint32_t>::max() - address) {
+        return std::nullopt;
+      }
+      const auto second = memory.read16(
+          address + static_cast<std::uint32_t>(second_offset));
+      if (!second || *second < 0xdc00U || *second > 0xdfffU)
+        return std::nullopt;
+      codepoint = 0x10000U +
+                  ((static_cast<std::uint32_t>(*first) - 0xd800U) << 10U) +
+                  (static_cast<std::uint32_t>(*second) - 0xdc00U);
+    } else if (*first >= 0xdc00U && *first <= 0xdfffU) {
+      return std::nullopt;
+    }
+    if (!append_utf8(result, codepoint) || result.size() > maximum_size)
+      return std::nullopt;
+  }
+  return expected_units ? std::optional{result} : std::nullopt;
+}
+
 } // namespace
 
 UserlandHleCall::UserlandHleCall(UserlandHleRegistry &registry, Cpu &cpu,
@@ -131,6 +201,35 @@ UserlandHleCall::string_argument(std::size_t index,
   const auto address = argument(index);
   return address == 0 ? std::nullopt
                       : memory_.read_c_string(address, maximum_size);
+}
+
+std::optional<std::string>
+UserlandHleCall::objc_string_argument(std::size_t index,
+                                      std::size_t maximum_size) const {
+  const auto object = argument(index);
+  if (object == 0 || maximum_size == 0)
+    return std::nullopt;
+
+  // Objective-C 1.x NSString objects used by the firmware have either an
+  // external byte/UTF-16 buffer with a length word, or an inline null-
+  // terminated UTF-16 payload immediately after the isa/info words.
+  const auto data = memory_.read32(object + 8U);
+  const auto length = memory_.read32(object + 12U);
+  if (data && length && *data != 0 && *length <= maximum_size) {
+    if (const auto bytes = memory_.read_bytes(*data, *length)) {
+      const auto embedded_null =
+          std::find(bytes->begin(), bytes->end(), std::byte{0});
+      if (embedded_null == bytes->end()) {
+        return std::string{reinterpret_cast<const char *>(bytes->data()),
+                           bytes->size()};
+      }
+    }
+    if (const auto unicode =
+            read_utf16_string(memory_, *data, maximum_size, *length)) {
+      return unicode;
+    }
+  }
+  return read_utf16_string(memory_, object + 8U, maximum_size);
 }
 
 bool UserlandHleCall::write32(std::uint32_t address, std::uint32_t value) {
@@ -525,6 +624,22 @@ bool UserlandHleRegistry::dispatch(Cpu &cpu, std::uint32_t process_id,
   // retain the encoded registration id used by the original implementation.
   const auto entry = cpu.registers()[15] - (thumb ? 2U : 4U);
   if (!thumb &&
+      (svc_immediate & userland_hle_call_mask) ==
+          thread_callback_return_hle_call &&
+      entry == thread_callback_return_address_) {
+    const auto pending = pending_thread_callbacks_.find(cpu.processor_id());
+    if (pending == pending_thread_callbacks_.end())
+      return false;
+    UserlandHleCall call{*this, cpu, memory_, output_, process_id,
+                         thread_callback_symbol};
+    pending->second(call);
+    // A host-backed driver owns one persistent guest callback thread. Park it
+    // between device periods; the scheduler restores its registers and wakes
+    // the same slot when the next buffer is due.
+    cpu.halt(Dynarmic::HaltReason::UserDefined5);
+    return true;
+  }
+  if (!thumb &&
       (svc_immediate & userland_hle_call_mask) == continuation_hle_call) {
     const auto pending = pending_continuations_.find(entry);
     if (pending == pending_continuations_.end()) return false;
@@ -706,6 +821,40 @@ std::optional<std::uint32_t> UserlandHleRegistry::install_continuation(
   return address;
 }
 
+std::optional<std::uint32_t>
+UserlandHleRegistry::prepare_thread_callback_return(Cpu &cpu) {
+  if (thread_callback_return_address_ != 0)
+    return thread_callback_return_address_;
+
+  constexpr std::uint32_t address = 0x62000000U;
+  const auto page = address & ~(AddressSpace::page_size - 1U);
+  if (!memory_.mapped(page, AddressSpace::page_size) &&
+      !memory_.map(page, AddressSpace::page_size,
+                   MemoryPermission::Read | MemoryPermission::Write |
+                       MemoryPermission::Execute)) {
+    return std::nullopt;
+  }
+  const auto instruction = little_endian_word(
+      arm_svc_opcode | userland_hle_svc_namespace |
+      thread_callback_return_hle_call);
+  if (!memory_.copy_in(address, instruction))
+    return std::nullopt;
+  cpu.invalidate_cache_range(address, instruction.size());
+  thread_callback_return_address_ = address;
+  return address;
+}
+
+bool UserlandHleRegistry::bind_thread_callback(std::size_t processor,
+                                               Handler completion) {
+  return completion && thread_callback_return_address_ != 0 &&
+         pending_thread_callbacks_.emplace(processor, std::move(completion))
+             .second;
+}
+
+void UserlandHleRegistry::unbind_thread_callback(std::size_t processor) {
+  pending_thread_callbacks_.erase(processor);
+}
+
 std::uint32_t UserlandHleRegistry::ensure_string_page() {
   if (string_page_ != 0 &&
       memory_.mapped(string_page_, AddressSpace::page_size)) {
@@ -853,6 +1002,8 @@ void UserlandHleRegistry::reset_mappings() {
   pending_continuations_.clear();
   available_continuation_trampolines_.clear();
   continuation_trampoline_cursor_ = 0x61000000U;
+  thread_callback_return_address_ = 0;
+  pending_thread_callbacks_.clear();
   traced_symbols_.clear();
 }
 
@@ -872,6 +1023,8 @@ void UserlandHleRegistry::inherit_mappings(const UserlandHleRegistry &parent) {
       parent.available_continuation_trampolines_;
   continuation_trampoline_cursor_ =
       parent.continuation_trampoline_cursor_;
+  thread_callback_return_address_ = parent.thread_callback_return_address_;
+  pending_thread_callbacks_.clear();
 }
 
 } // namespace ilegacysim

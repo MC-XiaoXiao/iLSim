@@ -42,6 +42,7 @@
 #include "ilegacysim/sdl_display.hpp"
 #include "ilegacysim/touch_replay.hpp"
 #include "ilegacysim/xnu_scheduler.hpp"
+#include "ffmpeg_audio_decoder.hpp"
 #include "sdl_audio_sink.hpp"
 
 namespace {
@@ -664,6 +665,13 @@ void boot(const std::vector<std::string> &args, Output &output) {
   } else {
     output.line("[audio] backend=none");
   }
+  if (FfmpegAudioDecoder::available()) {
+    initial->kernel->set_audio_decoder(
+        std::make_shared<FfmpegAudioDecoder>());
+    output.line("[audio] decoder=ffmpeg");
+  } else {
+    output.line("[audio] decoder=pcm-caf-only");
+  }
   initial->kernel->set_process_arguments({binary}, initial_environment);
   initial->kernel->enqueue_baseband_input(baseband_input);
   if (baseband_input_path) {
@@ -819,6 +827,10 @@ void boot(const std::vector<std::string> &args, Output &output) {
           const XnuThreadId thread{pid, slot};
           return runnable ? scheduler.resume_thread(thread)
                           : scheduler.suspend_thread(thread);
+        });
+    runtime.kernel->set_thread_wake_handler(
+        [&scheduler](std::uint32_t pid, std::uint32_t slot) {
+          return scheduler.wake_thread(XnuThreadId{pid, slot});
         });
     runtime.kernel->set_fork_handler(
         [&, runtime_ptr](Cpu &parent_cpu) -> std::optional<std::uint32_t> {
@@ -1182,6 +1194,12 @@ void boot(const std::vector<std::string> &args, Output &output) {
         // quanta. Catch it up from the host monotonic clock as well so time
         // keeps moving while every guest thread is idle.
         initial_runtime->kernel->advance_absolute_time(host_time);
+        for (auto &runtime : runtimes) {
+          if (runtime.get() != initial_runtime &&
+              !runtime->kernel->process().exited) {
+            runtime->kernel->service_time_dependent_devices(host_time);
+          }
+        }
       }
       const auto delay = realtime_pacer->delay_until(
           initial_runtime->kernel->current_absolute_time());
@@ -1508,6 +1526,14 @@ void boot(const std::vector<std::string> &args, Output &output) {
           "guest scheduler ticks must map exactly to virtual time");
       initial_runtime->kernel->advance_time_by(
           scheduler_round_ticks * absolute_time_units_per_guest_tick);
+      const auto advanced_time =
+          initial_runtime->kernel->current_absolute_time();
+      for (auto &runtime : runtimes) {
+        if (runtime.get() != initial_runtime &&
+            !runtime->kernel->process().exited) {
+          runtime->kernel->service_time_dependent_devices(advanced_time);
+        }
+      }
       // AppleH1CLCD scans its reserved CoreSurface directly; firmware does
       // not unlock or swap that front buffer. Refresh each process-local
       // surface after advancing virtual display time. Only the process that
@@ -1561,6 +1587,12 @@ void boot(const std::vector<std::string> &args, Output &output) {
           }
         }
         initial_runtime->kernel->advance_absolute_time(*next_deadline);
+        for (auto &runtime : runtimes) {
+          if (runtime.get() != initial_runtime &&
+              !runtime->kernel->process().exited) {
+            runtime->kernel->service_time_dependent_devices(*next_deadline);
+          }
+        }
         continue;
       }
       constexpr auto touch_replay_quiet_period = std::chrono::seconds{2};

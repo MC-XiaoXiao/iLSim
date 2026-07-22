@@ -34,6 +34,9 @@ public:
   [[nodiscard]] std::uint32_t argument(std::size_t index) const;
   [[nodiscard]] std::optional<std::string>
   string_argument(std::size_t index, std::size_t maximum_size = 4096) const;
+  [[nodiscard]] std::optional<std::string>
+  objc_string_argument(std::size_t index,
+                       std::size_t maximum_size = 4096) const;
   [[nodiscard]] bool write32(std::uint32_t address, std::uint32_t value);
   [[nodiscard]] std::uint32_t intern_string(std::string_view value);
   [[nodiscard]] std::uint32_t
@@ -130,6 +133,15 @@ public:
   image_loaded_beneath(std::string_view directory) const;
   void record_loaded_image(std::string image_path);
 
+  // Host-backed devices use this one-shot return gate when they schedule a
+  // firmware callback on an emulated thread. The callback still executes as
+  // guest code; only its thread's final return is handled here.
+  [[nodiscard]] std::optional<std::uint32_t>
+  prepare_thread_callback_return(Cpu &cpu);
+  [[nodiscard]] bool bind_thread_callback(std::size_t processor,
+                                          Handler completion);
+  void unbind_thread_callback(std::size_t processor);
+
   void reset_mappings();
   void inherit_mappings(const UserlandHleRegistry &parent);
 
@@ -181,6 +193,8 @@ private:
   std::map<std::uint32_t, PendingContinuation> pending_continuations_;
   std::vector<std::uint32_t> available_continuation_trampolines_;
   std::uint32_t continuation_trampoline_cursor_{0x61000000U};
+  std::uint32_t thread_callback_return_address_{};
+  std::map<std::size_t, Handler> pending_thread_callbacks_;
   // Keep one diagnostic per concrete intercepted symbol. A flat call-count
   // limit hid late framework activity after early startup repeatedly called
   // only a few functions.

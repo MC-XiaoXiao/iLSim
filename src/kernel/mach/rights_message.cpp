@@ -57,11 +57,13 @@ bool CompatibilityKernel::dispatch_mach_rights_message(
        *message_id ==
            mig_message_id(xnu792::mig::task::Routine::task_set_special_port) ||
        *message_id ==
+           mig_message_id(xnu792::mig::task::Routine::semaphore_destroy) ||
+       *message_id ==
            mig_message_id(xnu792::mig::thread_act::Routine::thread_policy) ||
        *message_id ==
            mig_message_id(xnu792::mig::vm_map::Routine::vm_deallocate)) &&
       registers[3] >= 36) {
-    // mach_port_deallocate / mach_port_insert_right /
+    // mach_port_deallocate / mach_port_insert_right / semaphore_destroy /
     // thread_policy / vm_deallocate
     std::uint32_t kernel_result = 0;
     if (*message_id ==
@@ -104,6 +106,75 @@ bool CompatibilityKernel::dispatch_mach_rights_message(
           // ipc_right_dealloc reports a wrong kind of right for
           // this interface, not a delta-validation error.
           kernel_result = 17; // KERN_INVALID_RIGHT
+        }
+      }
+    } else if (*message_id ==
+               mig_message_id(
+                   xnu792::mig::task::Routine::semaphore_destroy)) {
+      constexpr std::uint32_t semaphore_destroy_request_size =
+          darwin::mig_wire::complex_descriptor_base +
+          darwin::mig_wire::descriptor_size;
+      const auto descriptor_count = memory_.read32(
+          message_address +
+          darwin::mig_wire::complex_descriptor_count_offset);
+      const auto semaphore_name = memory_.read32(
+          message_address +
+          xnu792::mig::task::semaphore_destroy_arguments[1].request_offset);
+      const auto descriptor_word = memory_.read32(
+          message_address +
+          darwin::mig_wire::descriptor_metadata_offset(0));
+      const auto disposition =
+          descriptor_word
+              ? (*descriptor_word >>
+                 darwin::mig_wire::descriptor_disposition_shift) &
+                    0xffU
+              : 0U;
+      const auto descriptor_type =
+          descriptor_word
+              ? *descriptor_word >> darwin::mig_wire::descriptor_type_shift
+              : std::numeric_limits<std::uint32_t>::max();
+      const auto valid_wire =
+          registers[2] == semaphore_destroy_request_size &&
+          (*bits & darwin::mig_wire::message_complex_bit) != 0 &&
+          descriptor_count == 1 && semaphore_name && descriptor_word &&
+          disposition == darwin::mig_wire::disposition_move_send &&
+          descriptor_type == darwin::mig_wire::port_descriptor_type;
+      if (!valid_wire) {
+        kernel_result = darwin::mach::invalid_argument;
+      } else {
+        std::lock_guard mach_lock{shared_state_->mach_mutex};
+        const auto target =
+            target_task_for_port(*shared_state_, process_.pid, *remote_port);
+        const auto semaphore_object = resolve_name_with_right(
+            *shared_state_, process_.pid, *semaphore_name,
+            xnu792::ipc::Right::Send);
+        const auto semaphore =
+            semaphore_object
+                ? shared_state_->mach_semaphores.find(*semaphore_object)
+                : shared_state_->mach_semaphores.end();
+
+        // semaphore_consume_ref_t is a MOVE_SEND descriptor. Its send right is
+        // consumed by message transport even when the kernel operation fails;
+        // this direct kernel-server path performs that transport step here.
+        if (semaphore_object) {
+          static_cast<void>(consume_moved_right_locked(
+              *shared_state_, process_.pid, *semaphore_name,
+              xnu792::ipc::Right::Send, false));
+        }
+        if (!target || semaphore == shared_state_->mach_semaphores.end() ||
+            semaphore->second.owner_pid != *target) {
+          kernel_result = darwin::mach::invalid_argument;
+        } else {
+          const auto object = *semaphore_object;
+          for (const auto &waiter : semaphore->second.waiters) {
+            shared_state_->semaphore_terminations.insert(waiter);
+          }
+          output_.write("[semaphore] destroy pid=" +
+                        std::to_string(process_.pid) + " port=" +
+                        std::to_string(object) + " waiters=" +
+                        std::to_string(semaphore->second.waiters.size()) +
+                        "\n");
+          terminate_receive_object_locked(*shared_state_, object);
         }
       }
     } else if (*message_id ==

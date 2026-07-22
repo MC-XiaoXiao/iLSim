@@ -114,6 +114,14 @@ bool SdlAudioSink::play(const AudioBuffer &buffer) {
 #endif
 }
 
+void SdlAudioSink::stop() {
+  std::lock_guard lock{impl_->mutex};
+#if defined(ILEGACYSIM_HAS_SDL2)
+  if (impl_->device != 0)
+    SDL_ClearQueuedAudio(impl_->device);
+#endif
+}
+
 std::string SdlAudioSink::last_error() const {
   std::lock_guard lock{impl_->mutex};
   return impl_->error;

@@ -601,6 +601,10 @@ struct KernelSharedState {
            MachDeadNameNotificationRequest>
       mach_dead_name_notifications;
   std::set<std::pair<std::uint32_t, std::uint32_t>> semaphore_wakeups;
+  // Destruction wakes semaphore waiters with KERN_TERMINATED rather than as a
+  // successful signal. Keep that result distinct from ordinary wakeups while
+  // the owning CompatibilityKernel instances finish their blocked traps.
+  std::set<std::pair<std::uint32_t, std::uint32_t>> semaphore_terminations;
   std::map<std::uint32_t, std::deque<std::uint32_t>> iokit_iterators;
   std::map<std::uint32_t, IOKitService> iokit_services;
   std::map<std::uint32_t, IOKitConnection> iokit_connections;

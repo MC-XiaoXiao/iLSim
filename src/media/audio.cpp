@@ -5,11 +5,17 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <span>
+#include <string>
 
 #include "ilegacysim/audio_toolbox_hle.hpp"
+
+#if defined(ILEGACYSIM_HAS_LIBPLIST)
+#include <plist/plist.h>
+#endif
 
 namespace ilegacysim {
 namespace {
@@ -156,19 +162,27 @@ AudioBuffer apply_volume(AudioBuffer buffer, float volume) {
 
 } // namespace
 
-AudioSubsystem::AudioSubsystem(std::filesystem::path rootfs)
+AudioService::AudioService(std::filesystem::path rootfs)
     : rootfs_{std::move(rootfs)},
       system_sounds_{{audio_toolbox::lock_system_sound_id,
                       "/System/Library/Audio/UISounds/lock.caf"},
                      {audio_toolbox::unlock_system_sound_id,
-                      "/System/Library/Audio/UISounds/unlock.caf"}} {}
+                      "/System/Library/Audio/UISounds/unlock.caf"}} {
+  load_category_aliases();
+  load_system_volume_state();
+}
 
-void AudioSubsystem::set_sink(std::shared_ptr<AudioSink> sink) {
+void AudioService::set_sink(std::shared_ptr<AudioSink> sink) {
   std::lock_guard lock{mutex_};
   sink_ = std::move(sink);
 }
 
-AudioPlayResult AudioSubsystem::play_system_sound(std::uint32_t sound_id) {
+void AudioService::set_decoder(std::shared_ptr<AudioDecoder> decoder) {
+  std::lock_guard lock{mutex_};
+  decoder_ = std::move(decoder);
+}
+
+AudioPlayResult AudioService::play_system_sound(std::uint32_t sound_id) {
   std::shared_ptr<AudioSink> sink;
   std::optional<AudioBuffer> buffer;
   AudioPlayResult result;
@@ -177,7 +191,7 @@ AudioPlayResult AudioSubsystem::play_system_sound(std::uint32_t sound_id) {
     std::lock_guard lock{mutex_};
     buffer = load_sound_locked(sound_id, result);
     sink = sink_;
-    current_volume = volume_;
+    current_volume = category_volumes_["Ringtone"];
   }
   if (!buffer)
     return result;
@@ -186,8 +200,7 @@ AudioPlayResult AudioSubsystem::play_system_sound(std::uint32_t sound_id) {
     result.detail = "no host audio sink";
     return result;
   }
-  if (!sink->play(apply_volume(std::move(*buffer),
-                               muted() ? 0.0F : current_volume))) {
+  if (!sink->play(apply_volume(std::move(*buffer), current_volume))) {
     result.status = AudioPlayStatus::SinkError;
     result.detail = sink->last_error();
     return result;
@@ -196,36 +209,210 @@ AudioPlayResult AudioSubsystem::play_system_sound(std::uint32_t sound_id) {
   return result;
 }
 
-float AudioSubsystem::volume() const {
-  std::lock_guard lock{mutex_};
-  return volume_;
+AudioPlayResult AudioService::play_audio_file(
+    const std::filesystem::path &guest_path, bool replace_current) {
+  std::shared_ptr<AudioSink> sink;
+  std::optional<AudioBuffer> buffer;
+  AudioPlayResult result;
+  float current_volume = 1.0F;
+  {
+    std::lock_guard lock{mutex_};
+    buffer = load_file_locked(guest_path, result);
+    sink = sink_;
+    current_volume = category_volumes_["Ringtone"];
+  }
+  if (!buffer)
+    return result;
+  if (!sink) {
+    result.status = AudioPlayStatus::NoSink;
+    result.detail = "no host audio sink";
+    return result;
+  }
+  if (replace_current)
+    sink->stop();
+  if (!sink->play(apply_volume(std::move(*buffer), current_volume))) {
+    result.status = AudioPlayStatus::SinkError;
+    result.detail = sink->last_error();
+    return result;
+  }
+  result.status = AudioPlayStatus::Queued;
+  return result;
 }
 
-float AudioSubsystem::change_volume(float delta) {
-  std::lock_guard lock{mutex_};
-  volume_ = std::clamp(volume_ + delta, 0.0F, 1.0F);
-  return volume_;
+AudioPlayResult AudioService::queue_pcm(AudioBuffer buffer,
+                                        float device_volume) {
+  std::shared_ptr<AudioSink> sink;
+  {
+    std::lock_guard lock{mutex_};
+    sink = sink_;
+  }
+  AudioPlayResult result;
+  if (buffer.sample_rate == 0 || buffer.channel_count == 0 ||
+      buffer.samples.empty()) {
+    result.status = AudioPlayStatus::UnsupportedResource;
+    result.detail = "invalid PCM buffer";
+    return result;
+  }
+  if (!sink) {
+    result.status = AudioPlayStatus::NoSink;
+    result.detail = "no host audio sink";
+    return result;
+  }
+  // Firmware mediaserverd has already applied its category gain to this PCM.
+  // The backend contributes only the emulated physical-device scalar.
+  const auto gain = std::clamp(device_volume, 0.0F, 1.0F);
+  if (!sink->play(apply_volume(std::move(buffer), gain))) {
+    result.status = AudioPlayStatus::SinkError;
+    result.detail = sink->last_error();
+    return result;
+  }
+  result.status = AudioPlayStatus::Queued;
+  return result;
 }
 
-float AudioSubsystem::set_volume(float value) {
-  std::lock_guard lock{mutex_};
-  volume_ = std::clamp(value, 0.0F, 1.0F);
-  return volume_;
+void AudioService::stop_playback() {
+  std::shared_ptr<AudioSink> sink;
+  {
+    std::lock_guard lock{mutex_};
+    sink = sink_;
+  }
+  if (sink)
+    sink->stop();
 }
 
-bool AudioSubsystem::muted() const {
+void AudioService::observe_category_volume(std::string category, float value) {
+  if (category.empty() || !std::isfinite(value))
+    return;
   std::lock_guard lock{mutex_};
-  return muted_;
+  category_volumes_[canonical_category_locked(category)] =
+      std::clamp(value, 0.0F, 1.0F);
 }
 
-bool AudioSubsystem::toggle_muted() {
+float AudioService::category_volume(std::string_view category) const {
   std::lock_guard lock{mutex_};
-  muted_ = !muted_;
-  return muted_;
+  const auto found = category_volumes_.find(canonical_category_locked(category));
+  return found == category_volumes_.end() ? 1.0F : found->second;
+}
+
+void AudioService::initialize_player(AudioClientObject player,
+                                     AudioClientObject queue) {
+  std::lock_guard lock{mutex_};
+  players_[player] = PlayerState{queue, 0.0F, 0};
+}
+
+void AudioService::set_player_queue(AudioClientObject player,
+                                    AudioClientObject queue) {
+  std::lock_guard lock{mutex_};
+  players_[player].queue = queue;
+}
+
+AudioClientObject
+AudioService::player_queue(AudioClientObject player) const {
+  std::lock_guard lock{mutex_};
+  const auto current = players_.find(player);
+  return current == players_.end() ? AudioClientObject{} : current->second.queue;
+}
+
+AudioPlayResult AudioService::set_player_rate(AudioClientObject player,
+                                              float rate) {
+  if (!std::isfinite(rate) || rate <= 0.0F) {
+    stop_player(player);
+    AudioPlayResult result;
+    result.status = AudioPlayStatus::Queued;
+    return result;
+  }
+
+  std::optional<std::filesystem::path> path;
+  {
+    std::lock_guard lock{mutex_};
+    const auto current = players_.find(player);
+    if (current != players_.end()) {
+      const auto queue = queues_.find(current->second.queue);
+      if (queue != queues_.end() && !queue->second.empty()) {
+        const auto item = items_.find(queue->second.back());
+        if (item != items_.end())
+          path = item->second;
+      }
+    }
+  }
+
+  AudioPlayResult result;
+  if (path) {
+    result = play_audio_file(*path, true);
+  } else {
+    result.status = AudioPlayStatus::ResourceUnavailable;
+    result.detail = "audio service player has no playable item";
+  }
+  {
+    std::lock_guard lock{mutex_};
+    players_[player].rate =
+        result.status == AudioPlayStatus::Queued ? rate : 0.0F;
+  }
+  return result;
+}
+
+float AudioService::player_rate(AudioClientObject player) const {
+  std::lock_guard lock{mutex_};
+  const auto current = players_.find(player);
+  return current == players_.end() ? 0.0F : current->second.rate;
+}
+
+void AudioService::stop_player(AudioClientObject player) {
+  {
+    std::lock_guard lock{mutex_};
+    players_[player].rate = 0.0F;
+  }
+  stop_playback();
+}
+
+void AudioService::set_player_repeat_mode(AudioClientObject player,
+                                          std::uint32_t mode) {
+  std::lock_guard lock{mutex_};
+  players_[player].repeat_mode = mode;
+}
+
+std::uint32_t
+AudioService::player_repeat_mode(AudioClientObject player) const {
+  std::lock_guard lock{mutex_};
+  const auto current = players_.find(player);
+  return current == players_.end() ? 0U : current->second.repeat_mode;
+}
+
+void AudioService::initialize_queue(AudioClientObject queue) {
+  std::lock_guard lock{mutex_};
+  queues_.try_emplace(queue);
+}
+
+void AudioService::clear_queue(AudioClientObject queue) {
+  std::lock_guard lock{mutex_};
+  queues_[queue].clear();
+}
+
+bool AudioService::append_queue_item(AudioClientObject queue,
+                                     AudioClientObject item) {
+  std::lock_guard lock{mutex_};
+  if (!items_.contains(item))
+    return false;
+  queues_[queue].push_back(item);
+  return true;
+}
+
+void AudioService::set_item_path(AudioClientObject item,
+                                 std::filesystem::path path) {
+  std::lock_guard lock{mutex_};
+  items_[item] = std::move(path);
+}
+
+std::optional<std::filesystem::path>
+AudioService::item_path(AudioClientObject item) const {
+  std::lock_guard lock{mutex_};
+  const auto path = items_.find(item);
+  return path == items_.end() ? std::nullopt
+                              : std::optional{path->second};
 }
 
 std::optional<AudioBuffer>
-AudioSubsystem::load_sound_locked(std::uint32_t sound_id,
+AudioService::load_sound_locked(std::uint32_t sound_id,
                                   AudioPlayResult &result) {
   const auto sound = system_sounds_.find(sound_id);
   if (sound == system_sounds_.end()) {
@@ -255,6 +442,149 @@ AudioSubsystem::load_sound_locked(std::uint32_t sound_id,
       decoded_sounds_.emplace(sound_id, std::move(*decoded));
   static_cast<void>(inserted);
   return entry->second;
+}
+
+std::optional<AudioBuffer>
+AudioService::load_file_locked(const std::filesystem::path &guest_path,
+                                 AudioPlayResult &result) {
+  if (!guest_path.is_absolute()) {
+    result.status = AudioPlayStatus::ResourceUnavailable;
+    result.detail = "audio path is not guest-absolute";
+    return std::nullopt;
+  }
+  const auto relative = guest_path.relative_path().lexically_normal();
+  for (const auto &component : relative) {
+    if (component == "..") {
+      result.status = AudioPlayStatus::ResourceUnavailable;
+      result.detail = "audio path escapes the guest root";
+      return std::nullopt;
+    }
+  }
+  result.guest_path = std::filesystem::path{"/"} / relative;
+  if (const auto cached = decoded_files_.find(result.guest_path);
+      cached != decoded_files_.end()) {
+    return cached->second;
+  }
+  const auto host_path = rootfs_ / relative;
+  if (!std::filesystem::is_regular_file(host_path)) {
+    result.status = AudioPlayStatus::ResourceUnavailable;
+    result.detail = "audio resource is unavailable";
+    return std::nullopt;
+  }
+
+  if (const auto bytes = read_file(host_path)) {
+    if (auto decoded = decode_linear_pcm_caf(*bytes)) {
+      auto [entry, inserted] =
+          decoded_files_.emplace(result.guest_path, std::move(*decoded));
+      static_cast<void>(inserted);
+      return entry->second;
+    }
+  }
+  if (!decoder_) {
+    result.status = AudioPlayStatus::UnsupportedResource;
+    result.detail = "no decoder accepts this audio resource";
+    return std::nullopt;
+  }
+  auto decoded = decoder_->decode(host_path);
+  if (!decoded) {
+    result.status = AudioPlayStatus::UnsupportedResource;
+    result.detail = decoder_->last_error();
+    return std::nullopt;
+  }
+  auto [entry, inserted] =
+      decoded_files_.emplace(result.guest_path, std::move(*decoded));
+  static_cast<void>(inserted);
+  return entry->second;
+}
+
+void AudioService::load_category_aliases() {
+#if defined(ILEGACYSIM_HAS_LIBPLIST)
+  const auto path =
+      rootfs_ / "System/Library/Frameworks/Celestial.framework/"
+                "CategoriesThatShareVolumes.plist";
+  const auto bytes = read_file(path);
+  if (!bytes || bytes->empty() ||
+      bytes->size() > std::numeric_limits<std::uint32_t>::max()) {
+    return;
+  }
+
+  plist_t root = nullptr;
+  plist_format_t format = PLIST_FORMAT_NONE;
+  const auto parsed = plist_from_memory(
+      reinterpret_cast<const char *>(bytes->data()),
+      static_cast<std::uint32_t>(bytes->size()), &root, &format);
+  if (parsed != PLIST_ERR_SUCCESS || root == nullptr)
+    return;
+
+  plist_dict_iter iterator = nullptr;
+  plist_dict_new_iter(root, &iterator);
+  while (iterator != nullptr) {
+    char *alias = nullptr;
+    plist_t target_node = nullptr;
+    plist_dict_next_item(root, iterator, &alias, &target_node);
+    if (target_node == nullptr) {
+      std::free(alias);
+      break;
+    }
+    std::uint64_t target_length{};
+    const auto *target = plist_get_string_ptr(target_node, &target_length);
+    if (alias != nullptr && target != nullptr && target_length != 0) {
+      category_aliases_.insert_or_assign(
+          alias, std::string{target, static_cast<std::size_t>(target_length)});
+    }
+    std::free(alias);
+  }
+  std::free(iterator);
+  plist_free(root);
+#endif
+}
+
+std::string
+AudioService::canonical_category_locked(std::string_view category) const {
+  std::string result{category};
+  for (std::size_t depth = 0; depth <= category_aliases_.size(); ++depth) {
+    const auto alias = category_aliases_.find(result);
+    if (alias == category_aliases_.end() || alias->second == result)
+      break;
+    result = alias->second;
+  }
+  return result;
+}
+
+void AudioService::load_system_volume_state() {
+#if defined(ILEGACYSIM_HAS_LIBPLIST)
+  const auto path = rootfs_ /
+                    "var/root/Library/Preferences/com.apple.celestial.plist";
+  const auto bytes = read_file(path);
+  if (!bytes || bytes->empty() ||
+      bytes->size() > std::numeric_limits<std::uint32_t>::max()) {
+    return;
+  }
+
+  plist_t root = nullptr;
+  plist_format_t format = PLIST_FORMAT_NONE;
+  const auto parsed = plist_from_memory(
+      reinterpret_cast<const char *>(bytes->data()),
+      static_cast<std::uint32_t>(bytes->size()), &root, &format);
+  if (parsed != PLIST_ERR_SUCCESS || root == nullptr)
+    return;
+
+  const auto volumes = plist_dict_get_item(root, "volumes");
+  const auto broadcast =
+      volumes == nullptr ? nullptr : plist_dict_get_item(volumes, "broadcast");
+  const auto ringtone = broadcast == nullptr
+                            ? nullptr
+                            : plist_dict_get_item(broadcast, "Ringtone");
+  if (ringtone != nullptr) {
+    double value{};
+    plist_get_real_val(ringtone, &value);
+    if (std::isfinite(value)) {
+      category_volumes_["Ringtone"] =
+          std::clamp(static_cast<float>(value), 0.0F, 1.0F);
+    }
+  }
+  plist_free(root);
+#endif
 }
 
 } // namespace ilegacysim

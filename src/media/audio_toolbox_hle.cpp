@@ -36,8 +36,8 @@ std::string status_name(AudioPlayStatus status) {
 } // namespace
 
 AudioToolboxHle::AudioToolboxHle(
-    UserlandHleRegistry &registry, std::shared_ptr<AudioSubsystem> subsystem)
-    : subsystem_{std::move(subsystem)} {
+    UserlandHleRegistry &registry, std::shared_ptr<AudioService> service)
+    : service_{std::move(service)} {
   const auto register_play = [&](std::string symbol) {
     registry.register_function(
         std::string{audio_toolbox_image}, std::move(symbol),
@@ -48,14 +48,13 @@ AudioToolboxHle::AudioToolboxHle(
   register_play("_AudioServicesPlayAlertSound");
 }
 
-void AudioToolboxHle::set_subsystem(
-    std::shared_ptr<AudioSubsystem> subsystem) {
-  subsystem_ = std::move(subsystem);
+void AudioToolboxHle::set_service(std::shared_ptr<AudioService> service) {
+  service_ = std::move(service);
 }
 
 void AudioToolboxHle::play_system_sound(UserlandHleCall &call) {
   const auto sound_id = call.argument(0);
-  const auto result = subsystem_->play_system_sound(sound_id);
+  const auto result = service_->play_system_sound(sound_id);
   std::ostringstream message;
   message << "[audio] system-sound pid=" << call.process_id()
           << " id=" << sound_id << " status=" << status_name(result.status);

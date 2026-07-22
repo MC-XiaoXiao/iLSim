@@ -60,6 +60,10 @@ inline constexpr std::uint32_t set_status_flags = 4;
 inline constexpr std::uint32_t get_record_lock = 7;
 inline constexpr std::uint32_t set_record_lock = 8;
 inline constexpr std::uint32_t set_record_lock_wait = 9;
+// Darwin file-cache hints. They affect kernel read strategy, not descriptor
+// data or persistence, so the compatibility VFS may accept them as advisory.
+inline constexpr std::uint32_t set_read_ahead = 45;
+inline constexpr std::uint32_t set_no_cache = 48;
 } // namespace fcntl_command
 
 namespace record_lock {
@@ -135,6 +139,7 @@ inline constexpr std::uint32_t invalid_value = 18;
 inline constexpr std::uint32_t user_references_overflow = 19;
 inline constexpr std::uint32_t invalid_capability = 20;
 inline constexpr std::uint32_t right_exists = 21;
+inline constexpr std::uint32_t terminated = 37;
 inline constexpr std::uint32_t operation_timed_out = 49;
 inline constexpr std::uint32_t vm_flags_anywhere = 1;
 } // namespace mach

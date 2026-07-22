@@ -10,7 +10,6 @@
 #include "ilegacysim/darwin_network_abi.hpp"
 #include "ilegacysim/darwin_resource_abi.hpp"
 #include "ilegacysim/darwin_route_socket.hpp"
-#include "ilegacysim/fig_movie_hle.hpp"
 #include "ilegacysim/graphics_services_input.hpp"
 #include "ilegacysim/iokit_abi.hpp"
 #include "ilegacysim/kernel_clock.hpp"
@@ -68,10 +67,10 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
                                          std::filesystem::path rootfs)
     : memory_{memory}, output_{output}, rootfs_{std::move(rootfs)},
       hfs_metadata_{rootfs_},
-      audio_subsystem_{std::make_shared<AudioSubsystem>(rootfs_)},
+      audio_service_{std::make_shared<AudioService>(rootfs_)},
       userland_hle_{memory_, output_},
-      audio_toolbox_hle_{userland_hle_, audio_subsystem_},
-      celestial_audio_hle_{userland_hle_, audio_subsystem_},
+      audio_toolbox_hle_{userland_hle_, audio_service_},
+      core_audio_hle_{userland_hle_, audio_service_},
       apple80211_hle_{
           userland_hle_, wifi_state_,
           [this](const WifiSnapshot &before, const WifiSnapshot &after) {
@@ -87,7 +86,6 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
   register_core_telephony_hle(userland_hle_);
   register_dns_configuration_hle(userland_hle_);
   register_app_support_hle(userland_hle_);
-  register_fig_movie_hle(userland_hle_);
   register_bluetooth_manager_hle(userland_hle_);
   register_mbx_connect_hle(userland_hle_);
   graphics_services_input::register_springboard_alert_observers(
@@ -264,6 +262,7 @@ void CompatibilityKernel::install_commpage() {
 void CompatibilityKernel::prepare_exec(std::size_t processor_id) {
   install_commpage();
   userland_hle_.reset_mappings();
+  core_audio_hle_.reset();
   userland_hle_.record_loaded_image(process_image_);
   apple80211_hle_.reset();
   core_surface_hle_.reset();
@@ -600,11 +599,14 @@ bool CompatibilityKernel::deliver_pending_io(Cpu &cpu) {
     const auto waiter =
         std::pair{process_.pid, static_cast<std::uint32_t>(cpu.processor_id())};
     bool awakened = false;
+    bool terminated = false;
     bool timed_out = false;
     {
       std::lock_guard mach_lock{shared_state_->mach_mutex};
-      awakened = shared_state_->semaphore_wakeups.erase(waiter) != 0;
-      timed_out = !awakened && pending->second.deadline &&
+      terminated = shared_state_->semaphore_terminations.erase(waiter) != 0;
+      awakened = !terminated &&
+                 shared_state_->semaphore_wakeups.erase(waiter) != 0;
+      timed_out = !terminated && !awakened && pending->second.deadline &&
                   shared_state_->clock.now() >= *pending->second.deadline;
       if (timed_out) {
         if (auto semaphore =
@@ -614,15 +616,20 @@ bool CompatibilityKernel::deliver_pending_io(Cpu &cpu) {
         }
       }
     }
-    if (!awakened && !timed_out)
+    if (!terminated && !awakened && !timed_out)
       return false;
     if (pending->second.bsd_result) {
-      if (timed_out)
+      if (terminated)
+        bsd_error(cpu, darwin::error::invalid_argument);
+      else if (timed_out)
         bsd_error(cpu, 60); // ETIMEDOUT
       else
         bsd_success(cpu, 0);
     } else {
-      cpu.registers()[0] = timed_out ? 49U : 0U;
+      cpu.registers()[0] =
+          terminated ? darwin::mach::terminated
+                     : timed_out ? darwin::mach::operation_timed_out
+                                 : darwin::mach::success;
     }
     pending_semaphore_waits_.erase(pending);
     process_.waiting_for_events = false;
@@ -879,6 +886,10 @@ std::optional<std::uint64_t> CompatibilityKernel::next_timer_deadline() const {
       deadline = receive.deadline;
     }
   }
+  if (const auto audio = core_audio_hle_.next_io_proc_deadline();
+      audio && (!deadline || *audio < *deadline)) {
+    deadline = audio;
+  }
   {
     std::lock_guard mach_lock{shared_state_->mach_mutex};
     for (const auto &[port, timer] : shared_state_->mach_timers) {
@@ -902,31 +913,94 @@ std::optional<std::uint64_t> CompatibilityKernel::next_timer_deadline() const {
 
 void CompatibilityKernel::advance_absolute_time(std::uint64_t deadline) {
   shared_state_->clock.advance_to(deadline);
-  std::lock_guard mach_lock{shared_state_->mach_mutex};
-  for (auto &[port, timer] : shared_state_->mach_timers) {
-    if (!timer.deadline || *timer.deadline > deadline)
-      continue;
-    KernelSharedState::MachMessage message;
-    message.bytes.resize(48);
-    const auto put32 = [&](std::size_t offset, std::uint32_t value) {
-      for (std::size_t byte = 0; byte < sizeof(value); ++byte) {
-        message.bytes[offset + byte] =
-            static_cast<std::byte>(value >> (byte * 8U));
-      }
-    };
-    put32(0, 19); // MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0)
-    put32(4, static_cast<std::uint32_t>(message.bytes.size()));
-    put32(8, port);
-    put32(12, 0);
-    put32(16, 0);
-    put32(20, 0);
-    message.destination = port;
-    shared_state_->mach_queues[port].push_back(std::move(message));
-    timer.deadline.reset();
-    output_.write("[timer] expired port=" + std::to_string(port) + "\n");
+  {
+    std::lock_guard mach_lock{shared_state_->mach_mutex};
+    for (auto &[port, timer] : shared_state_->mach_timers) {
+      if (!timer.deadline || *timer.deadline > deadline)
+        continue;
+      KernelSharedState::MachMessage message;
+      message.bytes.resize(48);
+      const auto put32 = [&](std::size_t offset, std::uint32_t value) {
+        for (std::size_t byte = 0; byte < sizeof(value); ++byte) {
+          message.bytes[offset + byte] =
+              static_cast<std::byte>(value >> (byte * 8U));
+        }
+      };
+      put32(0, 19); // MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0)
+      put32(4, static_cast<std::uint32_t>(message.bytes.size()));
+      put32(8, port);
+      put32(12, 0);
+      put32(16, 0);
+      put32(20, 0);
+      message.destination = port;
+      shared_state_->mach_queues[port].push_back(std::move(message));
+      timer.deadline.reset();
+      output_.write("[timer] expired port=" + std::to_string(port) + "\n");
+    }
+    deliver_due_clock_alarms_locked(*shared_state_, deadline);
+    kernel_iokit::display::deliver_due_vsync_locked(*shared_state_, deadline);
   }
-  deliver_due_clock_alarms_locked(*shared_state_, deadline);
-  kernel_iokit::display::deliver_due_vsync_locked(*shared_state_, deadline);
+  service_time_dependent_devices(deadline);
+}
+
+void CompatibilityKernel::service_time_dependent_devices(
+    std::uint64_t deadline) {
+  schedule_due_audio_io(deadline);
+}
+
+void CompatibilityKernel::schedule_due_audio_io(std::uint64_t deadline) {
+  auto callback = core_audio_hle_.take_due_io_proc(deadline);
+  if (!callback)
+    return;
+  if (callback->process_id != process_.pid || !thread_create_handler_) {
+    core_audio_hle_.io_proc_schedule_failed(callback->process_id);
+    return;
+  }
+  if (callback->processor) {
+    darwin::arm_thread::GeneralState state{};
+    std::copy(callback->registers.begin(), callback->registers.end(),
+              state.begin());
+    state[darwin::arm_thread::cpsr_index] = callback->cpsr;
+    const auto slot = static_cast<std::uint32_t>(*callback->processor);
+    if (thread_state_update_handler_ && thread_wake_handler_ &&
+        thread_state_update_handler_(process_.pid, slot, state) &&
+        thread_wake_handler_(process_.pid, slot)) {
+      return;
+    }
+    userland_hle_.unbind_thread_callback(*callback->processor);
+    if (thread_terminate_handler_) {
+      static_cast<void>(
+          thread_terminate_handler_(process_.pid, *callback->processor));
+    }
+    core_audio_hle_.io_proc_schedule_failed(callback->process_id);
+    output_.write("[coreaudio-device] io-proc wake failed pid=" +
+                  std::to_string(process_.pid) + "\n");
+    return;
+  }
+  const auto processor =
+      thread_create_handler_(callback->registers, callback->cpsr);
+  if (!processor ||
+      !userland_hle_.bind_thread_callback(*processor,
+                                          std::move(callback->completion))) {
+    if (processor && thread_terminate_handler_) {
+      static_cast<void>(thread_terminate_handler_(process_.pid, *processor));
+    }
+    core_audio_hle_.io_proc_schedule_failed(callback->process_id);
+    output_.write("[coreaudio-device] io-proc schedule failed pid=" +
+                  std::to_string(process_.pid) + "\n");
+    return;
+  }
+  core_audio_hle_.io_proc_thread_scheduled(callback->process_id, *processor);
+}
+
+void CompatibilityKernel::reap_stopped_audio_threads() {
+  for (const auto processor : core_audio_hle_.take_retired_io_proc_threads()) {
+    userland_hle_.unbind_thread_callback(processor);
+    if (thread_terminate_handler_) {
+      static_cast<void>(
+          thread_terminate_handler_(process_.pid, processor));
+    }
+  }
 }
 
 void CompatibilityKernel::advance_time_by(std::uint64_t interval) {
@@ -949,9 +1023,9 @@ void CompatibilityKernel::inherit_process_state(
   shared_state_ = parent.shared_state_;
   display_state_ = parent.display_state_;
   wifi_state_ = parent.wifi_state_;
-  audio_subsystem_ = parent.audio_subsystem_;
-  audio_toolbox_hle_.set_subsystem(audio_subsystem_);
-  celestial_audio_hle_.set_subsystem(audio_subsystem_);
+  audio_service_ = parent.audio_service_;
+  audio_toolbox_hle_.set_service(audio_service_);
+  core_audio_hle_.set_service(audio_service_);
   apple80211_hle_.set_wifi_state(wifi_state_);
   core_surface_hle_.set_display(display_state_);
   core_surface_hle_.set_shared_state(shared_state_);
@@ -1043,6 +1117,7 @@ void CompatibilityKernel::inherit_process_state(
 void CompatibilityKernel::dispatch(Cpu &cpu, std::uint32_t svc_immediate) {
   std::lock_guard lock{mutex_};
   if (userland_hle_.dispatch(cpu, process_.pid, svc_immediate)) {
+    reap_stopped_audio_threads();
     return;
   }
   if (svc_immediate != 0x80) {

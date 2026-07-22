@@ -726,7 +726,18 @@ void CompatibilityKernel::dispatch_bsd_descriptor_memory(Cpu &cpu,
       }
       bsd_success(cpu, 0);
       return;
+    case darwin::fcntl_command::set_read_ahead:
+    case darwin::fcntl_command::set_no_cache:
+      // Host page-cache policy is deliberately not projected into guest
+      // semantics. Both commands are advisory and have no visible file-data
+      // effect, so accepting the requested Boolean policy is sufficient.
+      bsd_success(cpu, 0);
+      return;
     default:
+      output_.write("[vfs] unsupported fcntl pid=" +
+                    std::to_string(process_.pid) + " fd=" +
+                    std::to_string(fd) + " command=" +
+                    std::to_string(registers[1]) + "\n");
       bsd_error(cpu, bsd_support::invalid_argument);
       return;
     }

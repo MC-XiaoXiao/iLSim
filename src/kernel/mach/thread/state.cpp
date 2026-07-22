@@ -1,8 +1,10 @@
 #include "ilegacysim/kernel.hpp"
 
 #include "ilegacysim/mach_arm_thread_abi.hpp"
+#include "ilegacysim/mach_thread_info_abi.hpp"
 #include "ilegacysim/mig_wire_abi.hpp"
 #include "ilegacysim/thread_act_mig_ids.hpp"
+#include "ilegacysim/xnu_scheduler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -12,6 +14,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "../support.hpp"
 
@@ -42,6 +45,9 @@ bool write_words(AddressSpace &memory, std::uint32_t address,
 
 bool CompatibilityKernel::dispatch_mach_thread_state_message(
     Cpu &cpu, const MachMessageRequest &request) {
+  const auto gets_info =
+      request.identifier ==
+      mig_message_id(xnu792::mig::thread_act::Routine::thread_info);
   const auto gets_state =
       request.identifier ==
       mig_message_id(xnu792::mig::thread_act::Routine::thread_get_state);
@@ -50,11 +56,126 @@ bool CompatibilityKernel::dispatch_mach_thread_state_message(
           mig_message_id(xnu792::mig::thread_act::Routine::thread_set_state) ||
       request.identifier ==
           mig_message_id(xnu792::mig::thread_act::Routine::act_set_state);
-  if (!gets_state && !sets_state) {
+  if (!gets_info && !gets_state && !sets_state) {
     return false;
   }
 
   auto &registers = cpu.registers();
+  if (gets_info) {
+    const auto &arguments = xnu792::mig::thread_act::thread_info_arguments;
+    const auto flavor =
+        memory_.read32(request.address + arguments[1].request_offset);
+    const auto capacity =
+        memory_.read32(request.address + arguments[2].request_count_offset);
+    std::optional<std::pair<std::uint32_t, std::uint32_t>> target_owner;
+    {
+      std::lock_guard mach_lock{shared_state_->mach_mutex};
+      const auto object = resolve_name_with_right(
+          *shared_state_, process_.pid, request.remote_port,
+          xnu792::ipc::Right::Send);
+      if (object) {
+        target_owner = find_thread_owner(*shared_state_, *object);
+      }
+    }
+
+    const auto requested_word_count =
+        flavor && *flavor == darwin::mach::thread_info::basic_flavor
+            ? darwin::mach::thread_info::basic_word_count
+        : flavor &&
+                  *flavor ==
+                      darwin::mach::thread_info::sched_timeshare_flavor
+            ? darwin::mach::thread_info::sched_timeshare_word_count
+            : 0U;
+    if (!flavor || !capacity || !target_owner || requested_word_count == 0U ||
+        *capacity < requested_word_count) {
+      const std::array<std::uint32_t,
+                       simple_reply_size / sizeof(std::uint32_t)>
+          reply{darwin::mig_wire::message_bits(
+                    darwin::mig_wire::disposition_move_send_once),
+                simple_reply_size,
+                request.local_port,
+                0,
+                0,
+                request.identifier + 100,
+                0,
+                1,
+                kernel_invalid_argument};
+      registers[0] = write_words(memory_, request.address, reply)
+                         ? mach_message_success
+                         : mach_receive_invalid_data;
+      output_.write("[mach] thread_info caller=" +
+                    std::to_string(process_.pid) + " flavor=" +
+                    std::to_string(flavor.value_or(0)) + " capacity=" +
+                    std::to_string(capacity.value_or(0)) +
+                    " result=4\n");
+      return true;
+    }
+
+    const auto reply_size = static_cast<std::uint32_t>(
+        state_reply_prefix_size + requested_word_count * sizeof(std::uint32_t));
+    if (registers[3] < reply_size) {
+      registers[0] = mach_receive_invalid_data;
+      return true;
+    }
+    std::vector<std::uint32_t> reply{
+        darwin::mig_wire::message_bits(
+            darwin::mig_wire::disposition_move_send_once),
+        reply_size,
+        request.local_port,
+        0,
+        0,
+        request.identifier + 100,
+        0,
+        1,
+        mach_message_success,
+        static_cast<std::uint32_t>(requested_word_count),
+    };
+    if (*flavor == darwin::mach::thread_info::basic_flavor) {
+      const std::array<std::uint32_t,
+                       darwin::mach::thread_info::basic_word_count>
+          basic_info{
+              0, // user_time.seconds
+              0, // user_time.microseconds
+              0, // system_time.seconds
+              0, // system_time.microseconds
+              0, // cpu_usage
+              darwin::mach::thread_info::standard_policy,
+              darwin::mach::thread_info::waiting_state,
+              0, // flags
+              0, // suspend_count
+              0, // sleep_time
+          };
+      reply.insert(reply.end(), basic_info.begin(), basic_info.end());
+    } else {
+      const auto priority = static_cast<std::uint32_t>(
+          target_owner->first == process_.pid
+              ? std::clamp(process_.thread_base_priority,
+                           xnu792::scheduler::minimum_priority,
+                           xnu792::scheduler::maximum_user_priority)
+              : xnu792::scheduler::default_base_priority);
+      const std::array<std::uint32_t,
+                       darwin::mach::thread_info::sched_timeshare_word_count>
+          timeshare_info{
+              static_cast<std::uint32_t>(
+                  xnu792::scheduler::maximum_user_priority),
+              priority,
+              priority,
+              0, // depressed
+              priority,
+          };
+      reply.insert(reply.end(), timeshare_info.begin(), timeshare_info.end());
+    }
+    registers[0] = write_words(memory_, request.address, reply)
+                       ? mach_message_success
+                       : mach_receive_invalid_data;
+    output_.write("[mach] thread_info caller=" +
+                  std::to_string(process_.pid) + " flavor=" +
+                  std::to_string(*flavor) + " count=" +
+                  std::to_string(requested_word_count) +
+                  " result=0\n");
+    return true;
+  }
+
   const auto &arguments =
       gets_state ? xnu792::mig::thread_act::thread_get_state_arguments
                  : xnu792::mig::thread_act::thread_set_state_arguments;

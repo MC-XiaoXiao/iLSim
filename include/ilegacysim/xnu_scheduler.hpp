@@ -129,6 +129,9 @@ public:
     std::size_t remove_process(std::uint32_t process);
 
     bool make_runnable(XnuThreadId thread);
+    // Device and IPC completion can race a thread's final blocking SVC. Keep
+    // that wake pending until complete_slice observes the Block transition.
+    bool wake_thread(XnuThreadId thread);
     bool block(XnuThreadId thread);
     bool suspend_thread(XnuThreadId thread);
     bool resume_thread(XnuThreadId thread);
@@ -186,6 +189,7 @@ private:
         std::optional<std::uint64_t> depression_deadline;
         std::uint32_t suspend_count{};
         bool resume_runnable{};
+        bool wake_pending{};
         std::int32_t failsafe_saved_base_priority{};
         bool failsafe_saved_timeshare{};
         bool failsafe_saved_realtime{};

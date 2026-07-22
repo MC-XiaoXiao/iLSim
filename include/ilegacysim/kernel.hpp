@@ -20,7 +20,7 @@
 #include "ilegacysim/address_space.hpp"
 #include "ilegacysim/audio.hpp"
 #include "ilegacysim/audio_toolbox_hle.hpp"
-#include "ilegacysim/celestial_audio_hle.hpp"
+#include "ilegacysim/core_audio_hle.hpp"
 #include "ilegacysim/apple80211_hle.hpp"
 #include "ilegacysim/core_surface_hle.hpp"
 #include "ilegacysim/cpu.hpp"
@@ -62,6 +62,8 @@ public:
       const darwin::arm_thread::GeneralState &)>;
   using ThreadRunnableHandler =
       std::function<bool(std::uint32_t, std::uint32_t, bool)>;
+  using ThreadWakeHandler =
+      std::function<bool(std::uint32_t, std::uint32_t)>;
   using ForkHandler = std::function<std::optional<std::uint32_t>(Cpu &)>;
   using ExecHandler = std::function<bool(
       Cpu &, std::string, std::vector<std::string>, std::vector<std::string>)>;
@@ -100,6 +102,9 @@ public:
   void set_thread_runnable_handler(ThreadRunnableHandler handler) {
     thread_runnable_handler_ = std::move(handler);
   }
+  void set_thread_wake_handler(ThreadWakeHandler handler) {
+    thread_wake_handler_ = std::move(handler);
+  }
   void set_fork_handler(ForkHandler handler) {
     fork_handler_ = std::move(handler);
   }
@@ -131,7 +136,10 @@ public:
     display_state_->set_presenter(std::move(presenter));
   }
   void set_audio_sink(std::shared_ptr<AudioSink> sink) {
-    audio_subsystem_->set_sink(std::move(sink));
+    audio_service_->set_sink(std::move(sink));
+  }
+  void set_audio_decoder(std::shared_ptr<AudioDecoder> decoder) {
+    audio_service_->set_decoder(std::move(decoder));
   }
   [[nodiscard]] DisplayFrame display_snapshot() const {
     return display_state_->snapshot();
@@ -180,6 +188,10 @@ public:
   [[nodiscard]] std::optional<std::uint64_t> next_timer_deadline() const;
   void advance_absolute_time(std::uint64_t deadline);
   void advance_time_by(std::uint64_t interval);
+  // The clock is shared by every process, while device registrations are
+  // process-local. The boot scheduler calls this for sibling kernels after
+  // advancing the shared clock through one representative kernel.
+  void service_time_dependent_devices(std::uint64_t deadline);
   [[nodiscard]] std::string wait_reason(std::size_t processor) const;
 
 private:
@@ -358,6 +370,8 @@ private:
                          std::uint32_t signal_name,
                          std::optional<std::uint64_t> timeout_interval,
                          bool bsd_result);
+  void schedule_due_audio_io(std::uint64_t deadline);
+  void reap_stopped_audio_threads();
 
   AddressSpace &memory_;
   Output &output_;
@@ -366,10 +380,10 @@ private:
   std::shared_ptr<DisplayState> display_state_{
       std::make_shared<DisplayState>()};
   std::shared_ptr<WifiState> wifi_state_{std::make_shared<WifiState>()};
-  std::shared_ptr<AudioSubsystem> audio_subsystem_;
+  std::shared_ptr<AudioService> audio_service_;
   UserlandHleRegistry userland_hle_;
   AudioToolboxHle audio_toolbox_hle_;
-  CelestialAudioHle celestial_audio_hle_;
+  CoreAudioHle core_audio_hle_;
   Apple80211Hle apple80211_hle_;
   std::shared_ptr<SurfaceStore> surface_store_{
       std::make_shared<SurfaceStore>()};
@@ -422,6 +436,7 @@ private:
   ThreadStateQuery thread_state_query_;
   ThreadStateUpdateHandler thread_state_update_handler_;
   ThreadRunnableHandler thread_runnable_handler_;
+  ThreadWakeHandler thread_wake_handler_;
   ForkHandler fork_handler_;
   ExecHandler exec_handler_;
   SpawnExecHandler spawn_exec_handler_;
