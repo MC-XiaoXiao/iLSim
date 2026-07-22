@@ -425,8 +425,7 @@ void record_application_scene_transform(
   // lock screen and exit snapshots. Ignore only that App's roots: a different
   // App can publish its first live root before didBecomeActive arrives.
   if (state.application_touch_suspended &&
-      (!state.suspended_application_scene_process_id ||
-       *state.suspended_application_scene_process_id == process_id)) {
+      state.suspended_application_scene_process_id == process_id) {
     return;
   }
   const auto process = state.processes.find(process_id);
@@ -449,6 +448,58 @@ void record_application_scene_transform(
     state.active_application_event_object =
         state.active_application_scene->event_object;
   }
+}
+
+void release_application_process_locked(KernelSharedState &state,
+                                        std::uint32_t process_id) {
+  const auto object_owned_by_process = [&state, process_id](
+                                           std::uint32_t object) {
+    const auto port = state.mach_port_objects.lookup(object);
+    return port && port->receive_owner == process_id;
+  };
+  const auto active_scene_owned =
+      state.active_application_scene &&
+      state.active_application_scene->process_id == process_id;
+  const auto suspended_scene_owned =
+      state.suspended_application_scene_process_id == process_id;
+  const auto active_event = state.active_application_event_object;
+  const auto active_route_owned =
+      active_scene_owned || suspended_scene_owned ||
+      object_owned_by_process(active_event);
+
+  if (object_owned_by_process(state.pending_application_event_object) ||
+      (active_route_owned &&
+       state.pending_application_event_object == active_event)) {
+    state.pending_application_event_object = 0;
+  }
+  if (active_route_owned) {
+    state.active_application_event_object = 0;
+  }
+  if (active_route_owned || suspended_scene_owned) {
+    state.application_touch_suspended = false;
+    state.application_suspension_reason =
+        KernelSharedState::ApplicationSuspensionReason::None;
+  }
+  if (suspended_scene_owned) {
+    state.suspended_application_scene_process_id.reset();
+  }
+  if (state.latest_application_scene_transform &&
+      state.latest_application_scene_transform->process_id == process_id) {
+    state.latest_application_scene_transform.reset();
+  }
+  if (active_scene_owned) {
+    state.active_application_scene.reset();
+  }
+  if (state.pending_application_exit_snapshot &&
+      state.pending_application_exit_snapshot->process_id == process_id) {
+    state.pending_application_exit_snapshot.reset();
+  }
+  state.application_scene_transforms.erase(process_id);
+  state.consumed_application_prewarm_activations.erase(process_id);
+  std::erase_if(state.application_scene_context_owners,
+                [process_id](const auto &owner) {
+                  return owner.second == process_id;
+                });
 }
 
 void record_application_lifecycle_event_locked(

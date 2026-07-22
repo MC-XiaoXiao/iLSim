@@ -5,6 +5,7 @@
 #include "ilegacysim/darwin_network_abi.hpp"
 #include "ilegacysim/darwin_resource_abi.hpp"
 #include "ilegacysim/darwin_route_socket.hpp"
+#include "ilegacysim/graphics_services_input.hpp"
 #include "ilegacysim/kernel_network.hpp"
 
 #include <algorithm>
@@ -25,8 +26,38 @@
 #include <vector>
 
 #include "support.hpp"
+#include "../mach/support.hpp"
 
 namespace ilegacysim {
+
+void CompatibilityKernel::release_process_mach_rights() {
+  std::lock_guard mach_lock{shared_state_->mach_mutex};
+  auto entries = shared_state_->mach_namespaces.entries(process_.pid);
+
+  // An application can relinquish its receive right before calling exit, so
+  // explicit scene ownership must be retired before ipc_space teardown tries
+  // to infer anything from the remaining port objects.
+  graphics_services_input::release_application_process_locked(
+      *shared_state_, process_.pid);
+
+  // Tear down names without receive rights first. Notification endpoints in
+  // this task therefore remain alive long enough to absorb cancellation and
+  // send-once notifications generated while the ipc_space is dismantled.
+  const auto receive_type =
+      xnu792::ipc::type_mask(xnu792::ipc::Right::Receive);
+  std::stable_sort(entries.begin(), entries.end(), [receive_type](
+                                                const auto &left,
+                                                const auto &right) {
+    const auto left_receives = (left.entry.type & receive_type) != 0;
+    const auto right_receives = (right.entry.type & receive_type) != 0;
+    return !left_receives && right_receives;
+  });
+  for (const auto &entry : entries) {
+    static_cast<void>(mach_support::destroy_port_name_locked(
+        *shared_state_, process_.pid, entry.name));
+  }
+  shared_state_->mach_namespaces.destroy_task(process_.pid);
+}
 
 void CompatibilityKernel::dispatch_bsd_process(Cpu &cpu, std::uint32_t number) {
   if (dispatch_bsd_process_credentials(cpu, number))
@@ -48,6 +79,7 @@ void CompatibilityKernel::dispatch_bsd_process(Cpu &cpu, std::uint32_t number) {
   case 1: // exit
     shared_state_->advisory_file_locks->release_process_record_locks(
         process_.pid);
+    release_process_mach_rights();
     process_.exited = true;
     process_.exit_status = registers[0];
     process_.termination_signal = 0;

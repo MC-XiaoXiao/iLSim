@@ -206,6 +206,7 @@ private:
   void dispatch_arm_fast_trap(Cpu &cpu);
   void dispatch_bsd(Cpu &cpu, std::uint32_t number);
   void dispatch_bsd_process(Cpu &cpu, std::uint32_t number);
+  void release_process_mach_rights();
   [[nodiscard]] bool dispatch_bsd_process_credentials(Cpu &cpu,
                                                       std::uint32_t number);
   [[nodiscard]] bool dispatch_bsd_process_spawn(Cpu &cpu, std::uint32_t number);

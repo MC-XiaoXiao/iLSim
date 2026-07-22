@@ -87,6 +87,13 @@ void record_application_scene_transform(
     std::uint32_t context,
     const KernelSharedState::ApplicationTouchTransform &transform);
 
+// Releases every cached scene/routing record owned by one exiting process.
+// The caller holds mach_mutex because receive-right termination and scene
+// invalidation must be one transaction. Explicit scene ownership remains
+// authoritative even after the process has relinquished its receive right.
+void release_application_process_locked(KernelSharedState &state,
+                                        std::uint32_t process_id);
+
 // HOME/lock temporarily return touch ownership to SpringBoard. Lock keeps the
 // visible App scene transform available across the unlock lifecycle, while a
 // real Home transition releases it after the exit snapshot is prepared.
