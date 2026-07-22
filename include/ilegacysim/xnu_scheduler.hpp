@@ -149,9 +149,11 @@ public:
         std::optional<XnuThreadId> preferred = std::nullopt);
     [[nodiscard]] std::optional<XnuScheduledSlice> choose_next(
         std::size_t processor,
-        std::optional<XnuThreadId> preferred = std::nullopt);
+        std::optional<XnuThreadId> preferred = std::nullopt,
+        std::optional<std::uint32_t> preferred_process = std::nullopt);
     [[nodiscard]] XnuPreemption preemption_for(
-        XnuThreadId running_thread, std::size_t processor) const;
+        XnuThreadId running_thread, std::size_t processor,
+        std::optional<std::uint32_t> preferred_process = std::nullopt) const;
     bool complete_slice(
         XnuThreadId thread, std::uint64_t consumed_ticks,
         XnuSliceCompletion completion,
@@ -204,6 +206,12 @@ private:
     void remove_from_queue(XnuThreadId thread, ThreadRecord& record);
     static void refresh_high_queue(RunQueue& run_queue);
     [[nodiscard]] static XnuThreadId pop_highest(RunQueue& run_queue);
+    [[nodiscard]] static std::optional<XnuThreadId> pop_process_at_priority(
+        RunQueue& run_queue, std::int32_t priority,
+        std::uint32_t process);
+    [[nodiscard]] static std::optional<XnuThreadId> peek_highest_process(
+        const RunQueue& run_queue, std::int32_t maximum_priority,
+        std::uint32_t process);
     void advance_scheduler_time(std::uint64_t consumed_ticks);
     void age_priorities(std::uint64_t elapsed_ticks);
     void expire_depressions();

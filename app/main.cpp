@@ -591,6 +591,10 @@ void boot(const std::vector<std::string> &args, Output &output) {
   if (display_mode != "headless" && display_mode != "sdl") {
     throw std::runtime_error{"--display must be headless or sdl"};
   }
+  if (!bounded_execution && display_mode == "sdl" &&
+      std::find(args.begin(), args.end(), "--verbose") == args.end()) {
+    output.set_verbose(false);
+  }
   std::unique_ptr<SdlDisplay> sdl_display;
   std::unique_ptr<FrameFilePresenter> frame_file_presenter;
   std::unique_ptr<TouchReplay> touch_replay;
@@ -921,13 +925,15 @@ void boot(const std::vector<std::string> &args, Output &output) {
           return darwin::error::no_such_process;
         });
     runtime.kernel->set_scheduler_preemption_query(
-        [runtime_ptr, &scheduler](std::size_t processor) {
+        [runtime_ptr, initial_runtime, &scheduler](std::size_t processor) {
           const XnuThreadId thread{runtime_ptr->kernel->process().pid,
                                    static_cast<std::uint32_t>(processor)};
           const auto scheduling_info = scheduler.info(thread);
           return scheduling_info && scheduling_info->last_processor &&
                  scheduler.preemption_for(thread,
-                                          *scheduling_info->last_processor) !=
+                                          *scheduling_info->last_processor,
+                                          initial_runtime->kernel
+                                              ->active_client_process_id()) !=
                      XnuPreemption::None;
         });
     runtime.kernel->set_task_priority_handler(
@@ -1148,11 +1154,15 @@ void boot(const std::vector<std::string> &args, Output &output) {
         }
         case LiveControlCommandKind::Status: {
           const auto frame = initial_runtime->kernel->display_snapshot();
+          const auto active_process =
+              initial_runtime->kernel->active_client_process_id();
           output.line(
               "[control] status frame=" + std::to_string(frame.sequence) +
               " processes=" + std::to_string(runtimes.size()) +
               " threads=" + std::to_string(scheduler.thread_count()) +
               " runnable=" + std::to_string(scheduler.runnable_count()) +
+              " active-process=" +
+              (active_process ? std::to_string(*active_process) : "none") +
               " display-power=" +
               (initial_runtime->kernel->display_powered_on() ? "on" : "off"));
           break;
@@ -1191,15 +1201,23 @@ void boot(const std::vector<std::string> &args, Output &output) {
           initial_runtime->kernel->current_absolute_time();
       const auto host_time = realtime_pacer->allowed_virtual_time();
       if (current_time < host_time) {
-        // Guest execution advances virtual time in calibrated instruction
-        // quanta. Catch it up from the host monotonic clock as well so time
-        // keeps moving while every guest thread is idle.
-        initial_runtime->kernel->advance_absolute_time(host_time);
-        for (auto &runtime : runtimes) {
-          if (runtime.get() != initial_runtime &&
-              !runtime->kernel->process().exited) {
-            runtime->kernel->service_time_dependent_devices(host_time);
+        if (scheduler.runnable_count() == 0) {
+          // Guest execution advances virtual time in calibrated instruction
+          // quanta. Catch it up from the host monotonic clock only while all
+          // guest threads are idle; forcing wall time through a CPU-bound
+          // guest skips animation timers before it can produce their frames.
+          initial_runtime->kernel->advance_absolute_time(host_time);
+          for (auto &runtime : runtimes) {
+            if (runtime.get() != initial_runtime &&
+                !runtime->kernel->process().exited) {
+              runtime->kernel->service_time_dependent_devices(host_time);
+            }
           }
+        } else {
+          // The host is currently slower than the calibrated guest clock.
+          // Rebase pacing at the achieved virtual time so this deficit is not
+          // injected later as one large timer jump when the guest next idles.
+          realtime_pacer.emplace(current_time);
         }
       }
       const auto delay = realtime_pacer->delay_until(
@@ -1274,6 +1292,8 @@ void boot(const std::vector<std::string> &args, Output &output) {
       preferred_thread = XnuThreadId{debug_request->thread->process,
                                      debug_request->thread->thread - 1U};
     }
+    const auto preferred_process =
+        initial_runtime->kernel->active_client_process_id();
     std::vector<XnuScheduledSlice> scheduled_batch;
     scheduled_batch.reserve(guest_processor_count);
     auto reservable_ticks = remaining_ticks;
@@ -1281,7 +1301,8 @@ void boot(const std::vector<std::string> &args, Output &output) {
          ++processor) {
       if (bounded_execution && reservable_ticks == 0)
         break;
-      const auto scheduled = scheduler.choose_next(processor, preferred_thread);
+      const auto scheduled = scheduler.choose_next(
+          processor, preferred_thread, preferred_process);
       if (scheduled) {
         scheduled_batch.push_back(*scheduled);
         if (bounded_execution) {

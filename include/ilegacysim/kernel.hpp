@@ -146,6 +146,13 @@ public:
   [[nodiscard]] DisplayFrame display_snapshot() const {
     return display_state_->snapshot();
   }
+  [[nodiscard]] std::optional<std::uint32_t>
+  active_client_process_id() const {
+    const auto active_scene = scene_coordinator_->active_client_scene();
+    return active_scene
+               ? std::optional<std::uint32_t>{active_scene->client_process_id}
+               : std::nullopt;
+  }
   [[nodiscard]] std::uint64_t current_absolute_time() const {
     return shared_state_->clock.now();
   }
