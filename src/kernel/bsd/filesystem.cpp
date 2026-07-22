@@ -313,8 +313,6 @@ void CompatibilityKernel::dispatch_bsd_filesystem(Cpu &cpu,
     file_status_flags_[*fd] = flags;
     descriptor_flags_[*fd] = 0;
     static_cast<void>(ensure_regular_file_open_description(*fd));
-    if (process_image_ == "/usr/sbin/mediaserverd")
-      audio_service_->observe_service_source_file(*path);
     bsd_success(cpu, *fd);
     return;
   }

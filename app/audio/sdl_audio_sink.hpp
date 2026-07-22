@@ -18,6 +18,7 @@ public:
 
   [[nodiscard]] static bool available();
   [[nodiscard]] bool play(const AudioBuffer &buffer) override;
+  void set_gain(float gain) override;
   void stop() override;
   [[nodiscard]] std::string last_error() const override;
 

@@ -152,16 +152,6 @@ std::optional<AudioBuffer> decode_linear_pcm_caf(
   return result;
 }
 
-AudioBuffer apply_volume(AudioBuffer buffer, float volume) {
-  for (auto &sample : buffer.samples) {
-    const auto scaled = std::lround(static_cast<float>(sample) * volume);
-    sample = static_cast<std::int16_t>(std::clamp<long>(
-        scaled, std::numeric_limits<std::int16_t>::min(),
-        std::numeric_limits<std::int16_t>::max()));
-  }
-  return buffer;
-}
-
 } // namespace
 
 AudioService::AudioService(std::filesystem::path rootfs)
@@ -197,12 +187,14 @@ AudioPlayResult AudioService::play_system_sound(std::uint32_t sound_id) {
   }
   if (!buffer)
     return result;
+  result.applied_gain = current_volume;
   if (!sink) {
     result.status = AudioPlayStatus::NoSink;
     result.detail = "no host audio sink";
     return result;
   }
-  if (!sink->play(apply_volume(std::move(*buffer), current_volume))) {
+  sink->set_gain(current_volume);
+  if (!sink->play(*buffer)) {
     result.status = AudioPlayStatus::SinkError;
     result.detail = sink->last_error();
     return result;
@@ -214,19 +206,28 @@ AudioPlayResult AudioService::play_system_sound(std::uint32_t sound_id) {
 AudioPlayResult AudioService::play_audio_file(
     const std::filesystem::path &guest_path, bool replace_current,
     float device_volume) {
+  float gain = 1.0F;
+  {
+    std::lock_guard lock{mutex_};
+    gain = category_volumes_["Ringtone"] *
+           std::clamp(device_volume, 0.0F, 1.0F);
+  }
+  return play_audio_file_with_gain(guest_path, replace_current, gain);
+}
+
+AudioPlayResult AudioService::play_audio_file_with_gain(
+    const std::filesystem::path &guest_path, bool replace_current, float gain) {
   std::shared_ptr<AudioSink> sink;
   std::optional<AudioBuffer> buffer;
   AudioPlayResult result;
-  float current_volume = 1.0F;
   {
     std::lock_guard lock{mutex_};
     buffer = load_file_locked(guest_path, result);
     sink = sink_;
-    current_volume = category_volumes_["Ringtone"] *
-                     std::clamp(device_volume, 0.0F, 1.0F);
   }
   if (!buffer)
     return result;
+  result.applied_gain = std::clamp(gain, 0.0F, 1.0F);
   if (!sink) {
     result.status = AudioPlayStatus::NoSink;
     result.detail = "no host audio sink";
@@ -234,7 +235,8 @@ AudioPlayResult AudioService::play_audio_file(
   }
   if (replace_current)
     sink->stop();
-  if (!sink->play(apply_volume(std::move(*buffer), current_volume))) {
+  sink->set_gain(result.applied_gain);
+  if (!sink->play(*buffer)) {
     result.status = AudioPlayStatus::SinkError;
     result.detail = sink->last_error();
     return result;
@@ -245,11 +247,6 @@ AudioPlayResult AudioService::play_audio_file(
 
 AudioPlayResult AudioService::queue_pcm(AudioBuffer buffer,
                                         float device_volume) {
-  std::shared_ptr<AudioSink> sink;
-  {
-    std::lock_guard lock{mutex_};
-    sink = sink_;
-  }
   AudioPlayResult result;
   if (buffer.sample_rate == 0 || buffer.channel_count == 0 ||
       buffer.samples.empty()) {
@@ -257,25 +254,31 @@ AudioPlayResult AudioService::queue_pcm(AudioBuffer buffer,
     result.detail = "invalid PCM buffer";
     return result;
   }
+  // Firmware mediaserverd has already applied its category gain to this PCM.
+  // The backend contributes only the emulated physical-device scalar.
+  const auto gain = std::clamp(device_volume, 0.0F, 1.0F);
+  result.applied_gain = gain;
+  // A queued SDL device naturally renders silence when it underruns. Enqueuing
+  // every silent hardware period only creates latency when guest virtual time
+  // advances faster than host playback time, potentially hiding the next
+  // audible buffer behind stale silence.
+  if (std::ranges::none_of(buffer.samples,
+                           [](std::int16_t sample) { return sample != 0; })) {
+    result.status = AudioPlayStatus::Queued;
+    return result;
+  }
+  std::shared_ptr<AudioSink> sink;
+  {
+    std::lock_guard lock{mutex_};
+    sink = sink_;
+  }
   if (!sink) {
     result.status = AudioPlayStatus::NoSink;
     result.detail = "no host audio sink";
     return result;
   }
-  // Firmware mediaserverd has already applied its category gain to this PCM.
-  // The backend contributes only the emulated physical-device scalar.
-  const auto gain = std::clamp(device_volume, 0.0F, 1.0F);
-  auto output = apply_volume(std::move(buffer), gain);
-  // A queued SDL device naturally renders silence when it underruns. Enqueuing
-  // every silent hardware period only creates latency when guest virtual time
-  // advances faster than host playback time, potentially hiding the next
-  // audible buffer behind stale silence.
-  if (std::ranges::none_of(output.samples,
-                           [](std::int16_t sample) { return sample != 0; })) {
-    result.status = AudioPlayStatus::Queued;
-    return result;
-  }
-  if (!sink->play(output)) {
+  sink->set_gain(gain);
+  if (!sink->play(buffer)) {
     result.status = AudioPlayStatus::SinkError;
     result.detail = sink->last_error();
     return result;
@@ -289,55 +292,138 @@ void AudioService::stop_playback() {
   {
     std::lock_guard lock{mutex_};
     sink = sink_;
+    playing_service_source_id_.reset();
+    playing_service_source_.reset();
   }
   if (sink)
     sink->stop();
 }
 
-void AudioService::observe_service_source_file(
-    std::filesystem::path guest_path) {
-  if (!guest_path.is_absolute())
+void AudioService::observe_service_source_create_request(
+    std::uint32_t reply_object, std::filesystem::path guest_path) {
+  if (reply_object == 0 || !guest_path.is_absolute())
     return;
-  auto extension = guest_path.extension().string();
-  std::ranges::transform(extension, extension.begin(),
-                         [](unsigned char character) {
-                           return static_cast<char>(std::tolower(character));
-                         });
-  constexpr std::array supported_extensions{
-      std::string_view{".aif"}, std::string_view{".aiff"},
-      std::string_view{".caf"}, std::string_view{".m4a"},
-      std::string_view{".mov"}, std::string_view{".mp3"},
-      std::string_view{".wav"}};
-  if (std::ranges::find(supported_extensions, extension) ==
-      supported_extensions.end()) {
-    return;
-  }
   std::lock_guard lock{mutex_};
-  pending_service_source_ = std::move(guest_path);
+  pending_service_source_creates_[reply_object].push_back(
+      std::move(guest_path));
 }
 
-AudioPlayResult
-AudioService::play_observed_service_source(float device_volume) {
-  std::optional<std::filesystem::path> source;
+std::optional<std::filesystem::path>
+AudioService::observe_service_source_create_reply(
+    std::uint32_t reply_object, std::uint32_t source) {
+  std::optional<std::filesystem::path> path;
+  std::shared_ptr<AudioSink> sink;
   {
     std::lock_guard lock{mutex_};
-    source = std::exchange(pending_service_source_, std::nullopt);
+    const auto pending = pending_service_source_creates_.find(reply_object);
+    if (source == 0 || pending == pending_service_source_creates_.end() ||
+        pending->second.empty()) {
+      return std::nullopt;
+    }
+    path = std::move(pending->second.front());
+    pending->second.pop_front();
+    if (pending->second.empty())
+      pending_service_source_creates_.erase(pending);
+
+    const auto previous = service_sources_.find(source);
+    const auto changed = previous == service_sources_.end() ||
+                         previous->second.path != *path;
+    service_sources_.insert_or_assign(
+        source, ServiceSource{*path, std::nullopt, 0.0F});
+    // Some clients reuse the same server object for successive previews. A
+    // create reply begins a new generation: stale rate/volume state from the
+    // previous path must not start the replacement before its own rate=1.
+    if (changed && playing_service_source_id_ == source) {
+      playing_service_source_id_.reset();
+      playing_service_source_.reset();
+      sink = sink_;
+    }
   }
-  if (!source) {
-    AudioPlayResult result;
-    result.status = AudioPlayStatus::ResourceUnavailable;
-    result.detail = "media service has no observed audio source";
-    return result;
+  if (sink)
+    sink->stop();
+  return path;
+}
+
+bool AudioService::observe_service_source_property(
+    std::uint32_t source, std::string_view property, float value) {
+  if (source == 0 || !std::isfinite(value))
+    return false;
+  std::shared_ptr<AudioSink> sink;
+  std::optional<std::filesystem::path> path;
+  std::optional<float> gain;
+  bool stop = false;
+  {
+    std::lock_guard lock{mutex_};
+    auto &state = service_sources_[source];
+    if (property == "uservolume") {
+      state.user_volume = std::clamp(value, 0.0F, 1.0F);
+      if (playing_service_source_id_ == source) {
+        sink = sink_;
+        gain = *state.user_volume;
+      }
+    } else if (property == "rate") {
+      state.rate = value;
+      if (value <= 0.0F) {
+        if (playing_service_source_id_ == source) {
+          playing_service_source_id_.reset();
+          playing_service_source_.reset();
+          sink = sink_;
+          stop = true;
+        }
+      } else if (!state.path.empty() && playing_service_source_id_ != source) {
+        playing_service_source_id_ = source;
+        playing_service_source_ = state.path;
+        path = state.path;
+        gain = state.user_volume.value_or(category_volumes_["Ringtone"]);
+      }
+    } else {
+      return false;
+    }
   }
-  return play_audio_file(*source, true, device_volume);
+  if (stop) {
+    if (sink)
+      sink->stop();
+    return true;
+  }
+  if (path) {
+    const auto result = play_audio_file_with_gain(*path, true, *gain);
+    if (result.status != AudioPlayStatus::Queued) {
+      std::lock_guard lock{mutex_};
+      if (playing_service_source_id_ == source) {
+        playing_service_source_id_.reset();
+        playing_service_source_.reset();
+      }
+    }
+  } else if (sink && gain) {
+    sink->set_gain(*gain);
+  }
+  return true;
+}
+
+bool AudioService::service_source_playing() const {
+  std::lock_guard lock{mutex_};
+  return playing_service_source_id_.has_value();
 }
 
 void AudioService::observe_category_volume(std::string category, float value) {
   if (category.empty() || !std::isfinite(value))
     return;
-  std::lock_guard lock{mutex_};
-  category_volumes_[canonical_category_locked(category)] =
-      std::clamp(value, 0.0F, 1.0F);
+  std::shared_ptr<AudioSink> sink;
+  std::optional<float> gain;
+  {
+    std::lock_guard lock{mutex_};
+    const auto canonical = canonical_category_locked(category);
+    category_volumes_[canonical] = std::clamp(value, 0.0F, 1.0F);
+    if (canonical == "Ringtone" && playing_service_source_id_) {
+      const auto active = service_sources_.find(*playing_service_source_id_);
+      if (active != service_sources_.end() && !active->second.user_volume) {
+        sink = sink_;
+        gain = category_volumes_[canonical];
+      }
+    }
+  }
+  if (sink && gain)
+    sink->set_gain(*gain);
 }
 
 float AudioService::category_volume(std::string_view category) const {

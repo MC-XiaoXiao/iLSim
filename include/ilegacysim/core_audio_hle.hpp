@@ -79,7 +79,6 @@ private:
     std::optional<std::size_t> processor;
     bool running{};
     bool in_flight{};
-    bool source_playback{};
   };
 
   UserlandHleRegistry &registry_;

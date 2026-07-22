@@ -16,6 +16,7 @@
 
 #include "ilegacysim/audio.hpp"
 #include "ilegacysim/address_space.hpp"
+#include "ilegacysim/cpu.hpp"
 #include "ilegacysim/output.hpp"
 #include "ilegacysim/userland_hle.hpp"
 
@@ -449,7 +450,7 @@ void CoreAudioHle::complete_io_proc(UserlandHleCall &call,
                             std::abs(static_cast<int>(sample))));
       }
       applied_gain = device_output_gain(registration.device);
-      if (registration.source_playback) {
+      if (service_ && service_->service_source_playing()) {
         result.status = AudioPlayStatus::Queued;
       } else if (service_) {
         result = service_->queue_pcm(std::move(buffer), applied_gain);
@@ -877,21 +878,6 @@ void CoreAudioHle::start_io(UserlandHleCall &call) {
   state.sample_time = 0;
   state.callback_count = 0;
   state.peak_since_report = 0;
-  state.source_playback = false;
-  if (service_) {
-    const auto source = service_->play_observed_service_source(
-        device_output_gain(state.device));
-    state.source_playback = source.status == AudioPlayStatus::Queued;
-    if (source.status != AudioPlayStatus::ResourceUnavailable) {
-      call.output().line(
-          "[coreaudio-device] source-playback pid=" +
-          std::to_string(call.process_id()) + " path=" +
-          source.guest_path.string() + " status=" +
-          std::to_string(static_cast<unsigned>(source.status)) +
-          (source.detail.empty() ? std::string{}
-                                 : " detail=" + source.detail));
-    }
-  }
   call.output().line("[coreaudio-device] io-proc start pid=" +
                      std::to_string(call.process_id()) + " frames=" +
                      std::to_string(buffer_frame_size_) + " bytes=" +
@@ -908,8 +894,6 @@ void CoreAudioHle::stop_io(UserlandHleCall &call) {
     return;
   }
   registration->second.running = false;
-  if (service_)
-    service_->stop_playback();
   if (registration->second.processor) {
     retired_io_proc_threads_.push_back(*registration->second.processor);
     registration->second.processor.reset();

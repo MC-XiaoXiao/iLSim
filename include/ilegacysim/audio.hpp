@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -22,6 +23,7 @@ class AudioSink {
 public:
   virtual ~AudioSink() = default;
   [[nodiscard]] virtual bool play(const AudioBuffer &buffer) = 0;
+  virtual void set_gain(float gain) = 0;
   virtual void stop() = 0;
   [[nodiscard]] virtual std::string last_error() const = 0;
 };
@@ -47,6 +49,7 @@ struct AudioPlayResult {
   AudioPlayStatus status{AudioPlayStatus::UnknownSound};
   std::filesystem::path guest_path;
   std::string detail;
+  float applied_gain{1.0F};
 };
 
 struct AudioClientObject {
@@ -72,12 +75,17 @@ public:
                                           float device_volume = 1.0F);
   void stop_playback();
 
-  // The guest media service owns source selection and playback lifecycle.
-  // Record the compressed source it opened so a host decoder can stand in for
-  // codec/DSP hardware that is absent from the emulator.
-  void observe_service_source_file(std::filesystem::path guest_path);
-  [[nodiscard]] AudioPlayResult
-  play_observed_service_source(float device_volume = 1.0F);
+  // The guest FigMovie service is the source-of-truth for source selection.
+  // A create request's path is correlated with its reply through the Mach
+  // reply-port object; subsequent properties address the returned movie ID.
+  void observe_service_source_create_request(
+      std::uint32_t reply_object, std::filesystem::path guest_path);
+  [[nodiscard]] std::optional<std::filesystem::path>
+  observe_service_source_create_reply(std::uint32_t reply_object,
+                                      std::uint32_t source);
+  [[nodiscard]] bool observe_service_source_property(
+      std::uint32_t source, std::string_view property, float value);
+  [[nodiscard]] bool service_source_playing() const;
 
   void observe_category_volume(std::string category, float value);
   [[nodiscard]] float category_volume(std::string_view category) const;
@@ -112,6 +120,9 @@ private:
   void load_system_volume_state();
   [[nodiscard]] std::string
   canonical_category_locked(std::string_view category) const;
+  [[nodiscard]] AudioPlayResult
+  play_audio_file_with_gain(const std::filesystem::path &guest_path,
+                            bool replace_current, float gain);
 
   std::filesystem::path rootfs_;
   mutable std::mutex mutex_;
@@ -120,7 +131,16 @@ private:
   std::map<std::uint32_t, std::filesystem::path> system_sounds_;
   std::map<std::uint32_t, AudioBuffer> decoded_sounds_;
   std::map<std::filesystem::path, AudioBuffer> decoded_files_;
-  std::optional<std::filesystem::path> pending_service_source_;
+  struct ServiceSource {
+    std::filesystem::path path;
+    std::optional<float> user_volume;
+    float rate{};
+  };
+  std::map<std::uint32_t, std::deque<std::filesystem::path>>
+      pending_service_source_creates_;
+  std::map<std::uint32_t, ServiceSource> service_sources_;
+  std::optional<std::uint32_t> playing_service_source_id_;
+  std::optional<std::filesystem::path> playing_service_source_;
   struct PlayerState {
     AudioClientObject queue;
     float rate{};

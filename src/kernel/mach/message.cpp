@@ -152,6 +152,8 @@ void CompatibilityKernel::dispatch_mach_message(Cpu &cpu) {
             .value_or(0);
     bool routable = false;
     std::optional<std::uint32_t> graphics_event_type;
+    std::optional<std::uint32_t> routed_reply_object;
+    std::optional<std::string> service_source_create_path;
     std::vector<std::uint32_t> exit_snapshot_pixels;
     std::optional<std::uint32_t> transferred_receive;
     std::vector<KernelSharedState::MachMessage::OolPayload> ool_payloads;
@@ -231,6 +233,13 @@ void CompatibilityKernel::dispatch_mach_message(Cpu &cpu) {
                                            byte_size);
           }
         }
+      }
+      for (const auto &payload : ool_payloads) {
+        service_source_create_path =
+            celestial_volume_protocol::decode_source_create_path(
+                *message_id, payload.bytes);
+        if (service_source_create_path)
+          break;
       }
       std::lock_guard mach_lock{shared_state_->mach_mutex};
       const auto destination_disposition = *bits & 0xffU;
@@ -456,6 +465,7 @@ void CompatibilityKernel::dispatch_mach_message(Cpu &cpu) {
           queued.ool_payloads = std::move(ool_payloads);
           queued.ool_port_arrays = std::move(ool_port_arrays);
           queued.reply_object = reply_object;
+          routed_reply_object = reply_object;
           queued.reply_right = reply_right;
           queued.port_transfers = std::move(port_transfers);
           shared_state_->mach_queues[remote_object].push_back(
@@ -469,6 +479,33 @@ void CompatibilityKernel::dispatch_mach_message(Cpu &cpu) {
     }
     if (routable) {
       if (bytes) {
+        if (service_source_create_path && routed_reply_object) {
+          audio_service_->observe_service_source_create_request(
+              *routed_reply_object, *service_source_create_path);
+        }
+        if (const auto created =
+                celestial_volume_protocol::decode_source_create_reply(
+                    *message_id, *bytes)) {
+          if (const auto path =
+                  audio_service_->observe_service_source_create_reply(
+                      remote_object, created->source)) {
+            output_.line("[audio] source-create source=" +
+                         std::to_string(created->source) + " path=" +
+                         path->string());
+          }
+        }
+        if (const auto property =
+                celestial_volume_protocol::
+                    decode_source_float_property_request(*message_id,
+                                                         *bytes)) {
+          if (audio_service_->observe_service_source_property(
+                  property->source, property->property, property->value)) {
+            output_.line("[audio] source-property source=" +
+                         std::to_string(property->source) + " key=" +
+                         property->property + " value=" +
+                         std::to_string(property->value));
+          }
+        }
         if (const auto update = celestial_volume_protocol::decode_reply(
                 *message_id, *bytes)) {
           audio_service_->observe_category_volume(update->category,
