@@ -17,6 +17,7 @@
 #include "ilegacysim/mach_port_mig_ids.hpp"
 #include "ilegacysim/mach_scheduler_abi.hpp"
 #include "ilegacysim/mach_thread_policy_abi.hpp"
+#include "ilegacysim/media_library_service.hpp"
 #include "ilegacysim/mig_wire_abi.hpp"
 #include "ilegacysim/task_mig_ids.hpp"
 #include "ilegacysim/thread_act_mig_ids.hpp"
@@ -42,6 +43,22 @@
 namespace ilegacysim {
 
 using namespace mach_support;
+
+namespace {
+
+bool write_message_words(AddressSpace &memory, std::uint32_t address,
+                         std::span<const std::uint32_t> words) {
+  for (std::size_t index = 0; index < words.size(); ++index) {
+    if (!memory.write32(
+            address + static_cast<std::uint32_t>(index * sizeof(std::uint32_t)),
+            words[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace
 
 void CompatibilityKernel::dispatch_mach_message(Cpu &cpu) {
   auto &registers = cpu.registers();
@@ -120,6 +137,114 @@ void CompatibilityKernel::dispatch_mach_message(Cpu &cpu) {
     registers[0] = *result;
     return;
   }
+
+  if (*message_id ==
+          mig_message_id(xnu792::mig::bootstrap::Routine::look_up) &&
+      *remote_port == process_.bootstrap_port && registers[3] >= 40U) {
+    const auto service_name = memory_.read_c_string(
+        message_address +
+            xnu792::mig::bootstrap::look_up_arguments[2].request_offset,
+        128U);
+    if (service_name &&
+        *service_name == media_library_service::bootstrap_name &&
+        media_library_service::can_serve_empty_catalogue(rootfs_)) {
+      std::uint32_t service_name_in_task = 0;
+      std::uint32_t service_object = 0;
+      {
+        std::lock_guard mach_lock{shared_state_->mach_mutex};
+        const auto generation =
+            shared_state_->bootstrap_service_generations.find(*service_name);
+        if (generation ==
+                shared_state_->bootstrap_service_generations.end() ||
+            generation->second == 0U) {
+          auto service =
+              shared_state_->bootstrap_service_objects.find(*service_name);
+          if (service == shared_state_->bootstrap_service_objects.end()) {
+            service_object = shared_state_->allocate_mach_object();
+            if (shared_state_->mach_port_objects.create(service_object)) {
+              shared_state_->mach_queues.try_emplace(service_object);
+              service = shared_state_->bootstrap_service_objects.emplace(
+                  *service_name, service_object).first;
+            } else {
+              service_object = 0;
+            }
+          } else {
+            service_object = service->second;
+          }
+          if (service_object != 0) {
+            service_name_in_task =
+                shared_state_->mach_namespaces
+                    .copyout(process_.pid, service_object,
+                             xnu792::ipc::type_mask(
+                                 xnu792::ipc::Right::Send))
+                    .value_or(0);
+          }
+        }
+      }
+      if (service_name_in_task != 0) {
+        const std::array<std::uint32_t, 10> reply{
+            darwin::mig_wire::message_bits(
+                darwin::mig_wire::disposition_move_send_once, 0, true),
+            40U,
+            *local_port,
+            0U,
+            0U,
+            *message_id + 100U,
+            1U,
+            service_name_in_task,
+            0U,
+            darwin::mig_wire::port_descriptor_metadata(
+                darwin::mig_wire::disposition_move_send),
+        };
+        registers[0] = write_message_words(memory_, message_address, reply)
+                           ? 0U
+                           : 0x10004008U;
+        output_.write("[media] empty-catalogue service resolved pid=" +
+                      std::to_string(process_.pid) + "\n");
+        return;
+      }
+    }
+  }
+
+  if (media_library_service::is_request_identifier(*message_id)) {
+    bool media_service = false;
+    {
+      std::lock_guard mach_lock{shared_state_->mach_mutex};
+      const auto destination = shared_state_->mach_namespaces.resolve(
+          process_.pid, *remote_port);
+      const auto service = shared_state_->bootstrap_service_objects.find(
+          std::string{media_library_service::bootstrap_name});
+      media_service = destination &&
+                      service != shared_state_->bootstrap_service_objects.end() &&
+                      *destination == service->second;
+    }
+    auto payload = media_library_service::reply_payload(*message_id)
+                       .value_or(std::vector<std::uint32_t>{
+                           0U, 1U, 0xfffffed1U}); // MIG_BAD_ID
+    const auto reply_size = static_cast<std::uint32_t>(
+        darwin::mig_wire::message_header_size +
+        payload.size() * sizeof(std::uint32_t));
+    if (media_service && registers[3] >= reply_size) {
+      std::vector<std::uint32_t> reply{
+          darwin::mig_wire::message_bits(
+              darwin::mig_wire::disposition_move_send_once),
+          reply_size,
+          *local_port,
+          0U,
+          0U,
+          *message_id + 100U,
+      };
+      reply.insert(reply.end(), payload.begin(), payload.end());
+      registers[0] = write_message_words(memory_, message_address, reply)
+                         ? 0U
+                         : 0x10004008U;
+      output_.write("[media] empty-catalogue request pid=" +
+                    std::to_string(process_.pid) + " id=" +
+                    std::to_string(*message_id) + "\n");
+      return;
+    }
+  }
+
   if (*message_id == mig_message_id(xnu792::mig::bootstrap::Routine::look_up) &&
       process_.pid == 1 && registers[3] >= 36) {
     // launchd probes its own bootstrap namespace before its server

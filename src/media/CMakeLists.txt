@@ -2,7 +2,8 @@ add_library(ilegacysim_media STATIC
     audio.cpp
     audio_toolbox_hle.cpp
     celestial_volume_protocol.cpp
-    core_audio_hle.cpp)
+    core_audio_hle.cpp
+    media_library_service.cpp)
 add_library(iLegacySim::media ALIAS ilegacysim_media)
 ilegacysim_configure_module(ilegacysim_media)
 target_link_libraries(ilegacysim_media PUBLIC iLegacySim::foundation)
