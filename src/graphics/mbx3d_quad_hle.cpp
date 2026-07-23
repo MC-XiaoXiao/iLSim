@@ -164,7 +164,8 @@ void Mbx2dHle::quad_color(UserlandHleCall &call) {
   }
   if (covers_scene_extent(width, height, destination->width,
                           destination->height)) {
-    prepare_destination_for_frame(call, state_);
+    prepare_destination_for_frame(
+        call, state_, DamageRegion{left, top, right, bottom});
   }
   const auto destination_pixels =
       read_region(*destination, left, top, width, height, call);
@@ -303,7 +304,8 @@ void Mbx2dHle::quad_copy(UserlandHleCall &call) {
 
   if (covers_scene_extent(width, height, destination->width,
                           destination->height)) {
-    prepare_destination_for_frame(call, state_);
+    prepare_destination_for_frame(
+        call, state_, DamageRegion{left, top, right, bottom});
   }
   const auto destination_pixels =
       read_region(*destination, left, top, width, height, call);

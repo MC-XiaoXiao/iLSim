@@ -80,6 +80,12 @@ private:
     std::int64_t width{};
     std::int64_t height{};
   };
+  struct DamageRegion {
+    std::int64_t left{};
+    std::int64_t top{};
+    std::int64_t right{};
+    std::int64_t bottom{};
+  };
 
   [[nodiscard]] std::uint32_t
   allocate_surface(std::uint32_t core_surface_id = 0, bool framebuffer = false);
@@ -91,7 +97,8 @@ private:
                                           bool context_api);
   void bind_surface(UserlandHleCall &call, bool source, bool context_api);
   void initialize_destination(UserlandHleCall &call, RenderState &state);
-  void prepare_destination_for_frame(UserlandHleCall &call, RenderState &state);
+  void prepare_destination_for_frame(UserlandHleCall &call, RenderState &state,
+                                     DamageRegion damage);
   void set_scissor(UserlandHleCall &call, bool context_api);
   void set_blend_equation(UserlandHleCall &call, bool context_api,
                           bool complex);
@@ -140,6 +147,7 @@ private:
   std::map<std::uint32_t, Surface> surfaces_;
   std::set<std::uint32_t> initialized_destinations_;
   std::map<std::uint32_t, std::uint64_t> destination_frame_sequences_;
+  std::map<std::uint32_t, DamageRegion> destination_scene_damage_;
   std::uint32_t next_surface_{first_surface_handle};
   std::uint32_t framebuffer_surface_{};
   RenderState state_;
