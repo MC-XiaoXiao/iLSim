@@ -55,7 +55,8 @@ void Mbx2dHle::initialize_destination(
 }
 
 void Mbx2dHle::prepare_destination_for_frame(
-    UserlandHleCall& call, RenderState& state, DamageRegion damage) {
+    UserlandHleCall& call, RenderState& state, DamageRegion damage,
+    std::uint32_t source_surface) {
     initialize_destination(call, state);
     const auto destination = resolve(state.destination);
     if (!destination || destination->framebuffer || !display_ ||
@@ -82,13 +83,6 @@ void Mbx2dHle::prepare_destination_for_frame(
         }
         return;
     }
-    if (const auto previous = destination_scene_damage_.find(surface);
-        previous != destination_scene_damage_.end()) {
-        damage.left = std::min(damage.left, previous->second.left);
-        damage.top = std::min(damage.top, previous->second.top);
-        damage.right = std::max(damage.right, previous->second.right);
-        damage.bottom = std::max(damage.bottom, previous->second.bottom);
-    }
     damage.left = std::clamp<std::int64_t>(
         damage.left, 0, destination->width);
     damage.top = std::clamp<std::int64_t>(
@@ -97,20 +91,33 @@ void Mbx2dHle::prepare_destination_for_frame(
         damage.right, damage.left, destination->width);
     damage.bottom = std::clamp<std::int64_t>(
         damage.bottom, damage.top, destination->height);
+    const auto current_damage = damage;
+    const auto previous_source = destination_scene_sources_.find(surface);
+    if (const auto previous = destination_scene_damage_.find(surface);
+        previous != destination_scene_damage_.end() &&
+        previous_source != destination_scene_sources_.end() &&
+        previous_source->second == source_surface) {
+        damage.left = std::min(damage.left, previous->second.left);
+        damage.top = std::min(damage.top, previous->second.top);
+        damage.right = std::max(damage.right, previous->second.right);
+        damage.bottom = std::max(damage.bottom, previous->second.bottom);
+    }
     const auto width = damage.right - damage.left;
     const auto height = damage.bottom - damage.top;
     const auto pixel_count =
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
     const std::vector<std::uint32_t> clear(pixel_count, 0xff000000U);
-    // LayerKit retains unchanged layers in the swap backing. Clear only the
-    // union of the previous and current scene-wide damage so moving affine
-    // layers cannot leave trails while pixels outside the submitted scene
-    // remain available for later dirty updates.
+    // LayerKit retains unchanged sibling layers in the swap backing. Extend
+    // invalidation across old and new bounds only while the same large source
+    // moves. A replacement source starts a new scene generation; clearing the
+    // outgoing source's larger bounds would erase retained siblings outside
+    // the replacement's local bounds until their next dirty update.
     if (width > 0 && height > 0 &&
         write_region(*destination, damage.left, damage.top, width, height,
                      clear, call)) {
         destination_frame_sequences_[surface] = sequence;
-        destination_scene_damage_[surface] = damage;
+        destination_scene_damage_[surface] = current_damage;
+        destination_scene_sources_[surface] = source_surface;
     }
 }
 

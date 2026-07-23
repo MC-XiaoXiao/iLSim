@@ -85,6 +85,7 @@ Mbx2dHle::Mbx2dHle(UserlandHleRegistry &registry,
     initialized_destinations_.erase(surface);
     destination_frame_sequences_.erase(surface);
     destination_scene_damage_.erase(surface);
+    destination_scene_sources_.erase(surface);
     const auto unbind = [surface](RenderState &state) {
       if (state.source && state.source->surface == surface) {
         state.source.reset();
@@ -196,6 +197,7 @@ void Mbx2dHle::reset() {
   initialized_destinations_.clear();
   destination_frame_sequences_.clear();
   destination_scene_damage_.clear();
+  destination_scene_sources_.clear();
   next_surface_ = first_surface_handle;
   framebuffer_surface_ = 0;
   state_ = {};
@@ -210,6 +212,7 @@ void Mbx2dHle::inherit_state(const Mbx2dHle &parent) {
   initialized_destinations_ = parent.initialized_destinations_;
   destination_frame_sequences_ = parent.destination_frame_sequences_;
   destination_scene_damage_ = parent.destination_scene_damage_;
+  destination_scene_sources_ = parent.destination_scene_sources_;
   next_surface_ = parent.next_surface_;
   framebuffer_surface_ = parent.framebuffer_surface_;
   state_ = parent.state_;
