@@ -9,6 +9,7 @@ const DeviceProfile& DeviceProfile::iphone_2g_1_0() {
     static constexpr DeviceProfile profile{
         "iPhone1,1",
         "M68AP",
+        "MA712LL",
         "Samsung S5L8900 (APL0098)",
         "ARM1176JZF-S",
         "ARMv6KZ + Thumb",
@@ -23,4 +24,3 @@ const DeviceProfile& DeviceProfile::iphone_2g_1_0() {
 }
 
 }  // namespace ilegacysim
-

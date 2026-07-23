@@ -395,9 +395,28 @@ struct KernelSharedState {
     std::string type;
     std::vector<std::byte> matching;
   };
+  struct IOKitRegistryProperty {
+    enum class Kind {
+      String,
+      Data,
+    };
+
+    Kind kind{Kind::Data};
+    std::vector<std::byte> value;
+  };
   struct IOKitService {
     std::string class_name;
     std::vector<std::string> conforms_to;
+    std::map<std::string, IOKitRegistryProperty> properties;
+
+    IOKitService() = default;
+    IOKitService(std::string service_class,
+                 std::vector<std::string> service_conformance,
+                 std::map<std::string, IOKitRegistryProperty>
+                     registry_properties = {})
+        : class_name(std::move(service_class)),
+          conforms_to(std::move(service_conformance)),
+          properties(std::move(registry_properties)) {}
   };
   struct IOKitConnection {
     std::uint32_t service_port{};

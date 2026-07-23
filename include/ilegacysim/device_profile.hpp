@@ -9,6 +9,10 @@ namespace ilegacysim {
 struct DeviceProfile {
     std::string_view product_type;
     std::string_view board_config;
+    // Retail configuration identifier exposed by the platform device tree.
+    // This is distinct from product_type (for example, iPhone1,1) and the
+    // hardware board configuration (for example, M68AP).
+    std::string_view model_number;
     std::string_view soc;
     std::string_view cpu_core;
     std::string_view instruction_set;
@@ -23,4 +27,3 @@ struct DeviceProfile {
 };
 
 }  // namespace ilegacysim
-

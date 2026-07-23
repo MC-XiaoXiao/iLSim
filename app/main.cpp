@@ -335,6 +335,7 @@ void profile(Output &output) {
   std::ostringstream text;
   text << "product: " << device.product_type << '\n'
        << "board: " << device.board_config << '\n'
+       << "model_number: " << device.model_number << '\n'
        << "soc: " << device.soc << '\n'
        << "cpu: " << device.cpu_core << " (" << device.instruction_set << ")\n"
        << "cpu_hz: " << device.cpu_hz << '\n'
