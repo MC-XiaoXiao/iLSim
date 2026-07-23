@@ -177,21 +177,21 @@ void CompatibilityKernel::enqueue_touch_input(const TouchInput &input) {
 
 void CompatibilityKernel::enqueue_system_button(
     const SystemButtonInput &input) {
-  bool woke_sleeping_display = false;
+  bool home_pressed_while_display_asleep = false;
   if (input.button == SystemButton::Home &&
       input.phase == SystemButtonPhase::Down) {
     std::lock_guard mach_lock{shared_state_->mach_mutex};
     if (shared_state_->requested_display_power_state.value_or(1U) == 0U) {
-      shared_state_->requested_display_power_state = 1U;
-      woke_sleeping_display = true;
+      home_pressed_while_display_asleep = true;
     }
   }
-  if (woke_sleeping_display) {
-    display_state_->set_powered_on(true);
-  }
+  // Sleeping Home is a wake request for SpringBoard, not a host-side panel
+  // transition. The firmware prepares its lock scene and then requests LCD
+  // power through IOKit; exposing the retained scanout here races that order.
   if ((input.button == SystemButton::Home ||
        input.button == SystemButton::Lock) &&
-      input.phase == SystemButtonPhase::Down && !woke_sleeping_display) {
+      input.phase == SystemButtonPhase::Down &&
+      !home_pressed_while_display_asleep) {
     graphics_services_input::suspend_active_application(
         *shared_state_,
         input.button == SystemButton::Lock
