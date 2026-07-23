@@ -14,7 +14,6 @@
 #include <vector>
 
 #include "ilegacysim/address_space.hpp"
-#include "ilegacysim/device_profile.hpp"
 #include "ilegacysim/device_mig_ids.hpp"
 #include "ilegacysim/iokit_abi.hpp"
 #include "ilegacysim/kernel_iokit_baseband.hpp"
@@ -381,14 +380,13 @@ ensure_platform_expert_service_locked(KernelSharedState &shared_state) {
   static_cast<void>(shared_state.mach_port_objects.create(object));
   shared_state.mach_queues.try_emplace(object);
 
-  const auto &profile = DeviceProfile::iphone_2g_1_0();
   KernelSharedState::IOKitService service{
       std::string{platform_expert_class}, {"IOService"}, {}};
   service.properties.emplace(
       std::string{model_number_property},
       KernelSharedState::IOKitRegistryProperty{
           KernelSharedState::IOKitRegistryProperty::Kind::Data,
-          bytes_from_string(profile.model_number)});
+          bytes_from_string(shared_state.device_model_number)});
   shared_state.iokit_services.emplace(object, std::move(service));
   return object;
 }

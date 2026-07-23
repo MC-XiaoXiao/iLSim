@@ -1,7 +1,6 @@
 #include "ilegacysim/layerkit_hle.hpp"
 
 #include "ilegacysim/address_space.hpp"
-#include "ilegacysim/device_profile.hpp"
 #include "ilegacysim/graphics_services_input.hpp"
 #include "ilegacysim/kernel_shared_state.hpp"
 #include "ilegacysim/output.hpp"
@@ -79,7 +78,7 @@ void LayerKitHle::register_handlers(
             call.memory().read32(context + 0x3cU).value_or(0);
         const bool root_handle_cached =
             call.memory().read32(context + 0x40U).value_or(0) != 0U;
-        const auto &device = DeviceProfile::iphone_2g_1_0();
+        const auto viewport = shared_state_->user_interface_geometry;
         const auto position_x =
             call.memory().read32(object + 0xcU).value_or(0U);
         const auto position_y =
@@ -88,8 +87,8 @@ void LayerKitHle::register_handlers(
         const auto height = call.memory().read32(object + 0x18U).value_or(0U);
         if (const auto placement = compatibility_.application_window_placement(
                 context, current_layer_id, call.argument(1), render_flags,
-                position_x, position_y, width, height, device.display_width,
-                device.display_height)) {
+                position_x, position_y, width, height, viewport.width,
+                viewport.height)) {
           static_cast<void>(call.write32(object + 0x10U, placement->position_y));
           const auto client_process_id =
               graphics_services_input::record_application_scene_transform(

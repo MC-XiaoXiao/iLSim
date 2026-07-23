@@ -65,8 +65,6 @@ constexpr std::uint32_t gl_vendor = 0x1f00;
 constexpr std::uint32_t gl_renderer = 0x1f01;
 constexpr std::uint32_t gl_version = 0x1f02;
 constexpr std::uint32_t gl_extensions = 0x1f03;
-constexpr std::uint32_t iphone_width = 320;
-constexpr std::uint32_t iphone_height = 480;
 constexpr std::size_t maximum_unsupported_traces = 64;
 
 bool is_valid_display(std::uint32_t display) {
@@ -455,12 +453,14 @@ void OpenGlesHle::draw(UserlandHleCall& call, bool indexed) {
         vertices.push_back(*vertex);
     }
     if (vertices.size() < 3) return;
+    const auto geometry = display_ ? display_->geometry()
+                                   : default_display_geometry;
     const auto viewport_width = context->viewport[2] > 0
                                     ? static_cast<std::uint32_t>(context->viewport[2])
-                                    : iphone_2g_display_width;
+                                    : geometry.width;
     const auto viewport_height = context->viewport[3] > 0
                                      ? static_cast<std::uint32_t>(context->viewport[3])
-                                     : iphone_2g_display_height;
+                                     : geometry.height;
     GlesRasterState state;
     state.viewport_x = context->viewport[0];
     state.viewport_y = context->viewport[1];
@@ -602,7 +602,13 @@ void OpenGlesHle::register_egl(UserlandHleRegistry& registry) {
             return;
         }
         const auto context = next_context_++;
-        contexts_.emplace(context, ContextState{});
+        auto state = ContextState{};
+        const auto geometry = display_ ? display_->geometry()
+                                       : default_display_geometry;
+        state.viewport = {0, 0, static_cast<std::int32_t>(geometry.width),
+                          static_cast<std::int32_t>(geometry.height)};
+        state.scissor_box = state.viewport;
+        contexts_.emplace(context, std::move(state));
         egl_error_ = egl_success;
         call.set_return(context);
     });
@@ -743,8 +749,10 @@ void OpenGlesHle::register_egl(UserlandHleRegistry& registry) {
                 call.set_return(egl_false);
                 return;
             }
-            if (call.argument(2) == egl_width) value = iphone_width;
-            if (call.argument(2) == egl_height) value = iphone_height;
+            const auto geometry = display_ ? display_->geometry()
+                                           : default_display_geometry;
+            if (call.argument(2) == egl_width) value = geometry.width;
+            if (call.argument(2) == egl_height) value = geometry.height;
         } else {
             if (!contexts_.contains(call.argument(1))) {
                 egl_error_ = egl_bad_context;

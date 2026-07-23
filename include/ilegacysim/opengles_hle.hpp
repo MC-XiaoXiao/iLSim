@@ -76,12 +76,8 @@ private:
         std::uint32_t bound_element_array_buffer{};
         std::uint32_t unpack_alignment{gles_abi::default_pixel_alignment};
         std::uint32_t pack_alignment{gles_abi::default_pixel_alignment};
-        std::array<std::int32_t, 4> viewport{
-            0, 0, static_cast<std::int32_t>(iphone_2g_display_width),
-            static_cast<std::int32_t>(iphone_2g_display_height)};
-        std::array<std::int32_t, 4> scissor_box{
-            0, 0, static_cast<std::int32_t>(iphone_2g_display_width),
-            static_cast<std::int32_t>(iphone_2g_display_height)};
+        std::array<std::int32_t, 4> viewport{};
+        std::array<std::int32_t, 4> scissor_box{};
         std::array<float, 4> current_color{
             1.0F, 1.0F, 1.0F, 1.0F};
         std::array<bool, 4> color_mask{true, true, true, true};

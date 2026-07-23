@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "ilegacysim/display_geometry.hpp"
 #include "ilegacysim/touch_input.hpp"
 
 namespace ilegacysim {
@@ -44,7 +45,8 @@ struct LiveControlCommand {
 // sessions. The descriptor remains owned by the caller.
 class LiveControl {
 public:
-  explicit LiveControl(int descriptor);
+  explicit LiveControl(int descriptor,
+                       DisplayGeometry geometry = default_display_geometry);
 
   [[nodiscard]] std::vector<LiveControlCommand> poll();
   [[nodiscard]] bool closed() const { return closed_; }
@@ -53,6 +55,7 @@ private:
   [[nodiscard]] std::vector<LiveControlCommand> parse_line(std::string line);
 
   int descriptor_{};
+  DisplayGeometry geometry_;
   std::string buffered_input_;
   bool closed_{};
 };

@@ -279,6 +279,7 @@ std::string usage() {
          "  ilegacysim boot --rootfs DIR [--binary /sbin/launchd] [--ticks N] "
          "[--cores N] [--watch-address ADDR] [--gdb PORT] "
          "[--display headless|sdl] [--network isolated|loopback|host] "
+         "[--display-size WIDTHxHEIGHT] "
          "[--activation activated|unactivated|preserve] "
          "[--frame-output FILE] [--touch-replay FILE] [--control-stdin] "
          "[--baseband-input FILE] [--baseband-output FILE] "
@@ -297,6 +298,25 @@ std::optional<std::string> option(const std::vector<std::string> &args,
     }
   }
   return std::nullopt;
+}
+
+DisplayGeometry parse_display_geometry(std::string_view value) {
+  const auto separator = value.find_first_of("xX");
+  if (separator == std::string_view::npos || separator == 0U ||
+      separator + 1U >= value.size()) {
+    throw std::runtime_error{"--display-size must use WIDTHxHEIGHT"};
+  }
+  const auto parse_extent = [](std::string_view text) {
+    std::size_t consumed = 0;
+    const auto extent = std::stoull(std::string{text}, &consumed, 10);
+    if (consumed != text.size() || extent == 0U || extent > 4'096U) {
+      throw std::runtime_error{
+          "display extents must be in the range 1..4096"};
+    }
+    return static_cast<std::uint32_t>(extent);
+  };
+  return DisplayGeometry{parse_extent(value.substr(0, separator)),
+                         parse_extent(value.substr(separator + 1U))};
 }
 
 std::optional<std::string>
@@ -331,7 +351,7 @@ std::unique_ptr<Output> make_output(const std::vector<std::string> &args) {
 }
 
 void profile(Output &output) {
-  const auto &device = DeviceProfile::iphone_2g_1_0();
+  const auto &device = DeviceProfile::default_profile();
   std::ostringstream text;
   text << "product: " << device.product_type << '\n'
        << "board: " << device.board_config << '\n'
@@ -341,7 +361,10 @@ void profile(Output &output) {
        << "cpu_hz: " << device.cpu_hz << '\n'
        << "ram_bytes: " << device.ram_bytes << '\n'
        << "physical_cpu_count: " << device.physical_cpu_count << '\n'
-       << "display: " << device.display_width << 'x' << device.display_height;
+       << "display: " << device.display.width << 'x' << device.display.height
+       << '\n'
+       << "ui: " << device.user_interface.width << 'x'
+       << device.user_interface.height;
   output.line(text.str());
 }
 
@@ -557,6 +580,15 @@ void boot(const std::vector<std::string> &args, Output &output) {
     throw std::runtime_error{"boot requires --rootfs"};
   }
   const auto binary = option(args, "--binary").value_or("/sbin/launchd");
+  auto device = DeviceProfile::default_profile();
+  if (const auto display_size = option(args, "--display-size")) {
+    device.display = parse_display_geometry(*display_size);
+  }
+  output.line("[device] product=" + std::string{device.product_type} +
+              " display=" + std::to_string(device.display.width) + "x" +
+              std::to_string(device.display.height) + " ui=" +
+              std::to_string(device.user_interface.width) + "x" +
+              std::to_string(device.user_interface.height));
   const auto activation_value =
       option(args, "--activation").value_or("activated");
   const auto activation = parse_lockdown_activation(activation_value);
@@ -573,7 +605,7 @@ void boot(const std::vector<std::string> &args, Output &output) {
   const auto ticks = ticks_option ? std::stoull(*ticks_option)
                                   : std::numeric_limits<std::uint64_t>::max();
   const auto default_processor_count =
-      DeviceProfile::iphone_2g_1_0().physical_cpu_count;
+      device.physical_cpu_count;
   const auto guest_processor_count = static_cast<std::size_t>(
       std::stoul(option(args, "--cores")
                      .value_or(std::to_string(default_processor_count))));
@@ -606,7 +638,8 @@ void boot(const std::vector<std::string> &args, Output &output) {
       throw std::runtime_error{
           "--display sdl requested, but SDL2 support is not built"};
     }
-    sdl_display = std::make_unique<SdlDisplay>();
+    sdl_display = std::make_unique<SdlDisplay>(device.display,
+                                               device.user_interface);
   }
   if (const auto path = option(args, "--frame-output")) {
     frame_file_presenter = std::make_unique<FrameFilePresenter>(*path);
@@ -615,7 +648,7 @@ void boot(const std::vector<std::string> &args, Output &output) {
     touch_replay = std::make_unique<TouchReplay>(*path);
   }
   if (std::find(args.begin(), args.end(), "--control-stdin") != args.end()) {
-    live_control = std::make_unique<LiveControl>(0);
+    live_control = std::make_unique<LiveControl>(0, device.user_interface);
     output.line("[control] ready; use help for commands");
   }
   std::optional<std::uint16_t> gdb_port;
@@ -662,7 +695,8 @@ void boot(const std::vector<std::string> &args, Output &output) {
   initial->cpus =
       std::make_unique<CpuCluster>(maximum_guest_threads, *initial->memory);
   initial->kernel =
-      std::make_unique<CompatibilityKernel>(*initial->memory, output, *rootfs);
+      std::make_unique<CompatibilityKernel>(*initial->memory, output, *rootfs,
+                                            device);
   std::shared_ptr<SdlAudioSink> audio_sink;
   if (SdlAudioSink::available()) {
     audio_sink = std::make_shared<SdlAudioSink>();
@@ -848,7 +882,7 @@ void boot(const std::vector<std::string> &args, Output &output) {
           child->cpus = std::make_unique<CpuCluster>(maximum_guest_threads,
                                                      *child->memory);
           child->kernel = std::make_unique<CompatibilityKernel>(
-              *child->memory, output, *rootfs);
+              *child->memory, output, *rootfs, device);
           child->kernel->inherit_process_state(*runtime_ptr->kernel, child_pid);
           child->allocated.assign(maximum_guest_threads, false);
           configure_runtime(*child);

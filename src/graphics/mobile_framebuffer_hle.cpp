@@ -48,12 +48,14 @@ MobileFramebufferHle::MobileFramebufferHle(
   };
   // IOMobileFramebufferOpen intentionally executes from the firmware: it
   // allocates a genuine CFRuntime object and opens only our display handle.
-  add("_IOMobileFramebufferGetDisplaySize", [](UserlandHleCall &call) {
+  add("_IOMobileFramebufferGetDisplaySize", [this](UserlandHleCall &call) {
     const auto output = call.argument(1);
+    const auto geometry = display_ ? display_->geometry()
+                                   : default_display_geometry;
     const auto width = std::bit_cast<std::uint32_t>(
-        static_cast<float>(iphone_2g_display_width));
+        static_cast<float>(geometry.width));
     const auto height = std::bit_cast<std::uint32_t>(
-        static_cast<float>(iphone_2g_display_height));
+        static_cast<float>(geometry.height));
     call.set_return(output != 0 && call.memory().write32(output, width) &&
                             call.memory().write32(output + 4U, height)
                         ? iokit_abi::success
@@ -225,10 +227,9 @@ void MobileFramebufferHle::set_layer(UserlandHleCall &call) {
 void MobileFramebufferHle::submit_layers(UserlandHleCall &call) {
   if (display_ == nullptr)
     return;
+  const auto geometry = display_->geometry();
   std::vector<std::uint32_t> composed(
-      static_cast<std::size_t>(iphone_2g_display_width) *
-          iphone_2g_display_height,
-      background_argb_);
+      geometry.pixel_count(), background_argb_);
   const auto blend_channel = [](std::uint32_t source, std::uint32_t destination,
                                 std::uint32_t inverse_alpha) {
     return std::min(255U, source + (destination * inverse_alpha + 127U) / 255U);
@@ -247,33 +248,33 @@ void MobileFramebufferHle::submit_layers(UserlandHleCall &call) {
                                          static_cast<double>(maximum)));
     };
     const auto destination_left =
-        clipped_edge(state.destination.x, iphone_2g_display_width);
+        clipped_edge(state.destination.x, geometry.width);
     const auto destination_top =
-        clipped_edge(state.destination.y, iphone_2g_display_height);
+        clipped_edge(state.destination.y, geometry.height);
     const auto destination_right = clipped_edge(
         static_cast<double>(state.destination.x) + state.destination.width,
-        iphone_2g_display_width);
+        geometry.width);
     const auto destination_bottom = clipped_edge(
         static_cast<double>(state.destination.y) + state.destination.height,
-        iphone_2g_display_height);
+        geometry.height);
     if (destination_right <= destination_left ||
         destination_bottom <= destination_top) {
       continue;
     }
     const auto full_surface_copy =
         destination_left == 0 && destination_top == 0 &&
-        destination_right == static_cast<int>(iphone_2g_display_width) &&
-        destination_bottom == static_cast<int>(iphone_2g_display_height) &&
+        destination_right == static_cast<int>(geometry.width) &&
+        destination_bottom == static_cast<int>(geometry.height) &&
         state.destination.x == 0.0F && state.destination.y == 0.0F &&
         state.destination.width ==
-            static_cast<float>(iphone_2g_display_width) &&
+            static_cast<float>(geometry.width) &&
         state.destination.height ==
-            static_cast<float>(iphone_2g_display_height) &&
+            static_cast<float>(geometry.height) &&
         state.source.x == 0.0F && state.source.y == 0.0F &&
         state.source.width == static_cast<float>(backing->width) &&
         state.source.height == static_cast<float>(backing->height) &&
-        backing->width == iphone_2g_display_width &&
-        backing->height == iphone_2g_display_height &&
+        backing->width == geometry.width &&
+        backing->height == geometry.height &&
         std::all_of(source_pixels->begin(), source_pixels->end(),
                     [](std::uint32_t pixel) { return (pixel >> 24U) == 255U; });
     if (full_surface_copy) {
@@ -307,7 +308,7 @@ void MobileFramebufferHle::submit_layers(UserlandHleCall &call) {
                                  backing->width +
                              static_cast<std::size_t>(source_x)];
         auto &destination_pixel =
-            composed[static_cast<std::size_t>(y) * iphone_2g_display_width +
+            composed[static_cast<std::size_t>(y) * geometry.width +
                      static_cast<std::size_t>(x)];
         const auto alpha = source_pixel >> 24U;
         if (alpha == 255U) {

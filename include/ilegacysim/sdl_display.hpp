@@ -3,6 +3,7 @@
 #include <memory>
 #include <vector>
 
+#include "ilegacysim/display_geometry.hpp"
 #include "ilegacysim/system_button_input.hpp"
 #include "ilegacysim/touch_input.hpp"
 
@@ -12,7 +13,8 @@ struct DisplayFrame;
 
 class SdlDisplay {
 public:
-  SdlDisplay();
+  SdlDisplay(DisplayGeometry frame_geometry,
+             DisplayGeometry input_geometry);
   ~SdlDisplay();
   SdlDisplay(const SdlDisplay &) = delete;
   SdlDisplay &operator=(const SdlDisplay &) = delete;

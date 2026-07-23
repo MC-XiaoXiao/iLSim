@@ -2,7 +2,7 @@
 
 namespace ilegacysim {
 
-const DeviceProfile& DeviceProfile::iphone_2g_1_0() {
+const DeviceProfile& DeviceProfile::default_profile() {
     // iPhone OS 1.0 used the pre-1.1.2 clock setting generally reported as
     // 400 MHz. The S5L8900/ARM1176 core is physically single-core; the emulator
     // may expose extra virtual execution cores for stress and scheduler testing.
@@ -17,8 +17,8 @@ const DeviceProfile& DeviceProfile::iphone_2g_1_0() {
         100'000'000,
         128ULL * 1024ULL * 1024ULL,
         1,
-        320,
-        480,
+        default_display_geometry,
+        default_display_geometry,
     };
     return profile;
 }

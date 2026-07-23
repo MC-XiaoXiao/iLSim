@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <string_view>
 
+#include "ilegacysim/display_geometry.hpp"
+
 namespace ilegacysim {
 
 struct DeviceProfile {
@@ -20,10 +22,13 @@ struct DeviceProfile {
     std::uint32_t bus_hz;
     std::uint64_t ram_bytes;
     std::size_t physical_cpu_count;
-    std::uint32_t display_width;
-    std::uint32_t display_height;
+    // Guest-visible panel/framebuffer size.
+    DisplayGeometry display;
+    // Native firmware layout and touch coordinate space. Older UIKit builds
+    // may keep this fixed even when a different panel geometry is reported.
+    DisplayGeometry user_interface;
 
-    static const DeviceProfile& iphone_2g_1_0();
+    static const DeviceProfile& default_profile();
 };
 
 }  // namespace ilegacysim

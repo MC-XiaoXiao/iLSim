@@ -25,6 +25,7 @@
 #include "ilegacysim/core_surface_hle.hpp"
 #include "ilegacysim/cpu.hpp"
 #include "ilegacysim/display.hpp"
+#include "ilegacysim/device_profile.hpp"
 #include "ilegacysim/hfs_metadata.hpp"
 #include "ilegacysim/host_network.hpp"
 #include "ilegacysim/kernel_control.hpp"
@@ -81,7 +82,8 @@ public:
       std::function<std::uint32_t(std::uint32_t, std::uint32_t)>;
 
   CompatibilityKernel(AddressSpace &memory, Output &output,
-                      std::filesystem::path rootfs = {});
+                      std::filesystem::path rootfs = {},
+                      DeviceProfile device = DeviceProfile::default_profile());
 
   void attach(Cpu &cpu);
   void dispatch(Cpu &cpu, std::uint32_t svc_immediate);
@@ -386,9 +388,9 @@ private:
   AddressSpace &memory_;
   Output &output_;
   std::filesystem::path rootfs_;
+  DeviceProfile device_profile_;
   hfs::MetadataProvider hfs_metadata_;
-  std::shared_ptr<DisplayState> display_state_{
-      std::make_shared<DisplayState>()};
+  std::shared_ptr<DisplayState> display_state_;
   std::shared_ptr<WifiState> wifi_state_{std::make_shared<WifiState>()};
   std::shared_ptr<AudioService> audio_service_;
   UserlandHleRegistry userland_hle_;

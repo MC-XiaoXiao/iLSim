@@ -13,8 +13,6 @@
 #include <poll.h>
 #include <unistd.h>
 
-#include "ilegacysim/display.hpp"
-
 namespace ilegacysim {
 namespace {
 
@@ -29,10 +27,9 @@ constexpr auto drag_release_delay = std::chrono::milliseconds{16};
 // Reproduce the smallest trajectory that has been verified against the stock
 // iPhone OS 1.0 lock slider: Down at the knob center, seven 30-pixel moves at
 // 200 ms intervals, then Up after one final 200 ms hold.
-constexpr float unlock_start_x = 50.0F;
-constexpr float unlock_start_y = 430.0F;
-constexpr float unlock_end_x = 260.0F;
-constexpr float unlock_end_y = 430.0F;
+constexpr float unlock_start_x_fraction = 0.15625F;
+constexpr float unlock_y_fraction = 0.8958333333F;
+constexpr float unlock_end_x_fraction = 0.8125F;
 constexpr std::int64_t unlock_duration_ms = 1'400;
 constexpr std::size_t unlock_steps = 7;
 constexpr auto unlock_release_delay = std::chrono::milliseconds{200};
@@ -61,10 +58,10 @@ std::string trim(std::string value) {
   return value.substr(first, last - first + 1U);
 }
 
-bool valid_touch_position(float x, float y) {
+bool valid_touch_position(float x, float y, DisplayGeometry geometry) {
   return std::isfinite(x) && std::isfinite(y) && x >= 0.0F && y >= 0.0F &&
-         x < static_cast<float>(iphone_2g_display_width) &&
-         y < static_cast<float>(iphone_2g_display_height);
+         x < static_cast<float>(geometry.width) &&
+         y < static_cast<float>(geometry.height);
 }
 
 LiveControlCommand make_drag_command(
@@ -106,7 +103,9 @@ std::optional<TouchPhase> parse_phase(std::string_view value) {
 
 } // namespace
 
-LiveControl::LiveControl(int descriptor) : descriptor_{descriptor} {
+LiveControl::LiveControl(int descriptor, DisplayGeometry geometry)
+    : descriptor_{descriptor},
+      geometry_{geometry.valid() ? geometry : default_display_geometry} {
   if (descriptor_ < 0)
     closed_ = true;
 }
@@ -240,8 +239,11 @@ std::vector<LiveControlCommand> LiveControl::parse_line(std::string line) {
     std::string trailing;
     if (parser >> trailing)
       return {error_command("unlock does not accept arguments")};
+    const auto width = static_cast<float>(geometry_.width);
+    const auto height = static_cast<float>(geometry_.height);
     auto command = make_drag_command(
-        unlock_start_x, unlock_start_y, unlock_end_x, unlock_end_y,
+        width * unlock_start_x_fraction, height * unlock_y_fraction,
+        width * unlock_end_x_fraction, height * unlock_y_fraction,
         unlock_duration_ms, unlock_steps, "unlock", unlock_release_delay,
         unlock_wake_settle_delay);
     command.wake_display = true;
@@ -270,13 +272,15 @@ std::vector<LiveControlCommand> LiveControl::parse_line(std::string line) {
         parser >> std::ws;
       }
     }
-    if (!parser.eof() || !valid_touch_position(start_x, start_y) ||
-        !valid_touch_position(end_x, end_y) || duration_ms <= 0 ||
+    if (!parser.eof() || !valid_touch_position(start_x, start_y, geometry_) ||
+        !valid_touch_position(end_x, end_y, geometry_) || duration_ms <= 0 ||
         duration_ms > maximum_drag_duration_ms || steps == 0 ||
         steps > maximum_drag_steps ||
         duration_ms < static_cast<std::int64_t>(steps)) {
       return {error_command(
-          "drag coordinates must be inside 320x480; duration must be "
+          "drag coordinates must be inside " +
+          std::to_string(geometry_.width) + "x" +
+          std::to_string(geometry_.height) + "; duration must be "
           "1..5000 ms and at least steps; steps must be 1..64")};
     }
 
@@ -303,10 +307,14 @@ std::vector<LiveControlCommand> LiveControl::parse_line(std::string line) {
         return {error_command("tap hold duration must be an integer")};
       parser >> std::ws;
     }
-    if (!parser.eof() || !valid_touch_position(x, y) || duration_ms <= 0 ||
+    if (!parser.eof() || !valid_touch_position(x, y, geometry_) ||
+        duration_ms <= 0 ||
         duration_ms > maximum_drag_duration_ms) {
       return {error_command(
-          "tap coordinates must be inside 320x480 and hold duration must be "
+          "tap coordinates must be inside " +
+          std::to_string(geometry_.width) + "x" +
+          std::to_string(geometry_.height) +
+          " and hold duration must be "
           "1..5000 ms")};
     }
     LiveControlCommand command;
@@ -326,9 +334,11 @@ std::vector<LiveControlCommand> LiveControl::parse_line(std::string line) {
   float y = 0.0F;
   std::string trailing;
   if (!phase || !(parser >> x >> y) || (parser >> trailing) ||
-      !valid_touch_position(x, y)) {
+      !valid_touch_position(x, y, geometry_)) {
     return {error_command(
-        "expected touch <down|move|up|cancel> x y inside 320x480")};
+        "expected touch <down|move|up|cancel> x y inside " +
+        std::to_string(geometry_.width) + "x" +
+        std::to_string(geometry_.height))};
   }
   LiveControlCommand command;
   command.kind = LiveControlCommandKind::Touch;

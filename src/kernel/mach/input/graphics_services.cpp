@@ -691,25 +691,31 @@ void record_application_lifecycle_event_locked(
                  cached != state.application_scene_transforms.end()) {
         screen_origin_y = cached->second.screen_origin_y;
       }
-      const auto rounded_origin_y = std::llround(screen_origin_y);
-      if (rounded_origin_y > 0 && rounded_origin_y < iphone_2g_display_height &&
+      const auto geometry = state.display_geometry;
+      const auto ui_geometry = state.user_interface_geometry;
+      const auto scaled_origin_y =
+          ui_geometry.height == 0U
+              ? screen_origin_y
+              : screen_origin_y * static_cast<float>(geometry.height) /
+                    static_cast<float>(ui_geometry.height);
+      const auto rounded_origin_y = std::llround(scaled_origin_y);
+      if (rounded_origin_y > 0 && rounded_origin_y < geometry.height &&
           application_pixels.size() ==
-              static_cast<std::size_t>(iphone_2g_display_width) *
-                  iphone_2g_display_height) {
+              geometry.pixel_count()) {
         const auto inset = static_cast<std::size_t>(rounded_origin_y);
         const auto client_height =
-            static_cast<std::size_t>(iphone_2g_display_height) - inset;
+            static_cast<std::size_t>(geometry.height) - inset;
         std::vector<std::uint32_t> local_pixels(application_pixels.size());
-        for (std::size_t target_y = 0; target_y < iphone_2g_display_height;
+        for (std::size_t target_y = 0; target_y < geometry.height;
              ++target_y) {
           const auto client_y =
               std::min(client_height - 1U,
-                       target_y * client_height / iphone_2g_display_height);
-          const auto source = (inset + client_y) * iphone_2g_display_width;
-          const auto destination_offset = target_y * iphone_2g_display_width;
+                       target_y * client_height / geometry.height);
+          const auto source = (inset + client_y) * geometry.width;
+          const auto destination_offset = target_y * geometry.width;
           std::copy_n(application_pixels.begin() +
                           static_cast<std::ptrdiff_t>(source),
-                      iphone_2g_display_width,
+                      geometry.width,
                       local_pixels.begin() +
                           static_cast<std::ptrdiff_t>(destination_offset));
         }

@@ -115,10 +115,12 @@ CoreSurfaceHle::Buffer* CoreSurfaceHle::find(std::uint32_t client) {
 
 std::uint32_t CoreSurfaceHle::create_default_buffer(
     UserlandHleCall& call, std::uint32_t requested_id) {
-    constexpr auto width = iphone_2g_display_width;
-    constexpr auto height = iphone_2g_display_height;
-    constexpr auto pitch = width * core_surface_abi::bytes_per_bgra_pixel;
-    constexpr auto size = pitch * height;
+    const auto geometry = display_ ? display_->geometry()
+                                   : default_display_geometry;
+    const auto width = geometry.width;
+    const auto height = geometry.height;
+    const auto pitch = width * core_surface_abi::bytes_per_bgra_pixel;
+    const auto size = pitch * height;
     const auto base = call.allocate_data(size, pixel_buffer_alignment);
     if (base == 0) return 0;
     return create_buffer(
@@ -131,15 +133,17 @@ std::uint32_t CoreSurfaceHle::wrap_client_memory(
         !call.memory().mapped(base, size)) {
         return 0;
     }
-    const auto full_screen_size = iphone_2g_display_width *
-                                  iphone_2g_display_height *
+    const auto geometry = display_ ? display_->geometry()
+                                   : default_display_geometry;
+    const auto full_screen_size = geometry.width *
+                                  geometry.height *
                                   core_surface_abi::bytes_per_bgra_pixel;
     const auto width = size >= full_screen_size
-                           ? iphone_2g_display_width
+                           ? geometry.width
                            : std::max(
                                  1U, size /
                                          core_surface_abi::bytes_per_bgra_pixel);
-    const auto height = size >= full_screen_size ? iphone_2g_display_height : 1U;
+    const auto height = size >= full_screen_size ? geometry.height : 1U;
     return create_buffer(call, base, size, width, height, false);
 }
 
@@ -177,10 +181,12 @@ std::uint32_t CoreSurfaceHle::create_buffer(
     backing.provenance.producer_process_id = call.process_id();
     if (publish && !surfaces_->publish(call.memory(), backing)) return 0;
     std::vector<std::uint32_t> preserved_exit_snapshot_pixels;
+    const auto geometry = display_ ? display_->geometry()
+                                   : default_display_geometry;
     if (shared_state_ && publish && owns_memory &&
-        width == iphone_2g_display_width &&
-        height == iphone_2g_display_height &&
-        pitch == iphone_2g_display_width *
+        width == geometry.width &&
+        height == geometry.height &&
+        pitch == geometry.width *
                      core_surface_abi::bytes_per_bgra_pixel) {
         std::lock_guard lock{shared_state_->mach_mutex};
         auto& pending = shared_state_->pending_application_exit_snapshot;
@@ -205,9 +211,9 @@ std::uint32_t CoreSurfaceHle::create_buffer(
 }
 
 void CoreSurfaceHle::submit(Buffer& buffer, UserlandHleCall& call) {
-    if (!display_ || buffer.width != iphone_2g_display_width ||
-        buffer.height != iphone_2g_display_height ||
-        buffer.bytes_per_row != iphone_2g_display_width *
+    if (!display_ || buffer.width != display_->width() ||
+        buffer.height != display_->height() ||
+        buffer.bytes_per_row != display_->width() *
                                     core_surface_abi::bytes_per_bgra_pixel) {
         return;
     }
@@ -228,14 +234,13 @@ void CoreSurfaceHle::submit(Buffer& buffer, UserlandHleCall& call) {
     }
     const auto bytes = call.memory().read_bytes(buffer.base, buffer.allocation_size);
     if (!bytes || bytes->size() < static_cast<std::size_t>(
-                                    iphone_2g_display_width) *
-                                    iphone_2g_display_height *
+                                    display_->width()) *
+                                    display_->height() *
                                     core_surface_abi::bytes_per_bgra_pixel) {
         return;
     }
     std::vector<std::uint32_t> pixels(
-        static_cast<std::size_t>(iphone_2g_display_width) *
-        iphone_2g_display_height);
+        display_->geometry().pixel_count());
     for (std::size_t index = 0; index < pixels.size(); ++index) {
         const auto offset =
             index * core_surface_abi::bytes_per_bgra_pixel;
@@ -254,12 +259,14 @@ void CoreSurfaceHle::dispatch(UserlandHleCall& call) {
         return;
     }
     if (symbol == "_CoreSurfaceClientBufferAlloc") {
-        constexpr auto size = iphone_2g_display_width * iphone_2g_display_height *
-                              core_surface_abi::bytes_per_bgra_pixel;
+        const auto geometry = display_ ? display_->geometry()
+                                       : default_display_geometry;
+        const auto size = geometry.pixel_count() *
+                          core_surface_abi::bytes_per_bgra_pixel;
         const auto base = call.allocate_data(size, pixel_buffer_alignment);
         call.set_return(base == 0 ? 0 : create_buffer(
-            call, base, size, iphone_2g_display_width,
-            iphone_2g_display_height, true, call.argument(0)));
+            call, base, static_cast<std::uint32_t>(size), geometry.width,
+            geometry.height, true, call.argument(0)));
         return;
     }
     if (symbol == "_CoreSurfaceClientBufferWrapClientMemory") {

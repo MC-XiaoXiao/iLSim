@@ -358,7 +358,7 @@ void Mbx2dHle::set_feature(UserlandHleCall &call, bool context_api,
     state->enabled_features.erase(feature);
     // LayerKit brackets its affine/quad pass with the rotation feature.
     // The scissor programmed for that pass must not leak into the regular
-    // 2D blits which follow (notably the lock-screen bar at y=384..480).
+    // 2D blits which follow (notably the lock-screen bottom bar).
     if (feature == mbx2d_abi::feature_rotation) {
       state->scissor.enabled = false;
     }
@@ -374,8 +374,10 @@ Mbx2dHle::resolve(const std::optional<Binding> &binding) const {
   if (surface == surfaces_.end())
     return std::nullopt;
   if (surface->second.framebuffer) {
-    return ResolvedSurface{std::nullopt, true, iphone_2g_display_width,
-                           iphone_2g_display_height};
+    const auto geometry = display_ ? display_->geometry()
+                                   : default_display_geometry;
+    return ResolvedSurface{std::nullopt, true, geometry.width,
+                           geometry.height};
   }
   if (surface->second.client_backing) {
     auto backing = *surface->second.client_backing;
@@ -927,8 +929,8 @@ void Mbx2dHle::submit_destination(UserlandHleCall &call, bool context_api) {
     return;
   const auto destination = resolve(state->destination);
   if (!destination || destination->framebuffer || !display_ ||
-      destination->width != iphone_2g_display_width ||
-      destination->height != iphone_2g_display_height) {
+      destination->width != display_->width() ||
+      destination->height != display_->height()) {
     return;
   }
   const auto pixels = read_region(*destination, 0, 0, destination->width,

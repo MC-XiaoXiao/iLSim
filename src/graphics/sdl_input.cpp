@@ -13,7 +13,8 @@ namespace ilegacysim {
 namespace {
 
 #if defined(ILEGACYSIM_HAS_SDL2)
-TouchInput map_mouse(SDL_Window *window, TouchPhase phase, int x, int y) {
+TouchInput map_mouse(SDL_Window *window, TouchPhase phase, int x, int y,
+                     DisplayGeometry geometry) {
   int width = 1;
   int height = 1;
   SDL_GetWindowSize(window, &width, &height);
@@ -23,16 +24,17 @@ TouchInput map_mouse(SDL_Window *window, TouchPhase phase, int x, int y) {
         0.0F, 1.0F);
     return normalized * static_cast<float>(guest_extent - 1U);
   };
-  return TouchInput{phase, scale(x, width, iphone_2g_display_width),
-                    scale(y, height, iphone_2g_display_height)};
+  return TouchInput{phase, scale(x, width, geometry.width),
+                    scale(y, height, geometry.height)};
 }
 
-TouchInput map_finger(TouchPhase phase, float x, float y) {
+TouchInput map_finger(TouchPhase phase, float x, float y,
+                      DisplayGeometry geometry) {
   return TouchInput{phase,
                     std::clamp(x, 0.0F, 1.0F) *
-                        static_cast<float>(iphone_2g_display_width - 1U),
+                        static_cast<float>(geometry.width - 1U),
                     std::clamp(y, 0.0F, 1.0F) *
-                        static_cast<float>(iphone_2g_display_height - 1U)};
+                        static_cast<float>(geometry.height - 1U)};
 }
 
 std::optional<SystemButton> map_key(SDL_Keycode key) {
@@ -76,34 +78,40 @@ bool SdlInput::poll(SDL_Window *window) {
           event.button.which != SDL_TOUCH_MOUSEID) {
         mouse_active_ = true;
         touch_events_.push_back(map_mouse(window, TouchPhase::Down,
-                                          event.button.x, event.button.y));
+                                          event.button.x, event.button.y,
+                                          geometry_));
       }
       break;
     case SDL_MOUSEMOTION:
       if (mouse_active_ && event.motion.which != SDL_TOUCH_MOUSEID) {
         touch_events_.push_back(map_mouse(window, TouchPhase::Move,
-                                          event.motion.x, event.motion.y));
+                                          event.motion.x, event.motion.y,
+                                          geometry_));
       }
       break;
     case SDL_MOUSEBUTTONUP:
       if (event.button.button == SDL_BUTTON_LEFT && mouse_active_ &&
           event.button.which != SDL_TOUCH_MOUSEID) {
         touch_events_.push_back(
-            map_mouse(window, TouchPhase::Up, event.button.x, event.button.y));
+            map_mouse(window, TouchPhase::Up, event.button.x, event.button.y,
+                      geometry_));
         mouse_active_ = false;
       }
       break;
     case SDL_FINGERDOWN:
       touch_events_.push_back(
-          map_finger(TouchPhase::Down, event.tfinger.x, event.tfinger.y));
+          map_finger(TouchPhase::Down, event.tfinger.x, event.tfinger.y,
+                     geometry_));
       break;
     case SDL_FINGERMOTION:
       touch_events_.push_back(
-          map_finger(TouchPhase::Move, event.tfinger.x, event.tfinger.y));
+          map_finger(TouchPhase::Move, event.tfinger.x, event.tfinger.y,
+                     geometry_));
       break;
     case SDL_FINGERUP:
       touch_events_.push_back(
-          map_finger(TouchPhase::Up, event.tfinger.x, event.tfinger.y));
+          map_finger(TouchPhase::Up, event.tfinger.x, event.tfinger.y,
+                     geometry_));
       break;
     default:
       break;

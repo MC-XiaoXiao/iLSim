@@ -20,6 +20,7 @@
 #include "ilegacysim/darwin_network_abi.hpp"
 #include "ilegacysim/darwin_resource_abi.hpp"
 #include "ilegacysim/darwin_route_socket.hpp"
+#include "ilegacysim/display_geometry.hpp"
 #include "ilegacysim/file_page_cache.hpp"
 #include "ilegacysim/hfs_metadata.hpp"
 #include "ilegacysim/kernel_mach_task_identity.hpp"
@@ -264,6 +265,11 @@ make_socket_pair_endpoints(std::uint32_t pair) {
 }
 
 struct KernelSharedState {
+  std::string device_product_type;
+  std::string device_board_config;
+  std::string device_model_number;
+  std::uint64_t device_ram_bytes{};
+
   struct NetworkInterface {
     std::uint16_t flags{};
     std::uint16_t index{};
@@ -649,6 +655,8 @@ struct KernelSharedState {
       iokit_display_connections;
   // The physical panel has one power state even though GraphicsServices and
   // LayerKit open separate AppleH1CLCD user clients.
+  DisplayGeometry display_geometry{default_display_geometry};
+  DisplayGeometry user_interface_geometry{default_display_geometry};
   std::optional<std::uint32_t> requested_display_power_state;
   std::uint32_t baseband_service{};
   bsd::baseband_device::State baseband_device_state;

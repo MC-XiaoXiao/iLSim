@@ -64,9 +64,12 @@ constexpr std::uint32_t root_disk_device =
 } // namespace
 
 CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
-                                         std::filesystem::path rootfs)
+                                         std::filesystem::path rootfs,
+                                         DeviceProfile device)
     : memory_{memory}, output_{output}, rootfs_{std::move(rootfs)},
+      device_profile_{device},
       hfs_metadata_{rootfs_},
+      display_state_{std::make_shared<DisplayState>(device_profile_.display)},
       audio_service_{std::make_shared<AudioService>(rootfs_)},
       userland_hle_{memory_, output_},
       audio_toolbox_hle_{userland_hle_, audio_service_},
@@ -81,6 +84,13 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
       mbx2d_hle_{userland_hle_, display_state_, surface_store_},
       mobile_framebuffer_hle_{userland_hle_, display_state_, surface_store_,
                               presentation_tracker_} {
+  shared_state_->device_product_type = device_profile_.product_type;
+  shared_state_->device_board_config = device_profile_.board_config;
+  shared_state_->device_model_number = device_profile_.model_number;
+  shared_state_->device_ram_bytes = device_profile_.ram_bytes;
+  device_profile_.display = display_state_->geometry();
+  shared_state_->display_geometry = device_profile_.display;
+  shared_state_->user_interface_geometry = device_profile_.user_interface;
   core_surface_hle_.set_shared_state(shared_state_);
   core_surface_hle_.set_scene_coordinator(scene_coordinator_);
   opengles_hle_.set_shared_state(shared_state_);

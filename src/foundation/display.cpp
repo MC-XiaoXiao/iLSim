@@ -15,10 +15,11 @@ visible_pixels(const std::vector<std::uint32_t> &scanout, bool powered_on) {
 
 } // namespace
 
-DisplayState::DisplayState()
-    : pixels_(static_cast<std::size_t>(iphone_2g_display_width) *
-                  iphone_2g_display_height,
-              0xff000000U) {}
+DisplayState::DisplayState() : DisplayState(default_display_geometry) {}
+
+DisplayState::DisplayState(DisplayGeometry geometry)
+    : geometry_{geometry.valid() ? geometry : default_display_geometry},
+      pixels_(geometry_.pixel_count(), 0xff000000U) {}
 
 void DisplayState::set_presenter(Presenter presenter) {
   std::lock_guard lock{mutex_};
@@ -31,8 +32,7 @@ void DisplayState::clear(std::uint32_t argb) {
 }
 
 void DisplayState::replace_pixels(std::vector<std::uint32_t> pixels) {
-  const auto expected = static_cast<std::size_t>(iphone_2g_display_width) *
-                        iphone_2g_display_height;
+  const auto expected = geometry_.pixel_count();
   if (pixels.size() != expected)
     return;
   std::lock_guard lock{mutex_};
@@ -51,8 +51,8 @@ void DisplayState::set_powered_on(bool powered_on) {
     presenter = presenter_;
     if (!presenter)
       return;
-    frame = DisplayFrame{iphone_2g_display_width, iphone_2g_display_height,
-                         sequence_, visible_pixels(pixels_, powered_on_)};
+    frame = DisplayFrame{geometry_.width, geometry_.height, sequence_,
+                         visible_pixels(pixels_, powered_on_)};
   }
   presenter(frame);
 }
@@ -66,16 +66,16 @@ void DisplayState::present() {
     presenter = presenter_;
     if (!presenter)
       return;
-    frame = DisplayFrame{iphone_2g_display_width, iphone_2g_display_height,
-                         sequence_, visible_pixels(pixels_, powered_on_)};
+    frame = DisplayFrame{geometry_.width, geometry_.height, sequence_,
+                         visible_pixels(pixels_, powered_on_)};
   }
   presenter(frame);
 }
 
 DisplayFrame DisplayState::snapshot() const {
   std::lock_guard lock{mutex_};
-  return DisplayFrame{iphone_2g_display_width, iphone_2g_display_height,
-                      sequence_, visible_pixels(pixels_, powered_on_)};
+  return DisplayFrame{geometry_.width, geometry_.height, sequence_,
+                      visible_pixels(pixels_, powered_on_)};
 }
 
 std::uint64_t DisplayState::presented_frames() const {

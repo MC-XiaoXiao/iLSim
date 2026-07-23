@@ -13,9 +13,9 @@ namespace ilegacysim {
 void Mbx2dHle::initialize_destination(
     UserlandHleCall& call, RenderState& state) {
     const auto destination = resolve(state.destination);
-    if (!destination || destination->framebuffer ||
-        destination->width != iphone_2g_display_width ||
-        destination->height != iphone_2g_display_height) {
+    if (!destination || destination->framebuffer || !display_ ||
+        destination->width != display_->width() ||
+        destination->height != display_->height()) {
         return;
     }
     const auto surface = state.destination->surface;
@@ -58,9 +58,9 @@ void Mbx2dHle::prepare_destination_for_frame(
     UserlandHleCall& call, RenderState& state) {
     initialize_destination(call, state);
     const auto destination = resolve(state.destination);
-    if (!destination || destination->framebuffer ||
-        destination->width != iphone_2g_display_width ||
-        destination->height != iphone_2g_display_height) {
+    if (!destination || destination->framebuffer || !display_ ||
+        destination->width != display_->width() ||
+        destination->height != display_->height()) {
         return;
     }
     const auto surface = state.destination->surface;

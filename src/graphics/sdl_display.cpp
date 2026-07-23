@@ -12,6 +12,10 @@
 namespace ilegacysim {
 
 struct SdlDisplay::Impl {
+  Impl(DisplayGeometry initial_geometry, DisplayGeometry input_geometry)
+      : geometry{initial_geometry}, input{input_geometry} {}
+
+  DisplayGeometry geometry;
 #if defined(ILEGACYSIM_HAS_SDL2)
   SDL_Window *window{};
   SDL_Renderer *renderer{};
@@ -29,16 +33,21 @@ bool SdlDisplay::available() {
 #endif
 }
 
-SdlDisplay::SdlDisplay() : impl_{std::make_unique<Impl>()} {
+SdlDisplay::SdlDisplay(DisplayGeometry frame_geometry,
+                       DisplayGeometry input_geometry)
+    : impl_{std::make_unique<Impl>(
+          frame_geometry.valid() ? frame_geometry : default_display_geometry,
+          input_geometry.valid() ? input_geometry
+                                 : default_display_geometry)} {
 #if defined(ILEGACYSIM_HAS_SDL2)
   if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
     throw std::runtime_error{"SDL video initialization failed: " +
                              std::string{SDL_GetError()}};
   }
   impl_->window = SDL_CreateWindow(
-      "iLegacySim — iPhone 2G", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-      static_cast<int>(iphone_2g_display_width),
-      static_cast<int>(iphone_2g_display_height), SDL_WINDOW_RESIZABLE);
+      "iLegacySim", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+      static_cast<int>(impl_->geometry.width),
+      static_cast<int>(impl_->geometry.height), SDL_WINDOW_RESIZABLE);
   if (impl_->window == nullptr) {
     throw std::runtime_error{"SDL window creation failed: " +
                              std::string{SDL_GetError()}};
@@ -55,17 +64,15 @@ SdlDisplay::SdlDisplay() : impl_{std::make_unique<Impl>()} {
   }
   impl_->texture = SDL_CreateTexture(
       impl_->renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
-      static_cast<int>(iphone_2g_display_width),
-      static_cast<int>(iphone_2g_display_height));
+      static_cast<int>(impl_->geometry.width),
+      static_cast<int>(impl_->geometry.height));
   if (impl_->texture == nullptr) {
     throw std::runtime_error{"SDL texture creation failed: " +
                              std::string{SDL_GetError()}};
   }
-  DisplayFrame initial{iphone_2g_display_width, iphone_2g_display_height, 0,
-                       std::vector<std::uint32_t>(
-                           static_cast<std::size_t>(iphone_2g_display_width) *
-                               iphone_2g_display_height,
-                           0xff000000U)};
+  DisplayFrame initial{impl_->geometry.width, impl_->geometry.height, 0,
+                       std::vector<std::uint32_t>(impl_->geometry.pixel_count(),
+                                                  0xff000000U)};
   present(initial);
 #else
   throw std::runtime_error{
@@ -89,8 +96,8 @@ SdlDisplay::~SdlDisplay() {
 
 void SdlDisplay::present(const DisplayFrame &frame) {
 #if defined(ILEGACYSIM_HAS_SDL2)
-  if (!impl_->running || frame.width != iphone_2g_display_width ||
-      frame.height != iphone_2g_display_height || frame.pixels.empty()) {
+  if (!impl_->running || frame.width != impl_->geometry.width ||
+      frame.height != impl_->geometry.height || frame.pixels.empty()) {
     return;
   }
   if (SDL_UpdateTexture(

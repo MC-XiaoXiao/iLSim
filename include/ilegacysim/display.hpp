@@ -5,10 +5,9 @@
 #include <mutex>
 #include <vector>
 
-namespace ilegacysim {
+#include "ilegacysim/display_geometry.hpp"
 
-inline constexpr std::uint32_t iphone_2g_display_width = 320;
-inline constexpr std::uint32_t iphone_2g_display_height = 480;
+namespace ilegacysim {
 
 struct DisplayFrame {
   std::uint32_t width{};
@@ -24,6 +23,7 @@ public:
   using Presenter = std::function<void(const DisplayFrame &)>;
 
   DisplayState();
+  explicit DisplayState(DisplayGeometry geometry);
 
   void set_presenter(Presenter presenter);
   void clear(std::uint32_t argb);
@@ -36,8 +36,12 @@ public:
   [[nodiscard]] DisplayFrame snapshot() const;
   [[nodiscard]] std::uint64_t presented_frames() const;
   [[nodiscard]] bool powered_on() const;
+  [[nodiscard]] DisplayGeometry geometry() const { return geometry_; }
+  [[nodiscard]] std::uint32_t width() const { return geometry_.width; }
+  [[nodiscard]] std::uint32_t height() const { return geometry_.height; }
 
 private:
+  DisplayGeometry geometry_;
   mutable std::mutex mutex_;
   std::vector<std::uint32_t> pixels_;
   Presenter presenter_;

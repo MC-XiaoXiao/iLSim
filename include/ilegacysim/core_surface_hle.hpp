@@ -31,8 +31,8 @@ public:
     void set_display(std::shared_ptr<DisplayState> display);
     void set_shared_state(std::shared_ptr<KernelSharedState> shared_state);
     void set_scene_coordinator(std::shared_ptr<SceneCoordinator> scenes);
-    // The iPhone 2G LCD user client exposes its front buffer as a reserved
-    // CoreSurface ID.  Unlike ordinary buffers, firmware draws into it while
+    // The display user client exposes its front buffer as a reserved
+    // CoreSurface ID. Unlike ordinary buffers, firmware draws into it while
     // it remains locked and the display controller scans it out at vsync.
     // Return true only when a newly visible frame was submitted.
     bool refresh_default_scanout(AddressSpace& memory);
