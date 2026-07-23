@@ -1084,7 +1084,7 @@ void CompatibilityKernel::dispatch_bsd_events(Cpu &cpu, std::uint32_t number) {
           bsd_error(cpu, 12);
           return;
         }
-        if (!memory_.write64(registers[2], 0x08000000ULL)) {
+        if (!memory_.write64(registers[2], shared_state_->device_ram_bytes)) {
           bsd_error(cpu, bsd_support::bad_address);
           return;
         }
@@ -1094,7 +1094,9 @@ void CompatibilityKernel::dispatch_bsd_events(Cpu &cpu, std::uint32_t number) {
     }
     if (const auto hardware_string =
             *mib0 == darwin::sysctl::control_hardware
-                ? darwin::sysctl::hardware_string(*mib1)
+                ? darwin::sysctl::hardware_string(
+                      *mib1, shared_state_->device_product_type,
+                      shared_state_->device_board_config)
                 : std::nullopt) {
       const auto required =
           static_cast<std::uint32_t>(hardware_string->size() + 1);

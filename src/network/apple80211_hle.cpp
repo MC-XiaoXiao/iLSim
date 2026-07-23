@@ -148,9 +148,9 @@ Apple80211Hle::Apple80211Hle(
             call.set_return(apple80211_abi::invalid_argument);
             return;
         }
-        // The iPhone 2G exposes a single 802.11 interface. The CFString is
-        // validated by the caller; avoiding CF object fabrication keeps this
-        // HLE at the Aeropuerto ABI boundary.
+        // The selected target firmware exposes a single 802.11 interface. The
+        // CFString is validated by the caller; avoiding CF object fabrication
+        // keeps this HLE at the Aeropuerto ABI boundary.
         std::array<std::byte, apple80211_abi::interface_name_capacity> bytes{};
         for (std::size_t index = 0; index < interface_name.size(); ++index) {
             bytes[index] = static_cast<std::byte>(interface_name[index]);

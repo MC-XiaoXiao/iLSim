@@ -79,7 +79,7 @@ inline constexpr std::uint32_t set_attributes_after_drain =
 inline constexpr std::uint32_t set_attributes_after_drain_and_flush =
     sized_command(ioctl_input, 't', 22, arm32_attributes_size);
 
-// The iPhone 2G Apple Onboard Serial driver extension used by CommCenter.
+// Apple Onboard Serial driver contract used by the target CommCenter.
 // The firmware names this request IOAOSH5 and passes a 32-bit boolean that
 // selects the H5 framed transport.
 inline constexpr std::uint32_t set_h5_transport_mode =
