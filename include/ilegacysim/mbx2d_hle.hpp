@@ -100,6 +100,7 @@ private:
   void set_feature(UserlandHleCall &call, bool context_api, bool enabled);
   void blit_color(UserlandHleCall &call, bool context_api);
   void blit_copy(UserlandHleCall &call, bool context_api);
+  void quad_color(UserlandHleCall &call);
   void quad_copy(UserlandHleCall &call);
   void flush_surfaces(UserlandHleCall &call);
   void terminate(UserlandHleCall &call);

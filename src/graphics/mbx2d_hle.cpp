@@ -144,6 +144,7 @@ Mbx2dHle::Mbx2dHle(UserlandHleRegistry &registry,
       [this](UserlandHleCall &call) { blit_copy(call, false); });
   add("_mbx2DCtxBlitCopy",
       [this](UserlandHleCall &call) { blit_copy(call, true); });
+  add("_mbx3DQuadColor", [this](UserlandHleCall &call) { quad_color(call); });
   add("_mbx3DQuadCopy", [this](UserlandHleCall &call) { quad_copy(call); });
 
   const auto finish = [this](UserlandHleCall &call) {
@@ -637,18 +638,7 @@ std::optional<std::vector<std::uint32_t>> Mbx2dHle::composite(
   const auto scale_byte = [](std::uint32_t value, std::uint32_t factor) {
     return (value * factor + 127U) / 255U;
   };
-  auto alpha = static_cast<std::uint32_t>(state.blend.global_alpha);
-  const auto retained_springboard_band =
-      destination.width == iphone_2g_display_width &&
-      destination.height == iphone_2g_display_height &&
-      (y + height <= mbx2d_abi::springboard_status_bar_height ||
-       y >= mbx2d_abi::springboard_dock_origin_y);
-  if (retained_springboard_band) {
-    // LayerKit caches these static bands once and submits a unit sentinel
-    // rather than an animated 0..255 opacity. Their per-pixel alpha still
-    // controls the straight-alpha icon and glyph edges below.
-    alpha = 255U;
-  }
+  const auto alpha = static_cast<std::uint32_t>(state.blend.global_alpha);
   const auto is_constant_alpha_crossfade =
       !state.blend.complex &&
       state.blend.source_factor == mbx2d_abi::layerkit_crossfade_source_word &&

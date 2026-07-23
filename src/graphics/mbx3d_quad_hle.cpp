@@ -24,9 +24,23 @@ struct Point {
 
 constexpr float edge_tolerance = 0.01F;
 constexpr std::uint64_t maximum_quad_pixels = 16U * 1024U * 1024U;
+constexpr std::uint64_t scene_extent_numerator = 3;
+constexpr std::uint64_t scene_extent_denominator = 4;
 
 bool nearly_equal(float left, float right) {
   return std::abs(left - right) <= edge_tolerance;
+}
+
+bool covers_scene_extent(std::int64_t width, std::int64_t height,
+                         std::uint32_t destination_width,
+                         std::uint32_t destination_height) {
+  if (width <= 0 || height <= 0) return false;
+  return static_cast<std::uint64_t>(width) * scene_extent_denominator >=
+             static_cast<std::uint64_t>(destination_width) *
+                 scene_extent_numerator &&
+         static_cast<std::uint64_t>(height) * scene_extent_denominator >=
+             static_cast<std::uint64_t>(destination_height) *
+                 scene_extent_numerator;
 }
 
 std::optional<std::array<Point, 4>> read_quad(AddressSpace &memory,
@@ -97,6 +111,110 @@ float interpolate_triangle(const std::array<Point, 4> &values,
 }
 
 } // namespace
+
+void Mbx2dHle::quad_color(UserlandHleCall &call) {
+  const auto destination = resolve(state_.destination);
+  const auto positions = read_quad(call.memory(), call.argument(0));
+  if (!destination || !positions) {
+    call.set_return(mbx2d_abi::failure);
+    return;
+  }
+
+  auto left_value = (*positions)[0].x;
+  auto right_value = left_value;
+  auto top_value = (*positions)[0].y;
+  auto bottom_value = top_value;
+  for (const auto &position : *positions) {
+    left_value = std::min(left_value, position.x);
+    right_value = std::max(right_value, position.x);
+    top_value = std::min(top_value, position.y);
+    bottom_value = std::max(bottom_value, position.y);
+  }
+  if (right_value - left_value <= edge_tolerance ||
+      bottom_value - top_value <= edge_tolerance) {
+    call.set_return(mbx2d_abi::success);
+    return;
+  }
+
+  auto left = std::max<std::int64_t>(
+      static_cast<std::int64_t>(std::floor(left_value)), 0);
+  auto right = std::min<std::int64_t>(
+      static_cast<std::int64_t>(std::ceil(right_value)), destination->width);
+  auto top = std::max<std::int64_t>(
+      static_cast<std::int64_t>(std::floor(top_value)), 0);
+  auto bottom = std::min<std::int64_t>(
+      static_cast<std::int64_t>(std::ceil(bottom_value)), destination->height);
+  if (state_.scissor.enabled) {
+    left = std::max<std::int64_t>(left, state_.scissor.left);
+    top = std::max<std::int64_t>(top, state_.scissor.top);
+    right = std::min<std::int64_t>(right, state_.scissor.right);
+    bottom = std::min<std::int64_t>(bottom, state_.scissor.bottom);
+  }
+  if (right <= left || bottom <= top) {
+    call.set_return(mbx2d_abi::success);
+    return;
+  }
+
+  const auto width = right - left;
+  const auto height = bottom - top;
+  if (static_cast<std::uint64_t>(width) >
+      maximum_quad_pixels / static_cast<std::uint64_t>(height)) {
+    call.set_return(mbx2d_abi::failure);
+    return;
+  }
+  if (covers_scene_extent(width, height, destination->width,
+                          destination->height)) {
+    prepare_destination_for_frame(call, state_);
+  }
+  const auto destination_pixels =
+      read_region(*destination, left, top, width, height, call);
+  if (!destination_pixels) {
+    call.set_return(mbx2d_abi::failure);
+    return;
+  }
+
+  const auto axis_aligned =
+      nearly_equal((*positions)[0].x, left_value) &&
+      nearly_equal((*positions)[0].y, top_value) &&
+      nearly_equal((*positions)[1].x, right_value) &&
+      nearly_equal((*positions)[1].y, top_value) &&
+      nearly_equal((*positions)[2].x, right_value) &&
+      nearly_equal((*positions)[2].y, bottom_value) &&
+      nearly_equal((*positions)[3].x, left_value) &&
+      nearly_equal((*positions)[3].y, bottom_value);
+  std::vector<std::uint32_t> source_pixels(
+      static_cast<std::size_t>(width * height), call.argument(1));
+  std::vector<bool> covered;
+  if (!axis_aligned) {
+    covered.assign(source_pixels.size(), false);
+    for (std::int64_t y = 0; y < height; ++y) {
+      for (std::int64_t x = 0; x < width; ++x) {
+        const auto index = static_cast<std::size_t>(y * width + x);
+        covered[index] = sample_quad(
+                             *positions,
+                             Point{static_cast<float>(left + x) + 0.5F,
+                                   static_cast<float>(top + y) + 0.5F})
+                             .has_value();
+      }
+    }
+  }
+
+  auto pixels = composite(state_, *destination, left, top, width, height,
+                          source_pixels, call);
+  if (!pixels) {
+    call.set_return(mbx2d_abi::failure);
+    return;
+  }
+  if (!axis_aligned) {
+    for (std::size_t index = 0; index < covered.size(); ++index) {
+      if (!covered[index]) (*pixels)[index] = (*destination_pixels)[index];
+    }
+  }
+  call.set_return(
+      write_region(*destination, left, top, width, height, *pixels, call)
+          ? mbx2d_abi::success
+          : mbx2d_abi::failure);
+}
 
 void Mbx2dHle::quad_copy(UserlandHleCall &call) {
   const auto source = resolve(state_.source);
@@ -183,11 +301,8 @@ void Mbx2dHle::quad_copy(UserlandHleCall &call) {
     return;
   }
 
-  const auto covers_complete_scene =
-      left == 0 && right == destination->width &&
-      top <= mbx2d_abi::springboard_status_bar_height &&
-      bottom >= mbx2d_abi::springboard_dock_origin_y;
-  if (covers_complete_scene) {
+  if (covers_scene_extent(width, height, destination->width,
+                          destination->height)) {
     prepare_destination_for_frame(call, state_);
   }
   const auto destination_pixels =

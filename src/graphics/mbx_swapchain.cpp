@@ -33,6 +33,8 @@ void Mbx2dHle::initialize_destination(
                                     return pixel != 0;
                                 })) {
         initialized_destinations_.insert(surface);
+        destination_frame_sequences_[surface] =
+            display_ ? display_->presented_frames() : 0;
         return;
     }
 
@@ -47,6 +49,8 @@ void Mbx2dHle::initialize_destination(
     if (write_region(*destination, 0, 0, destination->width,
                      destination->height, initial, call)) {
         initialized_destinations_.insert(surface);
+        destination_frame_sequences_[surface] =
+            display_ ? display_->presented_frames() : 0;
     }
 }
 
@@ -66,16 +70,15 @@ void Mbx2dHle::prepare_destination_for_frame(
         prepared->second == sequence) {
         return;
     }
-    // LayerKit's valid textured quad submission begins a complete scene pass.
-    // Small 2D dirty updates retain swap-chain contents and must not clear it.
-    constexpr auto desktop_top = mbx2d_abi::springboard_status_bar_height;
-    constexpr auto desktop_bottom = mbx2d_abi::springboard_dock_origin_y;
-    constexpr auto desktop_height = desktop_bottom - desktop_top;
-    const std::vector<std::uint32_t> blank(
-        static_cast<std::size_t>(destination->width) * desktop_height,
-        0xff000000U);
-    if (write_region(*destination, 0, desktop_top, destination->width,
-                     desktop_height, blank, call)) {
+    const auto pixel_count = static_cast<std::size_t>(destination->width) *
+                             destination->height;
+    const std::vector<std::uint32_t> clear(pixel_count, 0xff000000U);
+    // A complete scene pass constructs its destination from submitted layers.
+    // Clear the entire reused swap backing once, independent of any UI bands;
+    // retaining the previous scanout here would leave trails behind moving
+    // source-over layers and would make opacity depend on screen coordinates.
+    if (write_region(*destination, 0, 0, destination->width,
+                     destination->height, clear, call)) {
         destination_frame_sequences_[surface] = sequence;
     }
 }

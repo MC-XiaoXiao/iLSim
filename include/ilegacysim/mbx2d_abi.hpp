@@ -35,11 +35,6 @@ inline constexpr std::uint32_t rotation_clockwise_270 = 0x06000000U;
 
 inline constexpr std::uint32_t float_one_bits = 0x3f800000U;
 
-// iPhoneOS 1.0 LayerKit splits the 320x480 SpringBoard target into retained
-// status-bar and dock bands around a discardable desktop composition area.
-inline constexpr std::uint32_t springboard_status_bar_height = 20;
-inline constexpr std::uint32_t springboard_dock_origin_y = 389;
-
 // Validation masks used by the real MBX2D client library before it records a
 // simple or complex blend equation in its 124-byte context structure.
 inline constexpr std::uint32_t simple_source_factor_mask = 0x00700000U;
