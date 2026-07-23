@@ -71,6 +71,7 @@ public:
   [[nodiscard]] std::vector<PresentationScene> latest_scenes() const;
   [[nodiscard]] std::optional<PresentationScene>
   latest_scene(std::uint32_t producer_process_id) const;
+  [[nodiscard]] bool has_presented_frame() const;
 
   // Ignore surfaces from this process incarnation at or below the publication
   // watermark. A reused PID becomes eligible automatically after it publishes

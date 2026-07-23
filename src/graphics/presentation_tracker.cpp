@@ -49,6 +49,11 @@ PresentationTracker::latest_scene(std::uint32_t producer_process_id) const {
              : std::optional<PresentationScene>{*found};
 }
 
+bool PresentationTracker::has_presented_frame() const {
+  std::lock_guard lock{mutex_};
+  return latest_.has_value();
+}
+
 void PresentationTracker::retire_process(
     std::uint32_t process_id, std::uint64_t publication_watermark) {
   if (process_id == 0U)

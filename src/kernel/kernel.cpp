@@ -79,9 +79,11 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
           [this](const WifiSnapshot &before, const WifiSnapshot &after) {
             apply_wifi_transition(before, after);
           }},
-      core_surface_hle_{userland_hle_, display_state_, surface_store_},
+      core_surface_hle_{userland_hle_, display_state_, surface_store_,
+                        presentation_tracker_},
       opengles_hle_{userland_hle_, display_state_, surface_store_},
-      mbx2d_hle_{userland_hle_, display_state_, surface_store_},
+      mbx2d_hle_{userland_hle_, display_state_, surface_store_,
+                 presentation_tracker_},
       mobile_framebuffer_hle_{userland_hle_, display_state_, surface_store_,
                               presentation_tracker_} {
   shared_state_->device_product_type = device_profile_.product_type;

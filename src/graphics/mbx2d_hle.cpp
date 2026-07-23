@@ -17,6 +17,7 @@
 #include "ilegacysim/display.hpp"
 #include "ilegacysim/mbx2d_abi.hpp"
 #include "ilegacysim/output.hpp"
+#include "ilegacysim/presentation_tracker.hpp"
 #include "ilegacysim/userland_hle.hpp"
 
 namespace ilegacysim {
@@ -38,10 +39,12 @@ std::int64_t signed_argument(UserlandHleCall &call, std::size_t index) {
 
 Mbx2dHle::Mbx2dHle(UserlandHleRegistry &registry,
                    std::shared_ptr<DisplayState> display,
-                   std::shared_ptr<SurfaceStore> surfaces)
+                   std::shared_ptr<SurfaceStore> surfaces,
+                   std::shared_ptr<PresentationTracker> presentations)
     : display_{std::move(display)},
       surface_store_{surfaces ? std::move(surfaces)
-                              : std::make_shared<SurfaceStore>()} {
+                              : std::make_shared<SurfaceStore>()},
+      presentation_tracker_{std::move(presentations)} {
   const auto add = [&](std::string symbol,
                        UserlandHleRegistry::Handler handler) {
     registry.register_function(std::string{mbx2d_image}, std::move(symbol),
@@ -164,7 +167,9 @@ Mbx2dHle::Mbx2dHle(UserlandHleRegistry &registry,
   });
   const auto present = [this](UserlandHleCall &call) {
     submit_destination(call, false);
-    if (display_)
+    if (display_ &&
+        (!presentation_tracker_ ||
+         !presentation_tracker_->has_presented_frame()))
       display_->present();
     call.set_return(mbx_success);
   };
@@ -210,6 +215,7 @@ void Mbx2dHle::inherit_state(const Mbx2dHle &parent) {
   state_ = parent.state_;
   initialized_ = parent.initialized_;
   deferred_trace_count_ = parent.deferred_trace_count_;
+  presentation_tracker_ = parent.presentation_tracker_;
   surface_store_->inherit_state(*parent.surface_store_);
 }
 
@@ -934,6 +940,14 @@ void Mbx2dHle::submit_destination(UserlandHleCall &call, bool context_api) {
   if (!destination || destination->framebuffer || !display_ ||
       destination->width != display_->width() ||
       destination->height != display_->height()) {
+    return;
+  }
+  // Once firmware has completed a transactional hardware-layer frame,
+  // IOMobileFramebuffer SwapEnd owns scanout. MBX finish/swap still commits
+  // pixels to its CoreSurface backing, but presenting that individual render
+  // target would bypass the other retained layers.
+  if (presentation_tracker_ &&
+      presentation_tracker_->has_presented_frame()) {
     return;
   }
   const auto pixels = read_region(*destination, 0, 0, destination->width,

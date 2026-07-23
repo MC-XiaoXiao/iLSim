@@ -15,6 +15,7 @@
 #include "ilegacysim/iokit_abi.hpp"
 #include "ilegacysim/kernel_shared_state.hpp"
 #include "ilegacysim/output.hpp"
+#include "ilegacysim/presentation_tracker.hpp"
 #include "ilegacysim/scene_coordinator.hpp"
 #include "ilegacysim/surface_store.hpp"
 #include "ilegacysim/userland_hle.hpp"
@@ -38,10 +39,12 @@ constexpr std::uint32_t success = 0;
 
 CoreSurfaceHle::CoreSurfaceHle(
     UserlandHleRegistry& registry, std::shared_ptr<DisplayState> display,
-    std::shared_ptr<SurfaceStore> surfaces)
+    std::shared_ptr<SurfaceStore> surfaces,
+    std::shared_ptr<PresentationTracker> presentations)
     : display_{std::move(display)},
       surfaces_{surfaces ? std::move(surfaces)
-                         : std::make_shared<SurfaceStore>()} {
+                         : std::make_shared<SurfaceStore>()},
+      presentation_tracker_{std::move(presentations)} {
     registry.register_prefix(
         std::string{core_surface_image}, std::string{client_buffer_prefix},
         [this](UserlandHleCall& call) { dispatch(call); });
@@ -61,6 +64,7 @@ void CoreSurfaceHle::inherit_state(const CoreSurfaceHle& parent) {
     clients_by_id_ = parent.clients_by_id_;
     last_scanout_generation_ = parent.last_scanout_generation_;
     last_scanout_pixels_ = parent.last_scanout_pixels_;
+    presentation_tracker_ = parent.presentation_tracker_;
     surfaces_->inherit_state(*parent.surfaces_);
 }
 
@@ -231,6 +235,13 @@ void CoreSurfaceHle::submit(Buffer& buffer, UserlandHleCall& call) {
                     : std::nullopt)) {
             return;
         }
+    }
+    // Unlock publishes guest writes to the CoreSurface backing. Once the
+    // firmware has entered transactional hardware-layer presentation, only
+    // IOMobileFramebuffer SwapEnd may turn those backing updates into scanout.
+    if (presentation_tracker_ &&
+        presentation_tracker_->has_presented_frame()) {
+        return;
     }
     const auto bytes = call.memory().read_bytes(buffer.base, buffer.allocation_size);
     if (!bytes || bytes->size() < static_cast<std::size_t>(

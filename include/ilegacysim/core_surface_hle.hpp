@@ -11,6 +11,7 @@ namespace ilegacysim {
 
 class AddressSpace;
 class DisplayState;
+class PresentationTracker;
 class SceneCoordinator;
 struct KernelSharedState;
 class SurfaceStore;
@@ -24,7 +25,8 @@ class CoreSurfaceHle {
 public:
     CoreSurfaceHle(UserlandHleRegistry& registry,
                    std::shared_ptr<DisplayState> display,
-                   std::shared_ptr<SurfaceStore> surfaces = {});
+                   std::shared_ptr<SurfaceStore> surfaces = {},
+                   std::shared_ptr<PresentationTracker> presentations = {});
 
     void reset();
     void inherit_state(const CoreSurfaceHle& parent);
@@ -71,6 +73,7 @@ private:
     std::vector<std::uint32_t> last_scanout_pixels_;
     std::shared_ptr<DisplayState> display_;
     std::shared_ptr<SurfaceStore> surfaces_;
+    std::shared_ptr<PresentationTracker> presentation_tracker_;
     std::shared_ptr<KernelSharedState> shared_state_;
     std::shared_ptr<SceneCoordinator> scene_coordinator_;
 };

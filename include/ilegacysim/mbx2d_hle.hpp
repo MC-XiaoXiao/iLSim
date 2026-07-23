@@ -16,6 +16,7 @@ namespace ilegacysim {
 class UserlandHleCall;
 class UserlandHleRegistry;
 class DisplayState;
+class PresentationTracker;
 
 // User-mode compatibility implementation for the MBX2D API consumed by
 // LayerKit. Handles are opaque because every operation stays at this HLE
@@ -23,7 +24,8 @@ class DisplayState;
 class Mbx2dHle {
 public:
   Mbx2dHle(UserlandHleRegistry &registry, std::shared_ptr<DisplayState> display,
-           std::shared_ptr<SurfaceStore> surfaces = {});
+           std::shared_ptr<SurfaceStore> surfaces = {},
+           std::shared_ptr<PresentationTracker> presentations = {});
 
   void reset();
   void inherit_state(const Mbx2dHle &parent);
@@ -155,6 +157,7 @@ private:
   std::size_t deferred_trace_count_{};
   std::shared_ptr<DisplayState> display_;
   std::shared_ptr<SurfaceStore> surface_store_;
+  std::shared_ptr<PresentationTracker> presentation_tracker_;
 };
 
 } // namespace ilegacysim
