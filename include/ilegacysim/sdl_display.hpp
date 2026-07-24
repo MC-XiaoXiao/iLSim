@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "ilegacysim/display_geometry.hpp"
+#include "ilegacysim/ringer_switch_state.hpp"
 #include "ilegacysim/system_button_input.hpp"
 #include "ilegacysim/touch_input.hpp"
 
@@ -25,6 +26,8 @@ public:
   [[nodiscard]] bool poll_events();
   [[nodiscard]] std::vector<TouchInput> take_touch_events();
   [[nodiscard]] std::vector<SystemButtonInput> take_button_events();
+  [[nodiscard]] std::vector<RingerSwitchInput>
+  take_ringer_switch_events();
 
 private:
   struct Impl;

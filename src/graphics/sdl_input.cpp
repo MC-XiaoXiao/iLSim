@@ -66,6 +66,11 @@ bool SdlInput::poll(SDL_Window *window) {
     case SDL_KEYDOWN:
     case SDL_KEYUP:
       if (event.key.repeat == 0) {
+        if (event.type == SDL_KEYDOWN &&
+            event.key.keysym.sym == SDLK_DELETE) {
+          ringer_switch_events_.push_back(RingerSwitchInput{});
+          break;
+        }
         if (const auto button = map_key(event.key.keysym.sym)) {
           button_events_.push_back(SystemButtonInput{
               *button, event.type == SDL_KEYDOWN ? SystemButtonPhase::Down
@@ -132,6 +137,12 @@ std::vector<TouchInput> SdlInput::take_touch_events() {
 std::vector<SystemButtonInput> SdlInput::take_button_events() {
   auto events = std::move(button_events_);
   button_events_.clear();
+  return events;
+}
+
+std::vector<RingerSwitchInput> SdlInput::take_ringer_switch_events() {
+  auto events = std::move(ringer_switch_events_);
+  ringer_switch_events_.clear();
   return events;
 }
 

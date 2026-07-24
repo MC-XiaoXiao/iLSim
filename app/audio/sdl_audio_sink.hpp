@@ -20,7 +20,7 @@ public:
   [[nodiscard]] bool play(const AudioBuffer &buffer) override;
   [[nodiscard]] bool has_pending_audio() const override;
   void set_gain(float gain) override;
-  void stop() override;
+  void stop(AudioStopMode mode = AudioStopMode::Immediate) override;
   [[nodiscard]] std::string last_error() const override;
 
 private:

@@ -26,6 +26,8 @@ constexpr std::uint32_t volume_down_button_down_event_type = 1008;
 constexpr std::uint32_t volume_down_button_up_event_type = 1009;
 constexpr std::uint32_t lock_button_down_event_type = 1010;
 constexpr std::uint32_t lock_button_up_event_type = 1011;
+constexpr std::uint32_t ringer_switch_off_event_type = 1012;
+constexpr std::uint32_t ringer_switch_on_event_type = 1013;
 constexpr std::size_t event_record_size = 48;
 constexpr std::size_t hand_info_size = 20;
 constexpr std::size_t path_info_size = 16;
@@ -398,6 +400,25 @@ EnqueueResult enqueue_system_button(KernelSharedState &state,
             KernelSharedState::PendingGraphicsInput::Kind::SystemEvent,
             {},
             event_type});
+    return EnqueueResult::Deferred;
+  }
+  queue_simple_event_locked(state, service->second, event_type);
+  return EnqueueResult::Queued;
+}
+
+EnqueueResult enqueue_ringer_switch_change(KernelSharedState &state,
+                                           bool active) {
+  const auto event_type =
+      active ? ringer_switch_on_event_type : ringer_switch_off_event_type;
+  std::lock_guard lock{state.mach_mutex};
+  const auto service =
+      state.bootstrap_service_objects.find(std::string{system_event_service});
+  if (service == state.bootstrap_service_objects.end()) {
+    state.pending_graphics_inputs.push_back(
+            KernelSharedState::PendingGraphicsInput{
+                KernelSharedState::PendingGraphicsInput::Kind::SystemEvent,
+                {},
+                event_type});
     return EnqueueResult::Deferred;
   }
   queue_simple_event_locked(state, service->second, event_type);

@@ -24,6 +24,7 @@
 #include "ilegacysim/apple80211_hle.hpp"
 #include "ilegacysim/core_surface_hle.hpp"
 #include "ilegacysim/cpu.hpp"
+#include "ilegacysim/darwin_notify_state_hle.hpp"
 #include "ilegacysim/display.hpp"
 #include "ilegacysim/device_profile.hpp"
 #include "ilegacysim/hfs_metadata.hpp"
@@ -37,6 +38,7 @@
 #include "ilegacysim/opengles_hle.hpp"
 #include "ilegacysim/output.hpp"
 #include "ilegacysim/presentation_tracker.hpp"
+#include "ilegacysim/ringer_switch_state.hpp"
 #include "ilegacysim/scene_coordinator.hpp"
 #include "ilegacysim/surface_store.hpp"
 #include "ilegacysim/system_button_input.hpp"
@@ -178,6 +180,8 @@ public:
   void enqueue_baseband_input(std::span<const std::byte> bytes);
   void enqueue_touch_input(const TouchInput &input);
   void enqueue_system_button(const SystemButtonInput &input);
+  void set_ringer_switch_active(bool active);
+  void toggle_ringer_switch();
   [[nodiscard]] bool display_powered_on() const;
   [[nodiscard]] std::vector<std::byte> take_baseband_output();
   void inherit_process_state(const CompatibilityKernel &parent,
@@ -321,6 +325,7 @@ private:
                                bool character_device);
   bool write_guest_statfs(std::uint32_t address);
   void install_commpage();
+  void configure_darwin_notify_state();
   bool deliver_pending_mach_locked(Cpu &cpu);
   bool receive_socket_message(Cpu &cpu, std::uint32_t fd,
                               std::uint32_t message_address);
@@ -393,7 +398,10 @@ private:
   std::shared_ptr<DisplayState> display_state_;
   std::shared_ptr<WifiState> wifi_state_{std::make_shared<WifiState>()};
   std::shared_ptr<AudioService> audio_service_;
+  std::shared_ptr<RingerSwitchState> ringer_switch_state_{
+      std::make_shared<RingerSwitchState>()};
   UserlandHleRegistry userland_hle_;
+  DarwinNotifyStateHle darwin_notify_state_hle_;
   AudioToolboxHle audio_toolbox_hle_;
   CoreAudioHle core_audio_hle_;
   Apple80211Hle apple80211_hle_;

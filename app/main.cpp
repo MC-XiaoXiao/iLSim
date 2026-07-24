@@ -1100,6 +1100,10 @@ void boot(const std::vector<std::string> &args, Output &output) {
       for (const auto &input : sdl_display->take_button_events()) {
         initial_runtime->kernel->enqueue_system_button(input);
       }
+      for (const auto &input : sdl_display->take_ringer_switch_events()) {
+        static_cast<void>(input);
+        initial_runtime->kernel->toggle_ringer_switch();
+      }
     }
     if (touch_replay) {
       for (const auto &input : touch_replay->poll()) {
@@ -1157,6 +1161,15 @@ void boot(const std::vector<std::string> &args, Output &output) {
                           : "[control] volume down requested");
           break;
         }
+        case LiveControlCommandKind::RingerRing:
+        case LiveControlCommandKind::RingerSilent: {
+          const auto active =
+              command.kind == LiveControlCommandKind::RingerRing;
+          initial_runtime->kernel->set_ringer_switch_active(active);
+          output.line(active ? "[control] ringer set to ring"
+                             : "[control] ringer set to silent");
+          break;
+        }
         case LiveControlCommandKind::Snapshot: {
           FrameFilePresenter snapshot_writer{command.path};
           const auto frame = initial_runtime->kernel->display_snapshot();
@@ -1207,6 +1220,7 @@ void boot(const std::vector<std::string> &args, Output &output) {
                       "tap x y [hold-ms]; unlock; "
                       "drag x1 y1 x2 y2 [duration-ms] [steps]; "
                       "wake; lock; volume-up; volume-down; snapshot PATH; "
+                      "ringer ring|silent; "
                       "snapshot-sequence PATH-PREFIX INTERVAL-MS COUNT; "
                       "status; quit");
           break;

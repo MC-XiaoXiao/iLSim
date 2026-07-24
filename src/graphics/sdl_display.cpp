@@ -129,4 +129,8 @@ std::vector<SystemButtonInput> SdlDisplay::take_button_events() {
   return impl_->input.take_button_events();
 }
 
+std::vector<RingerSwitchInput> SdlDisplay::take_ringer_switch_events() {
+  return impl_->input.take_ringer_switch_events();
+}
+
 } // namespace ilegacysim

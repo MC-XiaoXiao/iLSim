@@ -17,6 +17,8 @@ enum class LiveControlCommandKind {
   Lock,
   VolumeUp,
   VolumeDown,
+  RingerRing,
+  RingerSilent,
   Snapshot,
   SnapshotSequence,
   Status,

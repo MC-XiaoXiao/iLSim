@@ -71,6 +71,11 @@ void record_bootstrap_registration_locked(KernelSharedState &state,
 [[nodiscard]] EnqueueResult
 enqueue_system_button(KernelSharedState &state, const SystemButtonInput &input);
 
+// Publishes the firmware event for the new physical ringer/silent switch
+// position. The switch value remains in the device-state provider.
+[[nodiscard]] EnqueueResult
+enqueue_ringer_switch_change(KernelSharedState &state, bool active);
+
 // A resolved application port becomes foreground only when LayerKit attaches
 // that application's client context; background application services must not
 // steal SpringBoard touches.

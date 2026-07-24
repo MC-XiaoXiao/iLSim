@@ -13,8 +13,6 @@
 #include <string>
 #include <utility>
 
-#include "ilegacysim/audio_toolbox_hle.hpp"
-
 #if defined(ILEGACYSIM_HAS_LIBPLIST)
 #include <plist/plist.h>
 #endif
@@ -155,11 +153,7 @@ std::optional<AudioBuffer> decode_linear_pcm_caf(
 } // namespace
 
 AudioService::AudioService(std::filesystem::path rootfs)
-    : rootfs_{std::move(rootfs)},
-      system_sounds_{{audio_toolbox::lock_system_sound_id,
-                      "/System/Library/Audio/UISounds/lock.caf"},
-                     {audio_toolbox::unlock_system_sound_id,
-                      "/System/Library/Audio/UISounds/unlock.caf"}} {
+    : rootfs_{std::move(rootfs)} {
   load_category_aliases();
   load_system_volume_state();
 }
@@ -172,35 +166,6 @@ void AudioService::set_sink(std::shared_ptr<AudioSink> sink) {
 void AudioService::set_decoder(std::shared_ptr<AudioDecoder> decoder) {
   std::lock_guard lock{mutex_};
   decoder_ = std::move(decoder);
-}
-
-AudioPlayResult AudioService::play_system_sound(std::uint32_t sound_id) {
-  std::shared_ptr<AudioSink> sink;
-  std::optional<AudioBuffer> buffer;
-  AudioPlayResult result;
-  float current_volume = 1.0F;
-  {
-    std::lock_guard lock{mutex_};
-    buffer = load_sound_locked(sound_id, result);
-    sink = sink_;
-    current_volume = category_volumes_["Ringtone"];
-  }
-  if (!buffer)
-    return result;
-  result.applied_gain = current_volume;
-  if (!sink) {
-    result.status = AudioPlayStatus::NoSink;
-    result.detail = "no host audio sink";
-    return result;
-  }
-  sink->set_gain(current_volume);
-  if (!sink->play(*buffer)) {
-    result.status = AudioPlayStatus::SinkError;
-    result.detail = sink->last_error();
-    return result;
-  }
-  result.status = AudioPlayStatus::Queued;
-  return result;
 }
 
 AudioPlayResult AudioService::play_audio_file(
@@ -216,7 +181,8 @@ AudioPlayResult AudioService::play_audio_file(
 }
 
 AudioPlayResult AudioService::play_audio_file_with_gain(
-    const std::filesystem::path &guest_path, bool replace_current, float gain) {
+    const std::filesystem::path &guest_path, bool replace_current, float gain,
+    AudioStopMode replacement_mode) {
   std::shared_ptr<AudioSink> sink;
   std::optional<AudioBuffer> buffer;
   AudioPlayResult result;
@@ -234,7 +200,7 @@ AudioPlayResult AudioService::play_audio_file_with_gain(
     return result;
   }
   if (replace_current)
-    sink->stop();
+    sink->stop(replacement_mode);
   sink->set_gain(result.applied_gain);
   if (!sink->play(*buffer)) {
     result.status = AudioPlayStatus::SinkError;
@@ -287,7 +253,7 @@ AudioPlayResult AudioService::queue_pcm(AudioBuffer buffer,
   return result;
 }
 
-void AudioService::stop_playback() {
+void AudioService::stop_playback(AudioStopMode mode) {
   std::shared_ptr<AudioSink> sink;
   {
     std::lock_guard lock{mutex_};
@@ -296,7 +262,7 @@ void AudioService::stop_playback() {
     playing_service_source_.reset();
   }
   if (sink)
-    sink->stop();
+    sink->stop(mode);
 }
 
 void AudioService::observe_service_source_create_request(
@@ -313,6 +279,7 @@ AudioService::observe_service_source_create_reply(
     std::uint32_t reply_object, std::uint32_t source) {
   std::optional<std::filesystem::path> path;
   std::shared_ptr<AudioSink> sink;
+  AudioStopMode stop_mode = AudioStopMode::Immediate;
   {
     std::lock_guard lock{mutex_};
     const auto pending = pending_service_source_creates_.find(reply_object);
@@ -328,19 +295,26 @@ AudioService::observe_service_source_create_reply(
     const auto previous = service_sources_.find(source);
     const auto changed = previous == service_sources_.end() ||
                          previous->second.path != *path;
+    const auto previous_stop_mode =
+        previous == service_sources_.end() ? service_output_stop_mode_
+                                          : previous->second.stop_mode;
     service_sources_.insert_or_assign(
-        source, ServiceSource{*path, std::nullopt, 0.0F});
+        source,
+        ServiceSource{*path, std::nullopt, 0.0F,
+                      service_output_stop_mode_});
+    latest_service_source_id_ = source;
     // Some clients reuse the same server object for successive previews. A
     // create reply begins a new generation: stale rate/volume state from the
     // previous path must not start the replacement before its own rate=1.
     if (changed && playing_service_source_id_ == source) {
+      stop_mode = previous_stop_mode;
       playing_service_source_id_.reset();
       playing_service_source_.reset();
       sink = sink_;
     }
   }
   if (sink)
-    sink->stop();
+    sink->stop(stop_mode);
   return path;
 }
 
@@ -352,6 +326,8 @@ bool AudioService::observe_service_source_property(
   std::optional<std::filesystem::path> path;
   std::optional<float> gain;
   bool stop = false;
+  AudioStopMode stop_mode = AudioStopMode::Immediate;
+  AudioStopMode replacement_mode = AudioStopMode::Immediate;
   {
     std::lock_guard lock{mutex_};
     retire_finished_service_source_locked();
@@ -366,12 +342,21 @@ bool AudioService::observe_service_source_property(
       state.rate = value;
       if (value <= 0.0F) {
         if (playing_service_source_id_ == source) {
+          stop_mode = state.stop_mode;
           playing_service_source_id_.reset();
           playing_service_source_.reset();
           sink = sink_;
           stop = true;
         }
       } else if (!state.path.empty() && playing_service_source_id_ != source) {
+        if (playing_service_source_id_) {
+          const auto active =
+              service_sources_.find(*playing_service_source_id_);
+          if (active != service_sources_.end())
+            replacement_mode = active->second.stop_mode;
+        } else {
+          replacement_mode = state.stop_mode;
+        }
         playing_service_source_id_ = source;
         playing_service_source_ = state.path;
         path = state.path;
@@ -383,11 +368,12 @@ bool AudioService::observe_service_source_property(
   }
   if (stop) {
     if (sink)
-      sink->stop();
+      sink->stop(stop_mode);
     return true;
   }
   if (path) {
-    const auto result = play_audio_file_with_gain(*path, true, *gain);
+    const auto result =
+        play_audio_file_with_gain(*path, true, *gain, replacement_mode);
     if (result.status != AudioPlayStatus::Queued) {
       std::lock_guard lock{mutex_};
       if (playing_service_source_id_ == source) {
@@ -399,6 +385,23 @@ bool AudioService::observe_service_source_property(
     sink->set_gain(*gain);
   }
   return true;
+}
+
+void AudioService::observe_service_output_stop_mode(AudioStopMode mode) {
+  std::lock_guard lock{mutex_};
+  retire_finished_service_source_locked();
+  service_output_stop_mode_ = mode;
+  if (latest_service_source_id_) {
+    const auto latest = service_sources_.find(*latest_service_source_id_);
+    if (latest != service_sources_.end())
+      latest->second.stop_mode = mode;
+  }
+  if (playing_service_source_id_ &&
+      playing_service_source_id_ != latest_service_source_id_) {
+    const auto active = service_sources_.find(*playing_service_source_id_);
+    if (active != service_sources_.end())
+      active->second.stop_mode = mode;
+  }
 }
 
 bool AudioService::service_source_playing() {
@@ -549,39 +552,6 @@ AudioService::item_path(AudioClientObject item) const {
   const auto path = items_.find(item);
   return path == items_.end() ? std::nullopt
                               : std::optional{path->second};
-}
-
-std::optional<AudioBuffer>
-AudioService::load_sound_locked(std::uint32_t sound_id,
-                                  AudioPlayResult &result) {
-  const auto sound = system_sounds_.find(sound_id);
-  if (sound == system_sounds_.end()) {
-    result.status = AudioPlayStatus::UnknownSound;
-    result.detail = "unregistered system sound ID";
-    return std::nullopt;
-  }
-  result.guest_path = sound->second;
-  if (const auto cached = decoded_sounds_.find(sound_id);
-      cached != decoded_sounds_.end()) {
-    return cached->second;
-  }
-  auto relative = sound->second.relative_path();
-  const auto bytes = read_file(rootfs_ / relative);
-  if (!bytes) {
-    result.status = AudioPlayStatus::ResourceUnavailable;
-    result.detail = "system sound resource is unavailable";
-    return std::nullopt;
-  }
-  auto decoded = decode_linear_pcm_caf(*bytes);
-  if (!decoded) {
-    result.status = AudioPlayStatus::UnsupportedResource;
-    result.detail = "unsupported CAF encoding";
-    return std::nullopt;
-  }
-  auto [entry, inserted] =
-      decoded_sounds_.emplace(sound_id, std::move(*decoded));
-  static_cast<void>(inserted);
-  return entry->second;
 }
 
 std::optional<AudioBuffer>

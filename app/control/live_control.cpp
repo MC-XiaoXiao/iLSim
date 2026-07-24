@@ -195,6 +195,17 @@ std::vector<LiveControlCommand> LiveControl::parse_line(std::string line) {
                                ? LiveControlCommandKind::VolumeUp
                                : LiveControlCommandKind::VolumeDown)};
   }
+  if (operation == "ringer") {
+    std::string state;
+    std::string trailing;
+    if (!(parser >> state) || (parser >> trailing) ||
+        (state != "ring" && state != "silent")) {
+      return {error_command("ringer requires exactly ring or silent")};
+    }
+    return {simple_command(state == "ring"
+                               ? LiveControlCommandKind::RingerRing
+                               : LiveControlCommandKind::RingerSilent)};
+  }
   if (operation == "snapshot") {
     std::string path;
     std::getline(parser, path);

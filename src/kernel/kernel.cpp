@@ -72,7 +72,8 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
       display_state_{std::make_shared<DisplayState>(device_profile_.display)},
       audio_service_{std::make_shared<AudioService>(rootfs_)},
       userland_hle_{memory_, output_},
-      audio_toolbox_hle_{userland_hle_, audio_service_},
+      darwin_notify_state_hle_{userland_hle_},
+      audio_toolbox_hle_{userland_hle_},
       core_audio_hle_{userland_hle_, audio_service_},
       apple80211_hle_{
           userland_hle_, wifi_state_,
@@ -86,6 +87,7 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
                  presentation_tracker_},
       mobile_framebuffer_hle_{userland_hle_, display_state_, surface_store_,
                               presentation_tracker_} {
+  configure_darwin_notify_state();
   shared_state_->device_product_type = device_profile_.product_type;
   shared_state_->device_board_config = device_profile_.board_config;
   shared_state_->device_model_number = device_profile_.model_number;
@@ -135,6 +137,49 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
                                        {"PATH=/usr/bin:/bin:/usr/sbin:/sbin",
                                         "HOME=/var/root", "SHELL=/bin/sh"}};
   install_commpage();
+}
+
+void CompatibilityKernel::configure_darwin_notify_state() {
+  darwin_notify_state_hle_.set_provider(
+      std::string{ringer_switch_notification_name},
+      [state = ringer_switch_state_] {
+        return static_cast<std::uint64_t>(state->active());
+      });
+  darwin_notify_state_hle_.set_notification_dispatcher(
+      [weak_state = std::weak_ptr<KernelSharedState>{shared_state_}](
+          std::uint32_t process_id, std::uint32_t port_name,
+          std::uint32_t token) {
+        const auto state = weak_state.lock();
+        if (!state)
+          return;
+        std::lock_guard lock{state->mach_mutex};
+        const auto destination =
+            state->mach_namespaces.resolve(process_id, port_name);
+        if (!destination ||
+            !state->mach_port_objects.contains(*destination)) {
+          return;
+        }
+        KernelSharedState::MachMessage message;
+        message.bytes.resize(darwin::mig_wire::message_header_size,
+                             std::byte{0});
+        const auto write_word = [&message](std::size_t offset,
+                                           std::uint32_t value) {
+          for (std::size_t byte = 0; byte < sizeof(value); ++byte) {
+            message.bytes[offset + byte] =
+                static_cast<std::byte>(value >> (byte * 8U));
+          }
+        };
+        write_word(darwin::mig_wire::header_bits_offset, 19U);
+        write_word(
+            darwin::mig_wire::header_size_offset,
+            static_cast<std::uint32_t>(message.bytes.size()));
+        write_word(darwin::mig_wire::header_remote_port_offset,
+                   *destination);
+        write_word(darwin::mig_wire::header_identifier_offset, token);
+        message.destination = *destination;
+        message.sender_pid = 0;
+        state->mach_queues[*destination].push_back(std::move(message));
+      });
 }
 
 bool CompatibilityKernel::set_virtual_processor_count(
@@ -223,6 +268,35 @@ void CompatibilityKernel::enqueue_system_button(
                      : " deferred\n"));
 }
 
+void CompatibilityKernel::set_ringer_switch_active(bool active) {
+  if (!ringer_switch_state_->set_active(active))
+    return;
+  darwin_notify_state_hle_.publish(ringer_switch_notification_name);
+  const auto result =
+      graphics_services_input::enqueue_ringer_switch_change(*shared_state_,
+                                                            active);
+  output_.write(
+      "[input] ringer-switch=" +
+      std::string{active ? "ring" : "silent"} +
+      (result == graphics_services_input::EnqueueResult::Queued
+           ? " queued\n"
+           : " deferred\n"));
+}
+
+void CompatibilityKernel::toggle_ringer_switch() {
+  const auto active = ringer_switch_state_->toggle();
+  darwin_notify_state_hle_.publish(ringer_switch_notification_name);
+  const auto result =
+      graphics_services_input::enqueue_ringer_switch_change(*shared_state_,
+                                                            active);
+  output_.write(
+      "[input] ringer-switch=" +
+      std::string{active ? "ring" : "silent"} +
+      (result == graphics_services_input::EnqueueResult::Queued
+           ? " queued\n"
+           : " deferred\n"));
+}
+
 bool CompatibilityKernel::display_powered_on() const {
   std::lock_guard mach_lock{shared_state_->mach_mutex};
   return shared_state_->requested_display_power_state.value_or(1U) != 0;
@@ -281,6 +355,7 @@ void CompatibilityKernel::install_commpage() {
 void CompatibilityKernel::prepare_exec(std::size_t processor_id) {
   install_commpage();
   userland_hle_.reset_mappings();
+  darwin_notify_state_hle_.reset();
   core_audio_hle_.reset();
   userland_hle_.record_loaded_image(process_image_);
   apple80211_hle_.reset();
@@ -1063,7 +1138,9 @@ void CompatibilityKernel::inherit_process_state(
   scene_coordinator_ = parent.scene_coordinator_;
   wifi_state_ = parent.wifi_state_;
   audio_service_ = parent.audio_service_;
-  audio_toolbox_hle_.set_service(audio_service_);
+  ringer_switch_state_ = parent.ringer_switch_state_;
+  darwin_notify_state_hle_.inherit_state(parent.darwin_notify_state_hle_);
+  configure_darwin_notify_state();
   core_audio_hle_.set_service(audio_service_);
   apple80211_hle_.set_wifi_state(wifi_state_);
   core_surface_hle_.set_display(display_state_);

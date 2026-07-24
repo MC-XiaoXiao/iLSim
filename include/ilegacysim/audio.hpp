@@ -17,6 +17,15 @@ struct AudioBuffer {
   std::uint32_t sample_rate{};
   std::uint16_t channel_count{};
   std::vector<std::int16_t> samples;
+  // Hardware callbacks are adjacent pieces of one PCM timeline. Backends may
+  // retain converter history between these buffers; decoded files remain
+  // self-contained and flush their converter at the end.
+  bool streaming{};
+};
+
+enum class AudioStopMode {
+  Immediate,
+  FadeOut,
 };
 
 class AudioSink {
@@ -28,7 +37,7 @@ public:
   // hand control back to its normal PCM path after a decoded fallback ends.
   [[nodiscard]] virtual bool has_pending_audio() const = 0;
   virtual void set_gain(float gain) = 0;
-  virtual void stop() = 0;
+  virtual void stop(AudioStopMode mode = AudioStopMode::Immediate) = 0;
   [[nodiscard]] virtual std::string last_error() const = 0;
 };
 
@@ -70,14 +79,13 @@ public:
 
   void set_sink(std::shared_ptr<AudioSink> sink);
   void set_decoder(std::shared_ptr<AudioDecoder> decoder);
-  [[nodiscard]] AudioPlayResult play_system_sound(std::uint32_t sound_id);
   [[nodiscard]] AudioPlayResult
   play_audio_file(const std::filesystem::path &guest_path,
                   bool replace_current = false,
                   float device_volume = 1.0F);
   [[nodiscard]] AudioPlayResult queue_pcm(AudioBuffer buffer,
                                           float device_volume = 1.0F);
-  void stop_playback();
+  void stop_playback(AudioStopMode mode = AudioStopMode::Immediate);
 
   // The guest FigMovie service is the source-of-truth for source selection.
   // A create request's path is correlated with its reply through the Mach
@@ -89,6 +97,7 @@ public:
                                       std::uint32_t source);
   [[nodiscard]] bool observe_service_source_property(
       std::uint32_t source, std::string_view property, float value);
+  void observe_service_output_stop_mode(AudioStopMode mode);
   [[nodiscard]] bool service_source_playing();
 
   void observe_category_volume(std::string category, float value);
@@ -116,8 +125,6 @@ public:
 
 private:
   [[nodiscard]] std::optional<AudioBuffer>
-  load_sound_locked(std::uint32_t sound_id, AudioPlayResult &result);
-  [[nodiscard]] std::optional<AudioBuffer>
   load_file_locked(const std::filesystem::path &guest_path,
                    AudioPlayResult &result);
   void load_category_aliases();
@@ -127,25 +134,28 @@ private:
   void retire_finished_service_source_locked();
   [[nodiscard]] AudioPlayResult
   play_audio_file_with_gain(const std::filesystem::path &guest_path,
-                            bool replace_current, float gain);
+                            bool replace_current, float gain,
+                            AudioStopMode replacement_mode =
+                                AudioStopMode::Immediate);
 
   std::filesystem::path rootfs_;
   mutable std::mutex mutex_;
   std::shared_ptr<AudioSink> sink_;
   std::shared_ptr<AudioDecoder> decoder_;
-  std::map<std::uint32_t, std::filesystem::path> system_sounds_;
-  std::map<std::uint32_t, AudioBuffer> decoded_sounds_;
   std::map<std::filesystem::path, AudioBuffer> decoded_files_;
   struct ServiceSource {
     std::filesystem::path path;
     std::optional<float> user_volume;
     float rate{};
+    AudioStopMode stop_mode{AudioStopMode::Immediate};
   };
   std::map<std::uint32_t, std::deque<std::filesystem::path>>
       pending_service_source_creates_;
   std::map<std::uint32_t, ServiceSource> service_sources_;
+  std::optional<std::uint32_t> latest_service_source_id_;
   std::optional<std::uint32_t> playing_service_source_id_;
   std::optional<std::filesystem::path> playing_service_source_;
+  AudioStopMode service_output_stop_mode_{AudioStopMode::Immediate};
   struct PlayerState {
     AudioClientObject queue;
     float rate{};

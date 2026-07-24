@@ -59,6 +59,9 @@ private:
   void stop_io(UserlandHleCall &call);
   void complete_io_proc(UserlandHleCall &call, std::uint32_t process_id);
   [[nodiscard]] float device_output_gain(std::uint32_t device) const;
+  [[nodiscard]] double device_sample_rate(std::uint32_t device) const;
+  [[nodiscard]] std::uint32_t
+  device_channel_count(std::uint32_t device) const;
 
   struct IoProcRegistration {
     std::uint32_t callback{};
@@ -84,6 +87,11 @@ private:
   UserlandHleRegistry &registry_;
   std::shared_ptr<AudioService> service_;
   std::uint32_t buffer_frame_size_{1024};
+  struct StreamFormatState {
+    double sample_rate{};
+    std::uint32_t channel_count{};
+  };
+  std::map<std::uint32_t, StreamFormatState> stream_formats_;
   std::map<std::uint32_t, float> device_volumes_;
   std::map<std::uint64_t, std::uint32_t> hardware_control_states_;
   std::map<std::uint32_t, IoProcRegistration> io_procs_;

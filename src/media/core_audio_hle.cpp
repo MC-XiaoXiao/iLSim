@@ -81,15 +81,21 @@ struct DeviceDescription {
   std::uint32_t stream;
   std::string_view name;
   bool input;
+  double default_sample_rate;
+  std::uint32_t default_channel_count;
+  AudioStopMode stop_mode;
 };
 
 constexpr std::array devices{
     DeviceDescription{wolfson_device, wolfson_stream, virtual_device_name,
-                      false},
+                      false, media_sample_rate, 2U,
+                      AudioStopMode::Immediate},
     DeviceDescription{baseband_output_device, baseband_output_stream,
-                      baseband_output_name, false},
+                      baseband_output_name, false, media_sample_rate, 2U,
+                      AudioStopMode::FadeOut},
     DeviceDescription{baseband_input_device, baseband_input_stream,
-                      baseband_input_name, true},
+                      baseband_input_name, true, telephony_sample_rate, 1U,
+                      AudioStopMode::Immediate},
 };
 
 const DeviceDescription *find_device(std::uint32_t identifier) {
@@ -104,13 +110,12 @@ const DeviceDescription *find_stream(std::uint32_t identifier) {
   return result == devices.end() ? nullptr : &*result;
 }
 
-double device_sample_rate(const DeviceDescription &device) {
-  return device.identifier == wolfson_device ? media_sample_rate
-                                              : telephony_sample_rate;
+double default_device_sample_rate(const DeviceDescription &device) {
+  return device.default_sample_rate;
 }
 
-std::uint32_t device_channel_count(const DeviceDescription &device) {
-  return device.identifier == wolfson_device ? 2U : 1U;
+std::uint32_t default_device_channel_count(const DeviceDescription &device) {
+  return device.default_channel_count;
 }
 
 bool is_route_property(std::uint32_t property) {
@@ -176,14 +181,24 @@ void store64(std::span<std::byte> data, std::size_t offset,
   std::memcpy(data.data() + offset, &value, sizeof(value));
 }
 
+std::optional<double> read_double(AddressSpace &memory,
+                                  std::uint32_t address) {
+  const auto low = memory.read32(address);
+  const auto high = memory.read32(address + sizeof(std::uint32_t));
+  if (!low || !high)
+    return std::nullopt;
+  const auto encoded = static_cast<std::uint64_t>(*low) |
+                       (static_cast<std::uint64_t>(*high) << 32U);
+  return std::bit_cast<double>(encoded);
+}
+
 std::array<std::byte, stream_format_size>
-stream_format(const DeviceDescription &device) {
+stream_format(double sample_rate, std::uint32_t channels) {
   std::array<std::byte, stream_format_size> result{};
-  const auto channels = device_channel_count(device);
   const auto bytes_per_frame =
       channels * static_cast<std::uint32_t>(sizeof(std::int16_t));
   store64(result, 0,
-          std::bit_cast<std::uint64_t>(device_sample_rate(device)));
+          std::bit_cast<std::uint64_t>(sample_rate));
   store32(result, 8, linear_pcm_format);
   store32(result, 12, linear_pcm_flags);
   store32(result, 16, bytes_per_frame); // bytes per packet
@@ -195,20 +210,19 @@ stream_format(const DeviceDescription &device) {
 }
 
 std::array<std::byte, sizeof(double) * 2>
-sample_rate_range(const DeviceDescription &device) {
+sample_rate_range(double sample_rate) {
   std::array<std::byte, sizeof(double) * 2> result{};
-  const auto encoded =
-      std::bit_cast<std::uint64_t>(device_sample_rate(device));
+  const auto encoded = std::bit_cast<std::uint64_t>(sample_rate);
   store64(result, 0, encoded);
   store64(result, sizeof(double), encoded);
   return result;
 }
 
 std::array<std::byte, ranged_stream_format_size>
-ranged_stream_format(const DeviceDescription &device) {
+ranged_stream_format(double sample_rate, std::uint32_t channels) {
   std::array<std::byte, ranged_stream_format_size> result{};
-  const auto format = stream_format(device);
-  const auto range = sample_rate_range(device);
+  const auto format = stream_format(sample_rate, channels);
+  const auto range = sample_rate_range(sample_rate);
   std::ranges::copy(format, result.begin());
   std::ranges::copy(range, result.begin() + stream_format_size);
   return result;
@@ -282,6 +296,7 @@ void CoreAudioHle::set_service(std::shared_ptr<AudioService> service) {
 void CoreAudioHle::reset() {
   io_procs_.clear();
   retired_io_proc_threads_.clear();
+  stream_formats_.clear();
 }
 
 float CoreAudioHle::device_output_gain(std::uint32_t device) const {
@@ -294,6 +309,27 @@ float CoreAudioHle::device_output_gain(std::uint32_t device) const {
       return 0.0F;
   }
   return gain;
+}
+
+double CoreAudioHle::device_sample_rate(std::uint32_t device) const {
+  if (const auto configured = stream_formats_.find(device);
+      configured != stream_formats_.end()) {
+    return configured->second.sample_rate;
+  }
+  const auto *description = find_device(device);
+  return description == nullptr ? 0.0
+                                : default_device_sample_rate(*description);
+}
+
+std::uint32_t
+CoreAudioHle::device_channel_count(std::uint32_t device) const {
+  if (const auto configured = stream_formats_.find(device);
+      configured != stream_formats_.end()) {
+    return configured->second.channel_count;
+  }
+  const auto *description = find_device(device);
+  return description == nullptr ? 0U
+                                : default_device_channel_count(*description);
 }
 
 std::optional<std::uint64_t> CoreAudioHle::next_io_proc_deadline() const {
@@ -335,7 +371,7 @@ CoreAudioHle::take_due_io_proc(std::uint64_t now) {
       registration.memory->copy_in(registration.output_samples, silence) &&
       registration.memory->write32(registration.output_buffers, 1U) &&
       registration.memory->write32(registration.output_buffers + 4U,
-                                   device_channel_count(*device)) &&
+                                   device_channel_count(device->identifier)) &&
       registration.memory->write32(registration.output_buffers + 8U,
                                    registration.output_sample_bytes) &&
       registration.memory->write32(registration.output_buffers + 12U,
@@ -372,7 +408,7 @@ CoreAudioHle::take_due_io_proc(std::uint64_t now) {
   };
 
   const auto sample_rate = static_cast<std::uint64_t>(
-      std::llround(device_sample_rate(*device)));
+      std::llround(device_sample_rate(device->identifier)));
   const auto period = std::max<std::uint64_t>(
       1U, static_cast<std::uint64_t>(buffer_frame_size_) *
               virtual_time_units_per_second / sample_rate);
@@ -431,9 +467,11 @@ void CoreAudioHle::complete_io_proc(UserlandHleCall &call,
             call.memory().read_bytes(registration.output_samples, byte_count)) {
       AudioBuffer buffer;
       buffer.sample_rate = static_cast<std::uint32_t>(
-          std::llround(device_sample_rate(*device)));
+          std::llround(device_sample_rate(device->identifier)));
       buffer.channel_count =
-          static_cast<std::uint16_t>(device_channel_count(*device));
+          static_cast<std::uint16_t>(
+              device_channel_count(device->identifier));
+      buffer.streaming = true;
       buffer.samples.reserve(bytes->size() / sizeof(std::int16_t));
       for (std::size_t offset = 0; offset < bytes->size();
            offset += sizeof(std::int16_t)) {
@@ -605,7 +643,8 @@ void CoreAudioHle::device_property(UserlandHleCall &call) {
   if (property == nominal_sample_rate_property) {
     std::array<std::byte, sizeof(double)> data{};
     store64(data, 0,
-            std::bit_cast<std::uint64_t>(device_sample_rate(*device)));
+            std::bit_cast<std::uint64_t>(
+                device_sample_rate(device->identifier)));
     call.set_return(write_sized_data(call, call.argument(4), call.argument(5),
                                      data)
                         ? 0U
@@ -613,7 +652,8 @@ void CoreAudioHle::device_property(UserlandHleCall &call) {
     return;
   }
   if (property == available_sample_rates_property) {
-    const auto data = sample_rate_range(*device);
+    const auto data = sample_rate_range(
+        device_sample_rate(device->identifier));
     call.set_return(write_sized_data(call, call.argument(4), call.argument(5),
                                      data)
                         ? 0U
@@ -658,7 +698,8 @@ void CoreAudioHle::device_property(UserlandHleCall &call) {
 }
 
 void CoreAudioHle::device_set_property(UserlandHleCall &call) {
-  if (find_device(call.argument(0)) == nullptr) {
+  const auto *device = find_device(call.argument(0));
+  if (device == nullptr) {
     call.resume_original_persistently();
     return;
   }
@@ -666,6 +707,19 @@ void CoreAudioHle::device_set_property(UserlandHleCall &call) {
   if (property == buffer_frame_size_property && call.argument(5) >= 4U) {
     if (const auto value = call.memory().read32(call.argument(6))) {
       buffer_frame_size_ = *value;
+    }
+  } else if (property == nominal_sample_rate_property &&
+             call.argument(5) >= sizeof(double)) {
+    if (const auto sample_rate = read_double(call.memory(), call.argument(6));
+        sample_rate && std::isfinite(*sample_rate) &&
+        *sample_rate >= 4'000.0 && *sample_rate <= 192'000.0) {
+      stream_formats_[device->identifier] =
+          StreamFormatState{*sample_rate,
+                            device_channel_count(device->identifier)};
+    } else {
+      log_property(call, "set", property, parameter_error);
+      call.set_return(parameter_error);
+      return;
     }
   } else if (property == volume_scalar_property &&
              call.argument(5) >= sizeof(float)) {
@@ -713,7 +767,9 @@ void CoreAudioHle::stream_property(UserlandHleCall &call) {
   }
   const auto property = call.argument(2);
   if (property == physical_format_property) {
-    const auto data = stream_format(*device);
+    const auto data =
+        stream_format(device_sample_rate(device->identifier),
+                      device_channel_count(device->identifier));
     call.set_return(write_sized_data(call, call.argument(3), call.argument(4),
                                      data)
                         ? 0U
@@ -721,7 +777,9 @@ void CoreAudioHle::stream_property(UserlandHleCall &call) {
     return;
   }
   if (property == available_physical_formats_property) {
-    const auto data = ranged_stream_format(*device);
+    const auto data =
+        ranged_stream_format(device_sample_rate(device->identifier),
+                             device_channel_count(device->identifier));
     call.set_return(write_sized_data(call, call.argument(3), call.argument(4),
                                      data)
                         ? 0U
@@ -733,7 +791,8 @@ void CoreAudioHle::stream_property(UserlandHleCall &call) {
 }
 
 void CoreAudioHle::stream_set_property(UserlandHleCall &call) {
-  if (find_stream(call.argument(0)) == nullptr) {
+  const auto *device = find_stream(call.argument(0));
+  if (device == nullptr) {
     call.resume_original_persistently();
     return;
   }
@@ -743,6 +802,46 @@ void CoreAudioHle::stream_set_property(UserlandHleCall &call) {
     call.set_return(unsupported_property);
     return;
   }
+  if (call.argument(4) < stream_format_size || call.argument(5) == 0) {
+    call.set_return(parameter_error);
+    return;
+  }
+  const auto address = call.argument(5);
+  const auto sample_rate = read_double(call.memory(), address);
+  const auto format = call.memory().read32(address + 8U);
+  const auto flags = call.memory().read32(address + 12U);
+  const auto bytes_per_packet = call.memory().read32(address + 16U);
+  const auto frames_per_packet = call.memory().read32(address + 20U);
+  const auto bytes_per_frame = call.memory().read32(address + 24U);
+  const auto channels = call.memory().read32(address + 28U);
+  const auto bits_per_channel = call.memory().read32(address + 32U);
+  const auto valid =
+      sample_rate && format && flags && bytes_per_packet &&
+      frames_per_packet && bytes_per_frame && channels && bits_per_channel &&
+      std::isfinite(*sample_rate) && *sample_rate >= 4'000.0 &&
+      *sample_rate <= 192'000.0 && *format == linear_pcm_format &&
+      (*flags & linear_pcm_flags) == linear_pcm_flags &&
+      *channels >= 1U && *channels <= 8U && *bits_per_channel == 16U &&
+      *frames_per_packet != 0U &&
+      *bytes_per_frame == *channels * sizeof(std::int16_t) &&
+      *bytes_per_packet == *bytes_per_frame * *frames_per_packet;
+  if (!valid) {
+    call.output().line(
+        "[coreaudio-device] stream-format pid=" +
+        std::to_string(call.process_id()) + " device=" +
+        std::to_string(device->identifier) + " status=unsupported");
+    call.set_return(unsupported_property);
+    return;
+  }
+  stream_formats_[device->identifier] =
+      StreamFormatState{*sample_rate, *channels};
+  call.output().line(
+      "[coreaudio-device] stream-format pid=" +
+      std::to_string(call.process_id()) + " device=" +
+      std::to_string(device->identifier) + " rate=" +
+      std::to_string(*sample_rate) + " channels=" +
+      std::to_string(*channels) + " bits=" +
+      std::to_string(*bits_per_channel) + " status=0");
   call.set_return(0);
 }
 
@@ -849,7 +948,8 @@ void CoreAudioHle::start_io(UserlandHleCall &call) {
   const auto sample_bytes =
       device == nullptr
           ? 0U
-          : buffer_frame_size_ * device_channel_count(*device) *
+          : buffer_frame_size_ *
+                device_channel_count(device->identifier) *
                 static_cast<std::uint32_t>(sizeof(std::int16_t));
   if (state.callback_return == 0) {
     state.callback_return =
@@ -878,10 +978,16 @@ void CoreAudioHle::start_io(UserlandHleCall &call) {
   state.sample_time = 0;
   state.callback_count = 0;
   state.peak_since_report = 0;
+  if (service_ && device != nullptr)
+    service_->observe_service_output_stop_mode(device->stop_mode);
   call.output().line("[coreaudio-device] io-proc start pid=" +
                      std::to_string(call.process_id()) + " frames=" +
                      std::to_string(buffer_frame_size_) + " bytes=" +
-                     std::to_string(state.output_sample_bytes));
+                     std::to_string(state.output_sample_bytes) + " rate=" +
+                     std::to_string(device_sample_rate(device->identifier)) +
+                     " channels=" +
+                     std::to_string(
+                         device_channel_count(device->identifier)));
   call.set_return(0);
 }
 
