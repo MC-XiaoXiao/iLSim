@@ -4,8 +4,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
+#include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -15,6 +19,13 @@ namespace {
 constexpr std::uint32_t stack_base = 0x2ff00000U;
 constexpr std::uint32_t stack_size = 0x00100000U;
 constexpr std::uint32_t stack_top = stack_base + stack_size;
+constexpr std::size_t maximum_interpreter_line = 256;
+constexpr std::size_t maximum_interpreter_depth = 4;
+
+struct InterpreterDirective {
+    std::string path;
+    std::optional<std::string> argument;
+};
 
 std::array<std::byte, 4> little_endian_word(std::uint32_t value) {
     return {
@@ -23,6 +34,53 @@ std::array<std::byte, 4> little_endian_word(std::uint32_t value) {
         static_cast<std::byte>((value >> 16U) & 0xffU),
         static_cast<std::byte>((value >> 24U) & 0xffU),
     };
+}
+
+std::optional<InterpreterDirective>
+read_interpreter_directive(const std::filesystem::path& path) {
+    std::ifstream input{path, std::ios::binary};
+    if (!input) {
+        throw std::runtime_error{"cannot open executable: " + path.string()};
+    }
+    std::array<char, maximum_interpreter_line> prefix{};
+    input.read(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+    const auto count = static_cast<std::size_t>(input.gcount());
+    if (count < 2 || prefix[0] != '#' || prefix[1] != '!') {
+        return std::nullopt;
+    }
+    const auto newline =
+        std::find(prefix.begin() + 2,
+                  prefix.begin() + static_cast<std::ptrdiff_t>(count), '\n');
+    if (newline == prefix.begin() + static_cast<std::ptrdiff_t>(count)) {
+        throw std::runtime_error{"interpreter directive is too long: " +
+                                 path.string()};
+    }
+    std::string_view directive{
+        prefix.data() + 2,
+        static_cast<std::size_t>(newline - (prefix.begin() + 2))};
+    if (!directive.empty() && directive.back() == '\r') {
+        directive.remove_suffix(1);
+    }
+    const auto trim_left = [](std::string_view value) {
+        const auto first = value.find_first_not_of(" \t");
+        return first == std::string_view::npos ? std::string_view{}
+                                                : value.substr(first);
+    };
+    directive = trim_left(directive);
+    const auto separator = directive.find_first_of(" \t");
+    const auto interpreter = directive.substr(0, separator);
+    if (interpreter.empty() || interpreter.front() != '/') {
+        throw std::runtime_error{"invalid interpreter directive: " +
+                                 path.string()};
+    }
+    InterpreterDirective result{std::string{interpreter}, std::nullopt};
+    if (separator != std::string_view::npos) {
+        const auto argument = trim_left(directive.substr(separator));
+        if (!argument.empty()) {
+            result.argument = std::string{argument};
+        }
+    }
+    return result;
 }
 
 }  // namespace
@@ -50,7 +108,12 @@ LoadedProcess ProcessLoader::load(
     std::string guest_executable,
     std::vector<std::string> arguments,
     std::vector<std::string> environment) {
-    auto executable = MachOImage::parse(host_path(guest_executable));
+    auto invocation =
+        resolve_invocation(std::move(guest_executable), std::move(arguments));
+    auto mapped_executable = std::move(invocation.executable_path);
+    arguments = std::move(invocation.arguments);
+
+    auto executable = MachOImage::parse(host_path(mapped_executable));
     if (!executable.dynamic_linker() || !executable.entry_point()) {
         throw std::runtime_error{"executable lacks LC_LOAD_DYLINKER or LC_UNIXTHREAD"};
     }
@@ -65,9 +128,6 @@ LoadedProcess ProcessLoader::load(
         throw std::runtime_error{"failed to map initial user stack"};
     }
 
-    if (arguments.empty()) {
-        arguments.push_back(guest_executable);
-    }
     if (environment.empty()) {
         environment = {
             "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
@@ -101,7 +161,8 @@ LoadedProcess ProcessLoader::load(
         environment_pointers.push_back(push_string(*it));
     }
     std::reverse(environment_pointers.begin(), environment_pointers.end());
-    const auto executable_path = push_string("executable_path=" + guest_executable);
+    const auto executable_path =
+        push_string("executable_path=" + mapped_executable);
 
     const auto text_segment = std::find_if(
         executable.segments().begin(), executable.segments().end(),
@@ -141,10 +202,66 @@ LoadedProcess ProcessLoader::load(
     return LoadedProcess{
         std::move(executable),
         std::move(dynamic_linker),
+        std::move(mapped_executable),
+        std::move(arguments),
         dyld_entry,
         stack_pointer,
         main_header,
     };
+}
+
+ProcessLoader::ResolvedInvocation ProcessLoader::resolve_invocation(
+    std::string guest_executable,
+    std::vector<std::string> arguments) const {
+    if (arguments.empty()) {
+        arguments.push_back(guest_executable);
+    }
+    auto mapped_executable = guest_executable;
+    for (std::size_t depth = 0; depth < maximum_interpreter_depth; ++depth) {
+        const auto directive =
+            read_interpreter_directive(host_path(mapped_executable));
+        if (!directive) {
+            break;
+        }
+        std::vector<std::string> interpreter_arguments;
+        interpreter_arguments.reserve(arguments.size() + 2U);
+        interpreter_arguments.push_back(directive->path);
+        if (directive->argument) {
+            interpreter_arguments.push_back(*directive->argument);
+        }
+        interpreter_arguments.push_back(mapped_executable);
+        if (arguments.size() > 1U) {
+            interpreter_arguments.insert(interpreter_arguments.end(),
+                                         arguments.begin() + 1,
+                                         arguments.end());
+        }
+        arguments = std::move(interpreter_arguments);
+        mapped_executable = directive->path;
+        if (depth + 1U == maximum_interpreter_depth &&
+            read_interpreter_directive(host_path(mapped_executable))) {
+            throw std::runtime_error{"interpreter nesting limit exceeded: " +
+                                     guest_executable};
+        }
+    }
+    return ResolvedInvocation{std::move(mapped_executable),
+                              std::move(arguments)};
+}
+
+bool ProcessLoader::validate(std::string guest_executable) const {
+    try {
+        const auto invocation =
+            resolve_invocation(std::move(guest_executable), {});
+        const auto executable =
+            MachOImage::parse(host_path(invocation.executable_path));
+        if (!executable.dynamic_linker() || !executable.entry_point()) {
+            return false;
+        }
+        const auto dynamic_linker =
+            MachOImage::parse(host_path(*executable.dynamic_linker()));
+        return dynamic_linker.entry_point().has_value();
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 }  // namespace ilegacysim

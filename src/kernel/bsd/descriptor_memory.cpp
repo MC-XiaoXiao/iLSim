@@ -59,11 +59,14 @@ void CompatibilityKernel::dispatch_bsd_descriptor_memory(Cpu &cpu,
         virtual_descriptor->second == bsd::baseband_device::descriptor_kind;
     const auto readable_socket =
         host_sockets_.contains(fd) || virtual_udp_sockets_.contains(fd) ||
+        bpf_descriptors_.contains(fd) ||
         kernel_control_endpoints_.contains(fd) ||
         socket_pair_endpoints_.contains(fd) || baseband_descriptor ||
         (virtual_descriptor != virtual_descriptors_.end() &&
          (virtual_descriptor->second == "system-event-socket" ||
-          virtual_descriptor->second == "route-socket"));
+          virtual_descriptor->second == "route-socket" ||
+          virtual_descriptor->second ==
+              darwin::network::apple80211_driver::event_descriptor_kind));
     if (readable_socket) {
       if (receive_socket_bytes(cpu, fd, registers[1],
                                static_cast<std::uint32_t>(size))) {
@@ -152,6 +155,11 @@ void CompatibilityKernel::dispatch_bsd_descriptor_memory(Cpu &cpu,
     }
     const auto address = registers[1];
     const auto size = static_cast<std::size_t>(registers[2]);
+    if (bpf_descriptors_.contains(fd)) {
+      static_cast<void>(write_bpf_bytes(
+          cpu, fd, address, static_cast<std::uint32_t>(size)));
+      return;
+    }
     if (kernel_control_endpoints_.contains(fd)) {
       if (size > bsd_support::maximum_io) {
         bsd_error(cpu, bsd_support::invalid_argument);
@@ -206,14 +214,82 @@ void CompatibilityKernel::dispatch_bsd_descriptor_memory(Cpu &cpu,
         if (!queried_entry) {
           route_error = darwin::error::no_such_process;
         }
-      } else if (route_error == 0 && !entry->interface_name.empty()) {
-        std::lock_guard network_lock{shared_state_->network_mutex};
-        const auto interface =
-            shared_state_->network_interfaces.find(entry->interface_name);
-        if (interface == shared_state_->network_interfaces.end()) {
-          route_error = darwin::error::no_such_device_or_address;
-        } else if (entry->interface_index == 0) {
-          entry->interface_index = interface->second.index;
+      } else if (route_error == 0) {
+        const auto add_or_change =
+            parsed.message->type == darwin::route::message_add ||
+            parsed.message->type == darwin::route::message_change;
+        if (add_or_change && entry->interface_name.empty() &&
+            entry->interface_index == 0 && entry->gateway.size() >= 8U &&
+            std::to_integer<std::uint8_t>(entry->gateway[1]) ==
+                darwin::network::address_family_link) {
+          const auto link_index = static_cast<std::uint16_t>(
+              std::to_integer<std::uint8_t>(entry->gateway[2]) |
+              (static_cast<std::uint16_t>(
+                   std::to_integer<std::uint8_t>(entry->gateway[3]))
+               << 8U));
+          const auto name_length = static_cast<std::size_t>(
+              std::to_integer<std::uint8_t>(entry->gateway[5]));
+          if (name_length <= entry->gateway.size() - 8U) {
+            entry->interface_index = link_index;
+            entry->interface_name.assign(
+                reinterpret_cast<const char*>(entry->gateway.data() + 8U),
+                name_length);
+          }
+        }
+
+        if (!entry->interface_name.empty() ||
+            entry->interface_index != 0) {
+          std::lock_guard network_lock{shared_state_->network_mutex};
+          if (!entry->interface_name.empty()) {
+            const auto interface =
+                shared_state_->network_interfaces.find(
+                    entry->interface_name);
+            if (interface == shared_state_->network_interfaces.end()) {
+              route_error = darwin::error::no_such_device_or_address;
+            } else if (entry->interface_index != 0 &&
+                       entry->interface_index !=
+                           interface->second.index) {
+              route_error = darwin::error::invalid_argument;
+            } else {
+              entry->interface_index = interface->second.index;
+            }
+          } else {
+            const auto interface = std::find_if(
+                shared_state_->network_interfaces.begin(),
+                shared_state_->network_interfaces.end(),
+                [&](const auto& candidate) {
+                  return candidate.second.index ==
+                         entry->interface_index;
+                });
+            if (interface == shared_state_->network_interfaces.end()) {
+              route_error = darwin::error::no_such_device_or_address;
+            } else {
+              entry->interface_name = interface->first;
+            }
+          }
+        }
+
+        const auto gateway_family =
+            entry->gateway.size() >= 2U
+                ? std::to_integer<std::uint8_t>(entry->gateway[1])
+                : darwin::network::address_family_unspecified;
+        if (route_error == 0 && add_or_change &&
+            entry->interface_name.empty() &&
+            entry->interface_index == 0 &&
+            (gateway_family ==
+                 darwin::network::address_family_inet ||
+             gateway_family ==
+                 darwin::network::address_family_inet6)) {
+          darwin::route::Entry gateway_query;
+          gateway_query.family =
+              static_cast<std::uint8_t>(gateway_family);
+          gateway_query.destination = entry->gateway;
+          if (const auto route =
+                  shared_state_->route_table.lookup_bound_interface(
+                      gateway_query)) {
+            entry->interface_name = route->interface_name;
+            entry->interface_index = route->interface_index;
+          }
         }
       }
       if (!query && route_error == 0) {
@@ -526,6 +602,10 @@ void CompatibilityKernel::dispatch_bsd_descriptor_memory(Cpu &cpu,
           state != route_socket_states_.end()) {
         route_socket_states_[allocated] = state->second;
       }
+      if (const auto bpf = bpf_descriptors_.find(source);
+          bpf != bpf_descriptors_.end()) {
+        bpf_descriptors_[allocated] = bpf->second;
+      }
     } else {
       const auto original = duplicated_descriptors_.contains(source)
                                 ? duplicated_descriptors_.at(source)
@@ -601,8 +681,10 @@ void CompatibilityKernel::dispatch_bsd_descriptor_memory(Cpu &cpu,
     regular_file_open_descriptions_.erase(destination);
     file_status_flags_.erase(destination);
     virtual_block_descriptors_.erase(destination);
+    bpf_descriptors_.erase(destination);
     virtual_descriptors_.erase(destination);
     host_sockets_.erase(destination);
+    pending_wifi_driver_events_.erase(destination);
     virtual_udp_sockets_.erase(destination);
     kernel_control_endpoints_.erase(destination);
     duplicated_descriptors_.erase(destination);
@@ -613,6 +695,7 @@ void CompatibilityKernel::dispatch_bsd_descriptor_memory(Cpu &cpu,
     descriptor_flags_.erase(destination);
     socket_options_.erase(destination);
     system_event_filters_.erase(destination);
+    apple80211_scan_delivered_.erase(destination);
     system_event_next_identifiers_.erase(destination);
     route_socket_states_.erase(destination);
     kqueues_.erase(destination);
@@ -682,6 +765,10 @@ void CompatibilityKernel::dispatch_bsd_descriptor_memory(Cpu &cpu,
       if (const auto state = route_socket_states_.find(source);
           state != route_socket_states_.end()) {
         route_socket_states_[destination] = state->second;
+      }
+      if (const auto bpf = bpf_descriptors_.find(source);
+          bpf != bpf_descriptors_.end()) {
+        bpf_descriptors_[destination] = bpf->second;
       }
     } else {
       duplicated_descriptors_[destination] =

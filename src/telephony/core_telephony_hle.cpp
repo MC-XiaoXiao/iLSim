@@ -2,11 +2,14 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 
 #include "ilegacysim/address_space.hpp"
 #include "ilegacysim/userland_hle.hpp"
+#include "ilegacysim/wifi_state.hpp"
 
 namespace ilegacysim {
 namespace {
@@ -22,11 +25,10 @@ constexpr std::string_view offline_sim_status_export{
 
 // These APIs have scalar return values in iPhoneOS 1.0. An offline handset
 // has no data attachment, active data context, signal, airplane mode, or calls.
-constexpr std::array<std::string_view, 5> offline_scalar_queries{
+constexpr std::array<std::string_view, 4> offline_scalar_queries{
     "_CTRegistrationGetDataAttached",
     "_CTRegistrationGetDataContextActive",
     "_CTGetSignalStrength",
-    "_CTPowerGetAirplaneMode",
     "_CTGetCurrentCallCount",
 };
 
@@ -117,6 +119,15 @@ void return_server_success(UserlandHleCall& call) {
 }  // namespace
 
 void register_core_telephony_hle(UserlandHleRegistry& registry) {
+    const auto wifi_state = std::make_shared<WifiState>();
+    register_core_telephony_hle(
+        registry, [wifi_state] { return wifi_state; });
+}
+
+void register_core_telephony_hle(
+    UserlandHleRegistry& registry, WifiStateProvider wifi_state,
+    std::function<void(const WifiSnapshot&, const WifiSnapshot&)>
+        wifi_state_changed) {
     // Every stock UI process shares one offline compatibility backend. Match
     // the application directory instead of maintaining a bundle whitelist,
     // while allowing CommCenter and other system daemons to keep their native
@@ -141,6 +152,36 @@ void register_core_telephony_hle(UserlandHleRegistry& registry) {
                 }
             });
     }
+    registry.register_function(
+        std::string{core_telephony_image}, "_CTPowerGetAirplaneMode",
+        [wifi_state](UserlandHleCall& call) {
+            if (!is_offline_ui_client(call)) {
+                call.resume_original();
+                return;
+            }
+            const auto state = wifi_state ? wifi_state() : nullptr;
+            call.set_return(
+                state && state->snapshot().airplane_mode ? 1U : 0U);
+        });
+    registry.register_function(
+        std::string{core_telephony_image}, "_CTPowerSetAirplaneMode",
+        [wifi_state, wifi_state_changed](UserlandHleCall& call) {
+            if (!is_offline_ui_client(call)) {
+                call.resume_original();
+                return;
+            }
+            const auto state = wifi_state ? wifi_state() : nullptr;
+            if (!state) {
+                call.set_return(0);
+                return;
+            }
+            const auto before = state->snapshot();
+            static_cast<void>(
+                state->set_airplane_mode(call.argument(0) != 0));
+            const auto after = state->snapshot();
+            if (wifi_state_changed) wifi_state_changed(before, after);
+            call.set_return(0);
+        });
 
     registry.register_function(
         std::string{core_telephony_image}, "_CTRegistrationGetStatus",

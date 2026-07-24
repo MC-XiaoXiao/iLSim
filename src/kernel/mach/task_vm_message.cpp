@@ -63,6 +63,29 @@ bool CompatibilityKernel::dispatch_mach_task_vm_message(
       mig_message_id(xnu792::mig::task::Routine::thread_create_running);
   if ((creates_suspended_thread || creates_running_thread) &&
       registers[3] >= 40) {
+    const auto write_create_error = [&](std::uint32_t result) {
+      const std::array<std::uint32_t, 9> reply{
+          18,
+          36,
+          *local_port,
+          0,
+          0,
+          *message_id + 100,
+          0,
+          1,
+          result,
+      };
+      for (std::size_t index = 0; index < reply.size(); ++index) {
+        if (!memory_.write32(message_address +
+                                 static_cast<std::uint32_t>(index * 4U),
+                             reply[index])) {
+          registers[0] = darwin::mach_message::receive_invalid_data;
+          return true;
+        }
+      }
+      registers[0] = darwin::mach::success;
+      return true;
+    };
     const auto &create_arguments =
         xnu792::mig::task::thread_create_running_arguments;
     std::array<std::uint32_t, 16> state{};
@@ -111,10 +134,16 @@ bool CompatibilityKernel::dispatch_mach_task_vm_message(
                     std::to_string(state_count) + "\n");
       ++thread_trace_count_;
     }
+    if (!valid_state) {
+      return write_create_error(darwin::mach::invalid_argument);
+    }
     const auto processor =
-        valid_state && thread_create_handler_
+        thread_create_handler_
             ? thread_create_handler_(state, guest_cpsr | 0x10U)
             : std::nullopt;
+    if (!processor) {
+      return write_create_error(darwin::mach::resource_shortage);
+    }
     if (processor) {
       if (creates_suspended_thread && thread_runnable_handler_ &&
           !thread_runnable_handler_(process_.pid,
@@ -124,8 +153,7 @@ bool CompatibilityKernel::dispatch_mach_task_vm_message(
           static_cast<void>(thread_terminate_handler_(process_.pid,
                                                       *processor));
         }
-        registers[0] = 0x10004008U;
-        return true;
+        return write_create_error(darwin::mach::failure);
       }
       std::uint32_t port_object = 0;
       std::uint32_t port_name = 0;
@@ -149,8 +177,11 @@ bool CompatibilityKernel::dispatch_mach_task_vm_message(
         std::lock_guard mach_lock{shared_state_->mach_mutex};
         static_cast<void>(shared_state_->mach_port_objects.erase(port_object));
         shared_state_->mach_queues.erase(port_object);
-        registers[0] = 0x10004008U;
-        return true;
+        if (thread_terminate_handler_) {
+          static_cast<void>(thread_terminate_handler_(process_.pid,
+                                                      *processor));
+        }
+        return write_create_error(darwin::mach::resource_shortage);
       }
       thread_ports_[*processor] = port_name;
       const std::array<std::uint32_t, 10> reply{

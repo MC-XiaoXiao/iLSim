@@ -323,6 +323,12 @@ void remove_port_object_locked(KernelSharedState &state, std::uint32_t object) {
   if (state.mobile_framebuffer_service == object) {
     state.mobile_framebuffer_service = 0;
   }
+  if (state.wifi_service == object) {
+    state.wifi_service = 0;
+  }
+  if (state.wifi_interface_service == object) {
+    state.wifi_interface_service = 0;
+  }
   state.mach_notifications.erase(std::pair{object, mach_notify_port_destroyed});
   state.mach_notifications.erase(std::pair{object, mach_notify_no_senders});
 }

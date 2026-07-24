@@ -62,6 +62,30 @@ void CompatibilityKernel::release_process_mach_rights() {
   shared_state_->mach_namespaces.destroy_task(process_.pid);
 }
 
+void CompatibilityKernel::exit_process(std::uint32_t status,
+                                       std::uint32_t signal) {
+  if (process_.exited)
+    return;
+  shared_state_->advisory_file_locks->release_process_record_locks(
+      process_.pid);
+  apple80211_hle_.reset(process_.pid);
+  release_process_mach_rights();
+  process_.exited = true;
+  process_.exit_status = status;
+  process_.termination_signal = signal;
+  if (auto record = shared_state_->processes.find(process_.pid);
+      record != shared_state_->processes.end()) {
+    record->second.exited = true;
+    record->second.exit_status = status;
+    record->second.termination_signal = signal;
+  }
+  output_.write("[process] exit pid=" + std::to_string(process_.pid) +
+                " status=" + std::to_string(status) +
+                (signal != 0 ? " signal=" + std::to_string(signal)
+                             : std::string{}) +
+                "\n");
+}
+
 void CompatibilityKernel::dispatch_bsd_process(Cpu &cpu, std::uint32_t number) {
   if (dispatch_bsd_process_credentials(cpu, number))
     return;
@@ -80,20 +104,7 @@ void CompatibilityKernel::dispatch_bsd_process(Cpu &cpu, std::uint32_t number) {
     return;
   }
   case 1: // exit
-    shared_state_->advisory_file_locks->release_process_record_locks(
-        process_.pid);
-    release_process_mach_rights();
-    process_.exited = true;
-    process_.exit_status = registers[0];
-    process_.termination_signal = 0;
-    if (auto record = shared_state_->processes.find(process_.pid);
-        record != shared_state_->processes.end()) {
-      record->second.exited = true;
-      record->second.exit_status = process_.exit_status;
-      record->second.termination_signal = 0;
-    }
-    output_.write("[process] exit pid=" + std::to_string(process_.pid) +
-                  " status=" + std::to_string(process_.exit_status) + "\n");
+    exit_process(registers[0]);
     bsd_success(cpu, 0);
     cpu.halt(Dynarmic::HaltReason::UserDefined1);
     return;

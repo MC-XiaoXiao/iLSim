@@ -40,7 +40,8 @@ void CompatibilityKernel::dispatch_bsd_socket(Cpu &cpu, std::uint32_t number) {
     }
     if (receive_socket_message(cpu, fd, registers[1]))
       return;
-    if ((file_status_flags_[fd] & darwin::open_flag::non_block) != 0) {
+    if ((registers[2] & darwin::socket::message_dont_wait) != 0 ||
+        (file_status_flags_[fd] & darwin::open_flag::non_block) != 0) {
       bsd_error(cpu, bsd_support::would_block);
       return;
     }
@@ -207,7 +208,8 @@ void CompatibilityKernel::dispatch_bsd_socket(Cpu &cpu, std::uint32_t number) {
                              registers[5])) {
       return;
     }
-    if ((file_status_flags_[fd] & darwin::open_flag::non_block) != 0) {
+    if ((registers[3] & darwin::socket::message_dont_wait) != 0 ||
+        (file_status_flags_[fd] & darwin::open_flag::non_block) != 0) {
       bsd_error(cpu, bsd_support::would_block);
       return;
     }
@@ -393,6 +395,12 @@ void CompatibilityKernel::dispatch_bsd_socket(Cpu &cpu, std::uint32_t number) {
         const auto created = HostSocket::create(
             host_network_policy_, registers[0], registers[1], registers[2]);
         if (!created.socket) {
+          output_.write("[network] socket-create failed pid=" +
+                        std::to_string(process_.pid) + " family=" +
+                        std::to_string(registers[0]) + " type=" +
+                        std::to_string(registers[1]) + " protocol=" +
+                        std::to_string(registers[2]) + " error=" +
+                        std::to_string(created.darwin_error) + "\n");
           bsd_error(cpu, created.darwin_error);
           return;
         }

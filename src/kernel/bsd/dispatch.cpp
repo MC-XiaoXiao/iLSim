@@ -131,6 +131,15 @@ void CompatibilityKernel::dispatch_bsd(Cpu &cpu, std::uint32_t number) {
   case 300:
     static_cast<void>(dispatch_bsd_shared_region(cpu, number));
     return;
+  case darwin::syscall::aio_synchronize:
+  case darwin::syscall::aio_return:
+  case darwin::syscall::aio_suspend:
+  case darwin::syscall::aio_cancel:
+  case darwin::syscall::aio_error:
+  case darwin::syscall::aio_read:
+  case darwin::syscall::aio_write:
+    dispatch_bsd_aio(cpu, number);
+    return;
   case 180:
     static_cast<void>(dispatch_bsd_debug(cpu, number));
     return;

@@ -36,11 +36,14 @@
 #include "ilegacysim/lockdown_profile.hpp"
 #include "ilegacysim/mach_thread_policy_abi.hpp"
 #include "ilegacysim/macho.hpp"
+#include "ilegacysim/network_preferences.hpp"
 #include "ilegacysim/output.hpp"
 #include "ilegacysim/process_loader.hpp"
 #include "ilegacysim/realtime_pacer.hpp"
 #include "ilegacysim/sdl_display.hpp"
 #include "ilegacysim/touch_replay.hpp"
+#include "ilegacysim/virtual_network.hpp"
+#include "ilegacysim/wifi_state.hpp"
 #include "ilegacysim/xnu_scheduler.hpp"
 #include "ffmpeg_audio_decoder.hpp"
 #include "sdl_audio_sink.hpp"
@@ -51,7 +54,8 @@ using namespace ilegacysim;
 
 constexpr std::size_t fault_stack_word_count = 32;
 constexpr std::size_t maximum_watchpoint_traces = 64;
-constexpr std::size_t maximum_guest_threads = 16;
+constexpr std::size_t initial_guest_thread_slots = 16;
+constexpr std::size_t maximum_guest_threads = 32;
 constexpr std::size_t maximum_virtual_processors = 64;
 constexpr std::size_t arm_thumb_breakpoint_size = 2;
 constexpr std::size_t arm_breakpoint_size = 4;
@@ -615,10 +619,31 @@ void boot(const std::vector<std::string> &args, Output &output) {
                              std::to_string(maximum_virtual_processors)};
   }
   const auto network_policy_value =
-      option(args, "--network").value_or("isolated");
+      option(args, "--network").value_or("host");
   const auto network_policy = parse_host_network_policy(network_policy_value);
   if (!network_policy) {
     throw std::runtime_error{"--network must be isolated, loopback, or host"};
+  }
+  std::vector<std::string> preferred_wifi_networks;
+  if (*network_policy != HostNetworkPolicy::Isolated) {
+    const auto network_preferences = ensure_airport_network_service(
+        *rootfs, "en0", wifi_interface_mac_address,
+        NetworkPreferencesIpv4{
+            .address = virtual_network::client_address,
+            .netmask = virtual_network::netmask,
+            .gateway = virtual_network::gateway_address,
+            .dns_servers = {virtual_network::dns_proxy_address},
+        });
+    preferred_wifi_networks =
+        network_preferences.preferred_wifi_networks;
+    output.line(
+        "[device-state] airport-service=" +
+        (network_preferences.service_identifier.empty()
+             ? std::string{"unavailable"}
+             : network_preferences.service_identifier) +
+        " path=" + network_preferences.path.string() +
+        " supported=" + std::to_string(network_preferences.supported) +
+        " changed=" + std::to_string(network_preferences.changed));
   }
   const auto display_mode = option(args, "--display").value_or("headless");
   if (display_mode != "headless" && display_mode != "sdl") {
@@ -692,8 +717,9 @@ void boot(const std::vector<std::string> &args, Output &output) {
   std::vector<std::unique_ptr<Runtime>> runtimes;
   auto initial = std::make_unique<Runtime>();
   initial->memory = std::move(initial_memory);
-  initial->cpus =
-      std::make_unique<CpuCluster>(maximum_guest_threads, *initial->memory);
+  initial->cpus = std::make_unique<CpuCluster>(
+      initial_guest_thread_slots, maximum_guest_threads, *initial->memory,
+      guest_processor_count == 1);
   initial->kernel =
       std::make_unique<CompatibilityKernel>(*initial->memory, output, *rootfs,
                                             device);
@@ -735,13 +761,16 @@ void boot(const std::vector<std::string> &args, Output &output) {
                       " visible-pixels=" + std::to_string(visible));
         });
   }
-  initial->allocated.assign(maximum_guest_threads, false);
+  initial->allocated.assign(initial_guest_thread_slots, false);
   Runtime *initial_runtime = initial.get();
   runtimes.push_back(std::move(initial));
+  initial_runtime->kernel->set_preferred_wifi_networks(
+      preferred_wifi_networks);
   BootGdbTarget debug_target{runtimes};
   XnuScheduler scheduler{xnu792::scheduler::standard_quantum_ticks,
                          xnu792::scheduler::scheduler_tick_interval,
                          guest_processor_count};
+  std::optional<XnuThreadId> last_serial_thread;
 
   std::uint32_t next_pid = 2;
   std::size_t watchpoint_trace_count = 0;
@@ -753,7 +782,7 @@ void boot(const std::vector<std::string> &args, Output &output) {
     if (!runtime.kernel->set_virtual_processor_count(guest_processor_count)) {
       throw std::runtime_error{"invalid virtual processor topology"};
     }
-    for (std::size_t index = 0; index < runtime.cpus->size(); ++index) {
+    const auto configure_cpu = [&, runtime_ptr](std::size_t index) {
       auto &cpu = runtime.cpus->cpu(index);
       runtime.kernel->attach(cpu);
       cpu.set_svc_dispatch_mode(guest_processor_count > 1
@@ -784,15 +813,18 @@ void boot(const std::vector<std::string> &args, Output &output) {
               output.line(message.str());
             });
       }
+    };
+    for (std::size_t index = 0; index < runtime.cpus->size(); ++index) {
+      configure_cpu(index);
     }
     runtime.kernel->set_thread_create_handler(
-        [runtime_ptr,
-         &scheduler](const std::array<std::uint32_t, 16> &registers,
-                     std::uint32_t cpsr) -> std::optional<std::size_t> {
-          for (std::size_t index = 1; index < runtime_ptr->cpus->size();
-               ++index) {
+        [runtime_ptr, &scheduler,
+         configure_cpu](const std::array<std::uint32_t, 16> &registers,
+                        std::uint32_t cpsr) -> std::optional<std::size_t> {
+          const auto allocate_slot =
+              [&](std::size_t index) -> std::optional<std::size_t> {
             if (runtime_ptr->allocated[index])
-              continue;
+              return std::nullopt;
             auto &child = runtime_ptr->cpus->cpu(index);
             child.reset();
             child.registers() = registers;
@@ -807,8 +839,19 @@ void boot(const std::vector<std::string> &args, Output &output) {
               return std::nullopt;
             }
             return index;
+          };
+          for (std::size_t index = 1; index < runtime_ptr->cpus->size();
+               ++index) {
+            if (runtime_ptr->allocated[index])
+              continue;
+            return allocate_slot(index);
           }
-          return std::nullopt;
+          const auto added = runtime_ptr->cpus->add_cpu();
+          if (!added)
+            return std::nullopt;
+          runtime_ptr->allocated.push_back(false);
+          configure_cpu(*added);
+          return allocate_slot(*added);
         });
     runtime.kernel->set_thread_terminate_handler(
         [runtime_ptr, &scheduler](std::uint32_t pid, std::size_t processor) {
@@ -879,12 +922,13 @@ void boot(const std::vector<std::string> &args, Output &output) {
           child->memory = runtime_ptr->memory->clone();
           debug_target.prepare_fork_child(runtime_ptr->kernel->process().pid,
                                           *child->memory);
-          child->cpus = std::make_unique<CpuCluster>(maximum_guest_threads,
-                                                     *child->memory);
+          child->cpus = std::make_unique<CpuCluster>(
+              initial_guest_thread_slots, maximum_guest_threads,
+              *child->memory, guest_processor_count == 1);
           child->kernel = std::make_unique<CompatibilityKernel>(
               *child->memory, output, *rootfs, device);
           child->kernel->inherit_process_state(*runtime_ptr->kernel, child_pid);
-          child->allocated.assign(maximum_guest_threads, false);
+          child->allocated.assign(initial_guest_thread_slots, false);
           configure_runtime(*child);
           auto &child_cpu = child->cpus->cpu(0);
           child_cpu.registers() = parent_cpu.registers();
@@ -898,9 +942,16 @@ void boot(const std::vector<std::string> &args, Output &output) {
           return child_pid;
         });
     runtime.kernel->set_exec_handler(
-        [runtime_ptr](Cpu &source, std::string path,
-                      std::vector<std::string> arguments,
-                      std::vector<std::string> environment) {
+        [&, runtime_ptr](Cpu &source, std::string path,
+                         std::vector<std::string> arguments,
+                         std::vector<std::string> environment) {
+          ProcessLoader validator{*rootfs, *runtime_ptr->memory};
+          if (!validator.validate(path)) {
+            output.line("[process] exec rejected pid=" +
+                        std::to_string(runtime_ptr->kernel->process().pid) +
+                        " path=" + path);
+            return false;
+          }
           runtime_ptr->pending_exec = PendingExec{
               source.processor_id(),
               std::move(path),
@@ -922,24 +973,37 @@ void boot(const std::vector<std::string> &args, Output &output) {
             return false;
 
           auto &child_runtime = **child;
-          debug_target.notify_exec(child_pid);
-          child_runtime.memory->clear();
-          ProcessLoader loader{*rootfs, *child_runtime.memory};
-          child_runtime.kernel->set_process_arguments(arguments, environment);
-          auto loaded =
-              loader.load(path, std::move(arguments), std::move(environment));
-          child_runtime.kernel->set_process_image(path);
-          child_runtime.kernel->prepare_exec(0);
-          auto &child_cpu = child_runtime.cpus->cpu(0);
-          child_cpu.reset();
-          child_cpu.clear_cache();
-          child_cpu.registers().fill(0);
-          child_cpu.registers()[13] = loaded.stack_pointer;
-          child_cpu.registers()[15] = loaded.entry_point;
-          child_cpu.set_cpsr(0x10);
-          child_runtime.kernel->install_main_image_hle(child_cpu);
-          if (start_suspended) {
-            static_cast<void>(scheduler.block(XnuThreadId{child_pid, 0}));
+          try {
+            debug_target.notify_exec(child_pid);
+            child_runtime.memory->clear();
+            ProcessLoader loader{*rootfs, *child_runtime.memory};
+            auto loaded =
+                loader.load(path, std::move(arguments), environment);
+            child_runtime.kernel->set_process_arguments(loaded.arguments,
+                                                        environment);
+            child_runtime.kernel->set_process_image(path);
+            child_runtime.kernel->prepare_exec(0);
+            auto &child_cpu = child_runtime.cpus->cpu(0);
+            child_cpu.reset();
+            child_cpu.clear_cache();
+            child_cpu.registers().fill(0);
+            child_cpu.registers()[13] = loaded.stack_pointer;
+            child_cpu.registers()[15] = loaded.entry_point;
+            child_cpu.set_cpsr(0x10);
+            child_runtime.kernel->install_main_image_hle(
+                child_cpu, loaded.executable_path);
+            if (start_suspended) {
+              static_cast<void>(scheduler.block(XnuThreadId{child_pid, 0}));
+            }
+          } catch (const std::exception &error) {
+            output.line("[process] spawn exec failed pid=" +
+                        std::to_string(child_pid) + " path=" + path +
+                        " error=" + error.what());
+            child_runtime.kernel->exit_process(127);
+            scheduler.remove_process(child_pid);
+            std::fill(child_runtime.allocated.begin(),
+                      child_runtime.allocated.end(), false);
+            return false;
           }
           return true;
         });
@@ -1415,6 +1479,17 @@ void boot(const std::vector<std::string> &args, Output &output) {
         prepared.error = std::current_exception();
       }
     };
+    if (guest_processor_count == 1 && !prepared_slices.empty() &&
+        last_serial_thread !=
+            std::optional<XnuThreadId>{
+                prepared_slices.front().scheduled.thread}) {
+      // A local ARM exclusive reservation belongs to the physical processor,
+      // not to the saved register context. Clear it only at a real serialized
+      // thread switch; repeated slices of the same thread retain the ordinary
+      // Dynarmic fast path.
+      prepared_slices.front().cpu->clear_exclusive_state();
+      last_serial_thread = prepared_slices.front().scheduled.thread;
+    }
     if (prepared_slices.size() == 1) {
       execute_slice(prepared_slices.front());
     } else if (!prepared_slices.empty()) {
@@ -1476,11 +1551,11 @@ void boot(const std::vector<std::string> &args, Output &output) {
         debug_target.notify_exec(runtime.kernel->process().pid);
         runtime.memory->clear();
         ProcessLoader exec_loader{*rootfs, *runtime.memory};
-        runtime.kernel->set_process_arguments(pending.arguments,
-                                              pending.environment);
         auto loaded =
             exec_loader.load(pending.path, std::move(pending.arguments),
-                             std::move(pending.environment));
+                             pending.environment);
+        runtime.kernel->set_process_arguments(loaded.arguments,
+                                              pending.environment);
         runtime.kernel->set_process_image(pending.path);
         runtime.kernel->prepare_exec(pending.processor);
         auto &exec_cpu = runtime.cpus->cpu(pending.processor);
@@ -1490,7 +1565,8 @@ void boot(const std::vector<std::string> &args, Output &output) {
         exec_cpu.registers()[13] = loaded.stack_pointer;
         exec_cpu.registers()[15] = loaded.entry_point;
         exec_cpu.set_cpsr(0x10);
-        runtime.kernel->install_main_image_hle(exec_cpu);
+        runtime.kernel->install_main_image_hle(exec_cpu,
+                                               loaded.executable_path);
         static_cast<void>(scheduler.complete_slice(
             scheduled->thread, result.ticks_consumed,
             XnuSliceCompletion::Terminate, XnuTimeAccounting::Deferred));
@@ -1507,6 +1583,12 @@ void boot(const std::vector<std::string> &args, Output &output) {
           debug_stop = true;
           debug_signal = result.fault ? gdb_signal::segmentation_fault
                                       : gdb_signal::illegal_instruction;
+        } else if (runtime.kernel->process().pid !=
+                   initial_runtime->kernel->process().pid) {
+          runtime.kernel->exit_process(
+              0, result.fault ? gdb_signal::segmentation_fault
+                              : gdb_signal::illegal_instruction);
+          completion = XnuSliceCompletion::Terminate;
         } else {
           completion = XnuSliceCompletion::Terminate;
           hard_stop = true;

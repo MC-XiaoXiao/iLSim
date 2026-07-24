@@ -87,6 +87,10 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
                  presentation_tracker_},
       mobile_framebuffer_hle_{userland_hle_, display_state_, surface_store_,
                               presentation_tracker_} {
+  apple80211_hle_.set_event_injection_handler(
+      [this](std::uint32_t descriptor, std::uint32_t event) {
+        inject_wifi_driver_event(descriptor, event);
+      });
   configure_darwin_notify_state();
   shared_state_->device_product_type = device_profile_.product_type;
   shared_state_->device_board_config = device_profile_.board_config;
@@ -101,7 +105,12 @@ CompatibilityKernel::CompatibilityKernel(AddressSpace &memory, Output &output,
   opengles_hle_.set_scene_coordinator(scene_coordinator_);
   mobile_framebuffer_hle_.set_shared_state(shared_state_);
   mobile_framebuffer_hle_.set_scene_coordinator(scene_coordinator_);
-  register_core_telephony_hle(userland_hle_);
+  register_core_telephony_hle(
+      userland_hle_, [this] { return wifi_state_; },
+      [this](const WifiSnapshot &before, const WifiSnapshot &after) {
+        apply_wifi_transition(before, after);
+        apple80211_hle_.publish_state_change(before, after);
+      });
   register_dns_configuration_hle(userland_hle_);
   register_app_support_hle(userland_hle_);
   register_bluetooth_manager_hle(userland_hle_);
@@ -358,7 +367,7 @@ void CompatibilityKernel::prepare_exec(std::size_t processor_id) {
   darwin_notify_state_hle_.reset();
   core_audio_hle_.reset();
   userland_hle_.record_loaded_image(process_image_);
-  apple80211_hle_.reset();
+  apple80211_hle_.reset(process_.pid);
   core_surface_hle_.reset();
   opengles_hle_.reset();
   mbx2d_hle_.reset();
@@ -397,10 +406,14 @@ void CompatibilityKernel::prepare_exec(std::size_t processor_id) {
   pending_selects_.clear();
   pending_timers_.clear();
   pending_semaphore_waits_.clear();
+  aio_completions_.clear();
 }
 
-void CompatibilityKernel::install_main_image_hle(Cpu &cpu) {
-  auto relative = std::filesystem::path{process_image_};
+void CompatibilityKernel::install_main_image_hle(
+    Cpu &cpu, std::string_view mapped_guest_path) {
+  auto relative = std::filesystem::path{
+      mapped_guest_path.empty() ? std::string_view{process_image_}
+                                : mapped_guest_path};
   if (relative.is_absolute())
     relative = relative.relative_path();
   const auto host_path = rootfs_ / relative;
@@ -1105,6 +1118,19 @@ void CompatibilityKernel::schedule_due_audio_io(std::uint64_t deadline) {
   core_audio_hle_.io_proc_thread_scheduled(callback->process_id, *processor);
 }
 
+void CompatibilityKernel::inject_wifi_driver_event(
+    std::uint32_t, std::uint32_t event) {
+  if (event == 0 || event > 16) return;
+  const auto event_bit =
+      static_cast<std::uint16_t>(1U << (event - 1U));
+  for (const auto& [descriptor, kind] : virtual_descriptors_) {
+    if (kind ==
+        darwin::network::apple80211_driver::event_descriptor_kind) {
+      pending_wifi_driver_events_[descriptor] |= event_bit;
+    }
+  }
+}
+
 void CompatibilityKernel::reap_stopped_audio_threads() {
   for (const auto processor : core_audio_hle_.take_retired_io_proc_threads()) {
     userland_hle_.unbind_thread_callback(processor);
@@ -1185,6 +1211,7 @@ void CompatibilityKernel::inherit_process_state(
   file_status_flags_ = parent.file_status_flags_;
   descriptor_flags_ = parent.descriptor_flags_;
   virtual_descriptors_ = parent.virtual_descriptors_;
+  bpf_descriptors_ = parent.bpf_descriptors_;
   host_sockets_ = parent.host_sockets_;
   virtual_udp_sockets_ = parent.virtual_udp_sockets_;
   kernel_control_endpoints_ = parent.kernel_control_endpoints_;
@@ -1195,6 +1222,7 @@ void CompatibilityKernel::inherit_process_state(
   socket_options_ = parent.socket_options_;
   duplicated_descriptors_ = parent.duplicated_descriptors_;
   system_event_filters_ = parent.system_event_filters_;
+  apple80211_scan_delivered_ = parent.apple80211_scan_delivered_;
   system_event_next_identifiers_ = parent.system_event_next_identifiers_;
   route_socket_states_ = parent.route_socket_states_;
   socket_pair_endpoints_ = parent.socket_pair_endpoints_;
@@ -1237,6 +1265,13 @@ void CompatibilityKernel::inherit_process_state(
 
 void CompatibilityKernel::dispatch(Cpu &cpu, std::uint32_t svc_immediate) {
   std::lock_guard lock{mutex_};
+  if (apple80211_hle_.deliver_pending_event(
+          cpu, process_.pid, svc_immediate)) {
+    output_.write("[wifi-service] event-deliver pid=" +
+                  std::to_string(process_.pid) + " cpu=" +
+                  std::to_string(cpu.processor_id()) + "\n");
+    return;
+  }
   if (userland_hle_.dispatch(cpu, process_.pid, svc_immediate)) {
     reap_stopped_audio_threads();
     return;

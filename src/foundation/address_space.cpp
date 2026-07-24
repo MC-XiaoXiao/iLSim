@@ -134,6 +134,50 @@ bool AddressSpace::copy_in(std::uint32_t address,
   return true;
 }
 
+bool AddressSpace::copy_out(std::uint32_t address,
+                            std::span<std::byte> data) const {
+  if (range_overflows(address, data.size())) {
+    return false;
+  }
+  if (data.empty())
+    return true;
+  for (;;) {
+    {
+      auto lock = read_lock();
+      if (!range_accessible_locked(address, data.size(),
+                                   MemoryPermission::Read)) {
+        return false;
+      }
+      if (!range_needs_file_fault_locked(address, data.size())) {
+        std::size_t copied = 0;
+        while (copied < data.size()) {
+          const auto current =
+              address + static_cast<std::uint32_t>(copied);
+          const auto *page = find_page_locked(current);
+          const auto offset = current & (page_size - 1U);
+          const auto chunk = std::min<std::size_t>(
+              page_size - offset, data.size() - copied);
+          if (page != nullptr && page->backing) {
+            std::copy_n(page->backing->bytes.begin() + offset, chunk,
+                        data.begin() +
+                            static_cast<std::ptrdiff_t>(copied));
+          } else {
+            std::fill_n(
+                data.begin() + static_cast<std::ptrdiff_t>(copied), chunk,
+                std::byte{});
+          }
+          copied += chunk;
+        }
+        return true;
+      }
+    }
+    if (!const_cast<AddressSpace *>(this)->fault_file_pages(address,
+                                                            data.size())) {
+      return false;
+    }
+  }
+}
+
 bool AddressSpace::map_file(std::uint32_t address, std::uint32_t size,
                             MemoryPermission permissions,
                             const std::filesystem::path &path,

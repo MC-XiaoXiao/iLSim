@@ -222,16 +222,12 @@ std::optional<HostAddress> to_host_address(
         error = darwin_error_invalid_argument;
         return std::nullopt;
     }
-    const auto encoded_length = std::to_integer<std::uint8_t>(bytes[0]);
-    // Some Darwin 8 callers pass the authoritative sockaddr size as the
-    // syscall argument while leaving the in-structure sa_len byte zero.
-    const auto declared_length =
-        encoded_length == 0 ? bytes.size() : encoded_length;
+    // XNU's getsockaddr() overwrites sa_len with the syscall-supplied length
+    // after copying the user buffer. The span already represents that length,
+    // so an uninitialized or stale user sa_len byte must not reject an
+    // otherwise valid sockaddr.
+    const auto declared_length = bytes.size();
     const auto family = std::to_integer<std::uint8_t>(bytes[1]);
-    if (declared_length > bytes.size()) {
-        error = darwin_error_invalid_argument;
-        return std::nullopt;
-    }
 
     HostAddress result;
     if (family == darwin::network::address_family_inet) {

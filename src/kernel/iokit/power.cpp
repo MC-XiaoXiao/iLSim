@@ -223,7 +223,7 @@ std::optional<std::uint32_t> handle_interest_registration(
   std::uint32_t notification_name = 0;
   {
     std::lock_guard lock{state.mach_mutex};
-    if (!is_power_root_locked(state, process, remote_object))
+    if (!state.iokit_services.contains(remote_object))
       return std::nullopt;
     const auto wake_object =
         resolve_name_locked(state, process.pid, *wake_name);
@@ -238,7 +238,7 @@ std::optional<std::uint32_t> handle_interest_registration(
     notification_name =
         copyout_send_locked(state, process.pid, notification_object);
   }
-  output.write("[iokit-power] interest pid=" + std::to_string(process.pid) +
+  output.write("[iokit] interest pid=" + std::to_string(process.pid) +
                " notifier-name=" + std::to_string(notification_name) +
                " notifier-object=" + std::to_string(notification_object) +
                "\n");

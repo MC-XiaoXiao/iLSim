@@ -1,8 +1,11 @@
 #include "ilegacysim/darwin_network_abi.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace ilegacysim::darwin::network {
 namespace {
@@ -15,6 +18,42 @@ constexpr std::size_t interface_address_message_header_size = 20;
 constexpr std::size_t sockaddr_data_offset = 8;
 constexpr std::size_t minimum_sockaddr_dl_size = 20;
 constexpr std::uint32_t ethernet_baudrate = 10'000'000;
+constexpr std::size_t network_event_data_size =
+    sizeof(std::uint32_t) * 2U + interface_name_size;
+constexpr std::size_t ipv4_network_event_data_size =
+    network_event_data_size + 7U * sizeof(std::uint32_t);
+constexpr std::size_t ipv6_network_event_data_size = 160;
+
+void put32(
+    std::span<std::byte> bytes, std::size_t offset, std::uint32_t value);
+
+std::string_view event_interface_base_name(
+    const InterfaceSnapshot& interface) {
+    auto name = std::string_view{interface.name};
+    const auto unit = std::to_string(interface.unit);
+    if (name.size() > unit.size() && name.ends_with(unit)) {
+        name.remove_suffix(unit.size());
+    }
+    return name;
+}
+
+std::vector<std::byte> make_network_event_storage(
+    const InterfaceSnapshot& interface, std::size_t size) {
+    std::vector<std::byte> result(size);
+    put32(result, 0, interface.family);
+    put32(result, 4, interface.unit);
+    // XNU's net_event_data carries the driver base name and unit separately.
+    // Consumers reconstruct the BSD interface name as "<if_name><if_unit>".
+    const auto base_name = event_interface_base_name(interface);
+    const auto name_length = std::min(
+        base_name.size(), interface_name_size - 1U);
+    std::transform(
+        base_name.begin(),
+        base_name.begin() + static_cast<std::ptrdiff_t>(name_length),
+        result.begin() + 8,
+        [](char value) { return static_cast<std::byte>(value); });
+    return result;
+}
 
 void put16(
     std::span<std::byte> bytes, std::size_t offset, std::uint16_t value) {
@@ -28,6 +67,32 @@ void put32(
         bytes[offset + index] =
             static_cast<std::byte>(value >> (index * 8U));
     }
+}
+
+std::uint32_t ipv4_network_value(
+    const std::array<std::byte, 16>& address) {
+    std::uint32_t value{};
+    for (std::size_t index = 0; index < 4; ++index) {
+        value = (value << 8U) |
+                std::to_integer<std::uint8_t>(address[4 + index]);
+    }
+    return value;
+}
+
+void put_ipv4_network_value(
+    std::span<std::byte> bytes, std::size_t offset, std::uint32_t value) {
+    for (std::size_t index = 0; index < sizeof(value); ++index) {
+        bytes[offset + index] =
+            static_cast<std::byte>(value >> ((3U - index) * 8U));
+    }
+}
+
+std::uint32_t ipv4_classful_mask(std::uint32_t address) {
+    if ((address & 0x80000000U) == 0) return 0xff000000U;
+    if ((address & 0xc0000000U) == 0x80000000U) {
+        return 0xffff0000U;
+    }
+    return 0xffffff00U;
 }
 
 std::size_t rounded_sockaddr_size(std::size_t size) {
@@ -168,16 +233,93 @@ std::vector<std::byte> make_route_interface_list(
 
 std::vector<std::byte> make_network_event_data(
     const InterfaceSnapshot& interface) {
-    std::vector<std::byte> result(sizeof(std::uint32_t) * 2U + interface_name_size);
-    put32(result, 0, interface.family);
-    put32(result, 4, interface.unit);
-    const auto name_length = std::min(
-        interface.name.size(), interface_name_size - 1U);
-    std::transform(
-        interface.name.begin(),
-        interface.name.begin() + static_cast<std::ptrdiff_t>(name_length),
-        result.begin() + 8,
-        [](char value) { return static_cast<std::byte>(value); });
+    return make_network_event_storage(interface, network_event_data_size);
+}
+
+std::vector<std::byte> make_ipv4_network_event_data(
+    const InterfaceSnapshot& interface) {
+    auto result =
+        make_network_event_storage(interface, ipv4_network_event_data_size);
+    constexpr std::size_t address_offset = network_event_data_size;
+    constexpr std::size_t network_offset = address_offset + 4U;
+    constexpr std::size_t netmask_offset = network_offset + 4U;
+    constexpr std::size_t subnet_offset = netmask_offset + 4U;
+    constexpr std::size_t subnet_mask_offset = subnet_offset + 4U;
+    constexpr std::size_t broadcast_offset = subnet_mask_offset + 4U;
+    constexpr std::size_t destination_offset = broadcast_offset + 4U;
+
+    if (interface.ipv4_address) {
+        std::copy_n(
+            interface.ipv4_address->begin() + 4, 4,
+            result.begin() + static_cast<std::ptrdiff_t>(address_offset));
+        const auto address = ipv4_network_value(*interface.ipv4_address);
+        const auto class_mask = ipv4_classful_mask(address);
+        const auto subnet_mask =
+            interface.ipv4_netmask
+                ? ipv4_network_value(*interface.ipv4_netmask)
+                : class_mask;
+        const auto network_mask = class_mask & subnet_mask;
+
+        // XNU's ia_{,sub}net{,mask} fields are guest-host-order u_long
+        // values, unlike the surrounding in_addr fields.
+        put32(result, network_offset, address & network_mask);
+        put32(result, netmask_offset, network_mask);
+        put32(result, subnet_offset, address & subnet_mask);
+        put32(result, subnet_mask_offset, subnet_mask);
+        put_ipv4_network_value(
+            result, broadcast_offset,
+            (address & network_mask) | ~network_mask);
+    }
+    if (interface.ipv4_broadcast) {
+        std::copy_n(
+            interface.ipv4_broadcast->begin() + 4, 4,
+            result.begin() +
+                static_cast<std::ptrdiff_t>(destination_offset));
+    } else if (interface.ipv4_address &&
+               (interface.flags & interface_flag_loopback) != 0) {
+        std::copy_n(
+            interface.ipv4_address->begin() + 4, 4,
+            result.begin() +
+                static_cast<std::ptrdiff_t>(destination_offset));
+    }
+    return result;
+}
+
+std::vector<std::byte> make_ipv6_network_event_data(
+    const InterfaceSnapshot& interface) {
+    auto result =
+        make_network_event_storage(interface, ipv6_network_event_data_size);
+    constexpr std::size_t address_offset = network_event_data_size;
+    constexpr std::size_t network_offset = address_offset + 28U;
+    constexpr std::size_t prefix_mask_offset = network_offset + 56U;
+    constexpr std::size_t prefix_length_offset = prefix_mask_offset + 28U;
+
+    if (interface.ipv6_address) {
+        std::copy(
+            interface.ipv6_address->begin(), interface.ipv6_address->end(),
+            result.begin() + static_cast<std::ptrdiff_t>(address_offset));
+        std::copy(
+            interface.ipv6_address->begin(), interface.ipv6_address->end(),
+            result.begin() + static_cast<std::ptrdiff_t>(network_offset));
+    }
+    if (interface.ipv6_netmask) {
+        std::copy(
+            interface.ipv6_netmask->begin(), interface.ipv6_netmask->end(),
+            result.begin() +
+                static_cast<std::ptrdiff_t>(prefix_mask_offset));
+        std::uint32_t prefix_length{};
+        for (std::size_t index = 8; index < 24; ++index) {
+            prefix_length += std::popcount(
+                std::to_integer<std::uint8_t>(
+                    (*interface.ipv6_netmask)[index]));
+            if (interface.ipv6_address) {
+                result[network_offset + index] =
+                    (*interface.ipv6_address)[index] &
+                    (*interface.ipv6_netmask)[index];
+            }
+        }
+        put32(result, prefix_length_offset, prefix_length);
+    }
     return result;
 }
 

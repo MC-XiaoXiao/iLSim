@@ -294,6 +294,35 @@ std::optional<Entry> make_interface_route(
     return entry;
 }
 
+std::optional<Entry> make_default_gateway_route(
+    std::string interface_name, std::uint16_t interface_index,
+    std::span<const std::byte> gateway) {
+    if (gateway.size() < 2) return std::nullopt;
+    const auto family = std::to_integer<std::uint8_t>(gateway[1]);
+    const auto expected_size =
+        family == network::address_family_inet
+            ? 16U
+            : (family == network::address_family_inet6 ? 28U : 0U);
+    if (expected_size == 0 || gateway.size() < expected_size) {
+        return std::nullopt;
+    }
+
+    Entry entry;
+    entry.family = family;
+    entry.interface_index = interface_index;
+    entry.flags = flag_up | flag_gateway | flag_static;
+    entry.destination.assign(expected_size, std::byte{});
+    entry.destination[0] = static_cast<std::byte>(expected_size);
+    entry.destination[1] = static_cast<std::byte>(family);
+    entry.gateway.assign(
+        gateway.begin(),
+        gateway.begin() + static_cast<std::ptrdiff_t>(expected_size));
+    entry.netmask = entry.destination;
+    entry.interface_name = std::move(interface_name);
+    entry.origin = Entry::Origin::Interface;
+    return entry;
+}
+
 bool Entry::same_key(const Entry& other) const {
     return family == other.family &&
            address_data(destination, family) ==
@@ -432,6 +461,28 @@ std::optional<Entry> Table::lookup(const Entry& query) const {
     return best ? std::optional<Entry>{*best} : std::nullopt;
 }
 
+std::optional<Entry> Table::lookup_bound_interface(
+    const Entry& query) const {
+    std::lock_guard lock{mutex_};
+    const auto query_address = address_data(query.destination, query.family);
+    const Entry* best{};
+    std::size_t best_bits{};
+    for (const auto& candidate : entries_) {
+        const auto bound = !candidate.interface_name.empty() ||
+                           candidate.interface_index != 0;
+        if (!bound || candidate.family != query.family ||
+            !address_matches(candidate, query_address)) {
+            continue;
+        }
+        const auto bits = mask_bit_count(effective_mask(candidate));
+        if (best == nullptr || bits > best_bits) {
+            best = &candidate;
+            best_bits = bits;
+        }
+    }
+    return best ? std::optional<Entry>{*best} : std::nullopt;
+}
+
 InterfaceRouteUpdate Table::replace_interface_routes(
     std::string_view interface_name, std::uint8_t family,
     std::span<const Entry> replacements) {
@@ -459,6 +510,27 @@ InterfaceRouteUpdate Table::replace_interface_routes(
         }
     }
     return update;
+}
+
+std::vector<Entry> Table::remove_interface_routes(
+    std::string_view interface_name, std::uint16_t interface_index,
+    std::uint8_t family) {
+    std::lock_guard lock{mutex_};
+    std::vector<Entry> removed;
+    for (auto entry = entries_.begin(); entry != entries_.end();) {
+        const auto belongs_to_interface =
+            (!interface_name.empty() &&
+             entry->interface_name == interface_name) ||
+            (interface_index != 0 &&
+             entry->interface_index == interface_index);
+        if (entry->family == family && belongs_to_interface) {
+            removed.push_back(*entry);
+            entry = entries_.erase(entry);
+        } else {
+            ++entry;
+        }
+    }
+    return removed;
 }
 
 std::vector<Entry> Table::snapshot() const {

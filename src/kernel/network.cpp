@@ -66,13 +66,33 @@ darwin::network::InterfaceSnapshot make_interface_snapshot(
 
 void CompatibilityKernel::set_host_network_policy(HostNetworkPolicy policy) {
     host_network_policy_ = policy;
+    const auto service_available =
+        policy != HostNetworkPolicy::Isolated;
+    bool availability_changed = false;
+    {
+        std::lock_guard mach_lock{shared_state_->mach_mutex};
+        // The isolated policy intentionally exposes no external connectivity
+        // device. Loopback and host policies both have a usable upstream and
+        // therefore publish the guest's virtual 802.11 controller.
+        availability_changed =
+            shared_state_->wifi_service_available != service_available;
+        shared_state_->wifi_service_available = service_available;
+    }
+    // Every forked process receives its own kernel facade and host socket
+    // policy, but the radio is one shared device. Reapplying an unchanged host
+    // capability must not undo a guest Wi-Fi or airplane-mode decision.
+    if (!availability_changed) return;
+
     const auto before = wifi_state_->snapshot();
-    // Host isolation controls only whether BSD sockets may reach the host.
-    // The guest still sees its emulated Wi-Fi LAN, just as a device attached
-    // to an access point without an upstream route retains en0 and multicast.
-    static_cast<void>(wifi_state_->set_power(true));
-    static_cast<void>(wifi_state_->associate());
-    apply_wifi_transition(before, wifi_state_->snapshot());
+    // Publishing a usable backend powers the radio. Association is restored
+    // only when the guest data partition already marks a visible network as
+    // preferred; a fresh device remains idle until its first native join.
+    const auto power_changed = wifi_state_->set_power(service_available);
+    if (power_changed) {
+        const auto after = wifi_state_->snapshot();
+        apply_wifi_transition(before, after);
+        apple80211_hle_.publish_state_change(before, after);
+    }
 }
 
 std::optional<darwin::network::InterfaceSnapshot>
@@ -561,6 +581,25 @@ bool CompatibilityKernel::receive_socket_bytes(
         bsd_success(cpu, 0);
         return true;
     }
+    if (bpf_descriptors_.contains(fd)) {
+        return receive_bpf_bytes(cpu, fd, address, size);
+    }
+    if (const auto pending = pending_wifi_driver_events_.find(fd);
+        pending != pending_wifi_driver_events_.end() &&
+        pending->second != 0) {
+        const std::array bytes{
+            static_cast<std::byte>(pending->second & 0xffU),
+            static_cast<std::byte>((pending->second >> 8U) & 0xffU)};
+        const auto copied = std::min<std::size_t>(size, bytes.size());
+        if (!memory_.copy_in(
+                address, std::span{bytes}.first(copied))) {
+            bsd_error(cpu, darwin::error::bad_address);
+        } else {
+            pending_wifi_driver_events_.erase(pending);
+            bsd_success(cpu, static_cast<std::uint32_t>(copied));
+        }
+        return true;
+    }
     if (const auto host = host_sockets_.find(fd); host != host_sockets_.end()) {
         const auto received = host->second->receive(size);
         if (received.status == HostSocketStatus::WouldBlock) return false;
@@ -775,6 +814,8 @@ void CompatibilityKernel::apply_wifi_transition(
     bool flags_changed = false;
     bool address_added = false;
     bool address_deleted = false;
+    std::optional<darwin::network::InterfaceSnapshot>
+        deleted_address_snapshot;
     {
         std::lock_guard network_lock{shared_state_->network_mutex};
         const auto found = shared_state_->network_interfaces.find(
@@ -783,11 +824,14 @@ void CompatibilityKernel::apply_wifi_transition(
         auto& interface = found->second;
         const auto previous_flags = interface.flags;
         const auto previous_ipv4 = interface.has_ipv4;
+        if (previous_ipv4 && !after.ipv4) {
+            deleted_address_snapshot =
+                kernel_network::make_interface_snapshot(name, interface);
+        }
 
         if (after.powered) {
             interface.flags = static_cast<std::uint16_t>(
-                interface.flags | darwin::network::interface_flag_up |
-                darwin::network::interface_flag_running);
+                interface.flags | darwin::network::interface_flag_up);
         } else {
             interface.flags = static_cast<std::uint16_t>(
                 interface.flags &
@@ -796,11 +840,23 @@ void CompatibilityKernel::apply_wifi_transition(
                       darwin::network::interface_flag_running |
                       darwin::network::interface_flag_output_active)));
         }
+        if (after.associated_access_point) {
+            interface.flags = static_cast<std::uint16_t>(
+                interface.flags | darwin::network::interface_flag_running |
+                darwin::network::interface_flag_output_active);
+        } else {
+            interface.flags = static_cast<std::uint16_t>(
+                interface.flags &
+                static_cast<std::uint16_t>(
+                    ~(darwin::network::interface_flag_running |
+                      darwin::network::interface_flag_output_active)));
+        }
 
         interface.has_ipv4 = after.ipv4.has_value();
         interface.ipv4_address = {};
         interface.ipv4_netmask = {};
         interface.ipv4_broadcast = {};
+        interface.ipv4_gateway = {};
         if (after.ipv4) {
             const auto make_sockaddr = [](const std::array<std::byte, 4>& value) {
                 std::array<std::byte, 16> result{};
@@ -813,6 +869,7 @@ void CompatibilityKernel::apply_wifi_transition(
             interface.ipv4_address = make_sockaddr(after.ipv4->address);
             interface.ipv4_netmask = make_sockaddr(after.ipv4->netmask);
             interface.ipv4_broadcast = make_sockaddr(after.ipv4->broadcast);
+            interface.ipv4_gateway = make_sockaddr(after.ipv4->gateway);
         }
         flags_changed = previous_flags != interface.flags;
         address_added = !previous_ipv4 && interface.has_ipv4;
@@ -822,10 +879,12 @@ void CompatibilityKernel::apply_wifi_transition(
     synchronize_interface_routes(
         name, darwin::network::address_family_inet);
 
-    if (before.powered != after.powered) {
+    const auto was_linked = before.associated_access_point.has_value();
+    const auto is_linked = after.associated_access_point.has_value();
+    if (was_linked != is_linked) {
         post_data_link_event(
-            name, after.powered ? darwin::network::kernel_event_link_on
-                                : darwin::network::kernel_event_link_off);
+            name, is_linked ? darwin::network::kernel_event_link_on
+                            : darwin::network::kernel_event_link_off);
     }
     if (flags_changed) {
         post_data_link_event(
@@ -838,15 +897,19 @@ void CompatibilityKernel::apply_wifi_transition(
     } else if (address_deleted) {
         post_network_event(
             name, darwin::network::kernel_event_inet_subclass,
-            darwin::network::kernel_event_inet_address_deleted);
+            darwin::network::kernel_event_inet_address_deleted,
+            std::move(deleted_address_snapshot));
     }
 }
 
 void CompatibilityKernel::post_network_event(
     std::string_view interface_name, std::uint32_t event_subclass,
-    std::uint32_t event_code) {
+    std::uint32_t event_code,
+    std::optional<darwin::network::InterfaceSnapshot> address_snapshot) {
     darwin::network::InterfaceSnapshot snapshot;
-    {
+    if (address_snapshot) {
+        snapshot = std::move(*address_snapshot);
+    } else {
         std::lock_guard network_lock{shared_state_->network_mutex};
         const auto interface = shared_state_->network_interfaces.find(
             std::string{interface_name});
@@ -854,7 +917,13 @@ void CompatibilityKernel::post_network_event(
         snapshot = kernel_network::make_interface_snapshot(
             interface->first, interface->second);
     }
-    const auto event_data = darwin::network::make_network_event_data(snapshot);
+    const auto event_data =
+        event_subclass == darwin::network::kernel_event_inet_subclass
+            ? darwin::network::make_ipv4_network_event_data(snapshot)
+            : (event_subclass ==
+                       darwin::network::kernel_event_inet6_subclass
+                   ? darwin::network::make_ipv6_network_event_data(snapshot)
+                   : darwin::network::make_network_event_data(snapshot));
 
     std::lock_guard socket_lock{shared_state_->socket_mutex};
     const auto identifier = shared_state_->next_kernel_event_identifier++;
@@ -1014,6 +1083,13 @@ void CompatibilityKernel::synchronize_interface_routes(
                 interface.ipv4_address, mask, flags)) {
             replacements.push_back(std::move(*route));
         }
+        if (!loopback) {
+            if (auto route = darwin::route::make_default_gateway_route(
+                    std::string{interface_name}, interface.index,
+                    interface.ipv4_gateway)) {
+                replacements.push_back(std::move(*route));
+            }
+        }
     } else if (family == darwin::network::address_family_inet6 &&
                interface.has_ipv6) {
         const auto mask_is_host = std::all_of(
@@ -1038,8 +1114,19 @@ void CompatibilityKernel::synchronize_interface_routes(
         }
     }
 
-    const auto update = shared_state_->route_table.replace_interface_routes(
-        interface_name, family, replacements);
+    darwin::route::InterfaceRouteUpdate update;
+    const auto address_configured =
+        (family == darwin::network::address_family_inet &&
+         interface.has_ipv4) ||
+        (family == darwin::network::address_family_inet6 &&
+         interface.has_ipv6);
+    if (address_configured) {
+        update = shared_state_->route_table.replace_interface_routes(
+            interface_name, family, replacements);
+    } else {
+        update.removed = shared_state_->route_table.remove_interface_routes(
+            interface_name, interface.index, family);
+    }
     for (const auto& removed : update.removed) {
         post_route_message(darwin::route::make_entry_message(
             removed, 0, 0, false, false,
@@ -1062,6 +1149,12 @@ void CompatibilityKernel::synchronize_interface_routes(
 
 bool CompatibilityKernel::descriptor_readable(std::uint32_t fd) const {
     if (file_descriptors_.contains(fd)) return true;
+    if (bpf_descriptor_readable(fd)) return true;
+    if (const auto pending = pending_wifi_driver_events_.find(fd);
+        pending != pending_wifi_driver_events_.end() &&
+        pending->second != 0) {
+        return true;
+    }
     if (const auto descriptor = virtual_descriptors_.find(fd);
         descriptor != virtual_descriptors_.end() &&
         descriptor->second == bsd::baseband_device::descriptor_kind &&
@@ -1124,6 +1217,7 @@ bool CompatibilityKernel::descriptor_writable(std::uint32_t fd) const {
     if (const auto descriptor = virtual_descriptors_.find(fd);
         descriptor != virtual_descriptors_.end() &&
         (descriptor->second == "route-socket" ||
+         descriptor->second == darwin::bpf::descriptor_kind ||
          descriptor->second == bsd::baseband_device::descriptor_kind)) {
         return true;
     }
@@ -1133,6 +1227,11 @@ bool CompatibilityKernel::descriptor_writable(std::uint32_t fd) const {
 std::optional<std::uint32_t> CompatibilityKernel::socket_pending_byte_count(
     std::uint32_t fd, std::uint32_t& darwin_error) const {
     darwin_error = 0;
+    if (const auto pending = pending_wifi_driver_events_.find(fd);
+        pending != pending_wifi_driver_events_.end() &&
+        pending->second != 0) {
+        return 2;
+    }
     if (const auto host = host_sockets_.find(fd); host != host_sockets_.end()) {
         const auto pending = host->second->pending_bytes();
         if (pending.status == HostSocketStatus::Error) {

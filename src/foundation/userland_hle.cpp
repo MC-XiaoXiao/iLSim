@@ -844,6 +844,12 @@ UserlandHleRegistry::prepare_thread_callback_return(Cpu &cpu) {
   return address;
 }
 
+std::optional<std::uint32_t>
+UserlandHleRegistry::prepare_one_shot_return(
+    Cpu &cpu, std::uint32_t return_address, Handler completion) {
+  return install_continuation(cpu, return_address, std::move(completion));
+}
+
 bool UserlandHleRegistry::bind_thread_callback(std::size_t processor,
                                                Handler completion) {
   return completion && thread_callback_return_address_ != 0 &&

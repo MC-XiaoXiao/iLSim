@@ -64,6 +64,7 @@ std::uint32_t CompatibilityKernel::deliver_signal(std::uint32_t signal) {
 
   shared_state_->advisory_file_locks->release_process_record_locks(
       process_.pid);
+  apple80211_hle_.reset(process_.pid);
   release_process_mach_rights();
   process_.exited = true;
   process_.exit_status = 0;

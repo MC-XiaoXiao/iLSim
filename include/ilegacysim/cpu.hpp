@@ -60,12 +60,22 @@ public:
     void set_memory_write_watchpoint(
         std::uint32_t address, MemoryWriteHandler handler);
     void set_debug_breakpoints_enabled(bool enabled);
+    // The scheduler calls this when a different guest thread is dispatched on
+    // the same serialized virtual processor.
+    void clear_exclusive_state();
 
 private:
+    friend class CpuCluster;
+    Cpu(
+        std::size_t processor_id,
+        std::size_t exclusive_processor_id,
+        AddressSpace& memory,
+        Dynarmic::ExclusiveMonitor& monitor);
     class Callbacks;
     void ensure_jit();
 
     std::size_t processor_id_{};
+    std::size_t exclusive_processor_id_{};
     Dynarmic::ExclusiveMonitor* monitor_{};
     std::unique_ptr<Callbacks> callbacks_;
     std::unique_ptr<Dynarmic::A32::Jit> jit_;
@@ -75,14 +85,33 @@ private:
 class CpuCluster {
 public:
     CpuCluster(std::size_t processor_count, AddressSpace& memory);
+    CpuCluster(
+        std::size_t initial_processor_count,
+        std::size_t maximum_processor_count,
+        AddressSpace& memory);
+    // A serial guest scheduler can host many thread register contexts on one
+    // emulated processor. Keeping those counts separate avoids making every
+    // exclusive store scan all possible thread slots.
+    CpuCluster(
+        std::size_t initial_processor_count,
+        std::size_t maximum_processor_count,
+        AddressSpace& memory,
+        bool serialized_execution);
 
     [[nodiscard]] std::size_t size() const { return cpus_.size(); }
+    [[nodiscard]] std::size_t capacity() const {
+        return maximum_processor_count_;
+    }
     [[nodiscard]] Cpu& cpu(std::size_t index) { return *cpus_.at(index); }
     [[nodiscard]] const Cpu& cpu(std::size_t index) const { return *cpus_.at(index); }
+    [[nodiscard]] std::optional<std::size_t> add_cpu();
 
     std::vector<CpuRunResult> run_parallel(std::uint64_t ticks_per_cpu);
 
 private:
+    AddressSpace* memory_{};
+    std::size_t maximum_processor_count_{};
+    bool serialized_execution_{};
     Dynarmic::ExclusiveMonitor monitor_;
     std::vector<std::unique_ptr<Cpu>> cpus_;
 };

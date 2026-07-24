@@ -23,8 +23,10 @@ inline constexpr std::uint32_t bad_address = 14;
 inline constexpr std::uint32_t device_busy = 16;
 inline constexpr std::uint32_t file_exists = 17;
 inline constexpr std::uint32_t inappropriate_ioctl = 25;
+inline constexpr std::uint32_t illegal_seek = 29;
 inline constexpr std::uint32_t broken_pipe = 32;
 inline constexpr std::uint32_t would_block = 35;
+inline constexpr std::uint32_t operation_in_progress = 36;
 inline constexpr std::uint32_t no_protocol_option = 42;
 inline constexpr std::uint32_t address_in_use = 48;
 inline constexpr std::uint32_t not_directory = 20;
@@ -39,6 +41,37 @@ inline constexpr std::uint32_t not_connected = 57;
 inline constexpr std::uint32_t connection_refused = 61;
 inline constexpr std::uint32_t no_attribute = 93;
 } // namespace error
+
+namespace aio {
+// Darwin 8 ARM32 struct aiocb. off_t is 64-bit but only 4-byte aligned for
+// this target, while pointers and size_t remain 32-bit.
+inline constexpr std::uint32_t descriptor_offset = 0;
+inline constexpr std::uint32_t file_offset_offset = 4;
+inline constexpr std::uint32_t buffer_offset = 12;
+inline constexpr std::uint32_t byte_count_offset = 16;
+inline constexpr std::uint32_t request_priority_offset = 20;
+inline constexpr std::uint32_t notification_offset = 24;
+inline constexpr std::uint32_t signal_offset = 28;
+inline constexpr std::uint32_t signal_value_offset = 32;
+inline constexpr std::uint32_t notification_function_offset = 36;
+inline constexpr std::uint32_t notification_attributes_offset = 40;
+inline constexpr std::uint32_t list_opcode_offset = 44;
+inline constexpr std::uint32_t control_block_size = 48;
+
+inline constexpr std::uint32_t notify_none = 0;
+inline constexpr std::uint32_t notify_signal = 1;
+inline constexpr std::uint32_t notify_thread = 3;
+inline constexpr std::uint32_t all_done = 1;
+inline constexpr std::uint32_t canceled = 2;
+inline constexpr std::uint32_t not_canceled = 4;
+inline constexpr std::uint32_t list_no_operation = 0;
+inline constexpr std::uint32_t list_read = 1;
+inline constexpr std::uint32_t list_write = 2;
+inline constexpr std::uint32_t list_nowait = 1;
+inline constexpr std::uint32_t list_wait = 2;
+inline constexpr std::uint32_t synchronize = 0x0080;
+inline constexpr std::uint32_t maximum_requests_per_process = 16;
+} // namespace aio
 
 namespace open_flag {
 inline constexpr std::uint32_t access_mode = 0x0003;
@@ -109,6 +142,7 @@ inline constexpr std::uint32_t size = 8;
 } // namespace arm32_iovec
 
 inline constexpr std::uint32_t message_control_truncated = 0x20;
+inline constexpr std::uint32_t message_dont_wait = 0x80;
 
 inline constexpr std::uint32_t option_level = 0xffff; // SOL_SOCKET
 inline constexpr std::uint32_t option_accept_connection = 0x0002;
@@ -130,6 +164,7 @@ namespace mach {
 inline constexpr std::uint32_t success = 0;
 inline constexpr std::uint32_t invalid_argument = 4;
 inline constexpr std::uint32_t failure = 5;
+inline constexpr std::uint32_t resource_shortage = 6;
 inline constexpr std::uint32_t name_exists = 13;
 inline constexpr std::uint32_t aborted = 14;
 inline constexpr std::uint32_t invalid_name = 15;
@@ -223,6 +258,14 @@ inline constexpr std::uint32_t remove_extended_attribute = 238;
 inline constexpr std::uint32_t remove_extended_attribute_fd = 239;
 inline constexpr std::uint32_t list_extended_attributes = 240;
 inline constexpr std::uint32_t list_extended_attributes_fd = 241;
+inline constexpr std::uint32_t aio_synchronize = 313;
+inline constexpr std::uint32_t aio_return = 314;
+inline constexpr std::uint32_t aio_suspend = 315;
+inline constexpr std::uint32_t aio_cancel = 316;
+inline constexpr std::uint32_t aio_error = 317;
+inline constexpr std::uint32_t aio_read = 318;
+inline constexpr std::uint32_t aio_write = 319;
+inline constexpr std::uint32_t aio_list = 320;
 inline constexpr std::uint32_t disable_thread_signal = 331;
 inline constexpr std::uint32_t semaphore_wait_signal = 334;
 inline constexpr std::uint32_t kqueue = 362;

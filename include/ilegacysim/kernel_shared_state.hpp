@@ -28,6 +28,7 @@
 #include "ilegacysim/mach_port_object.hpp"
 #include "ilegacysim/touch_input.hpp"
 #include "ilegacysim/virtual_clock.hpp"
+#include "ilegacysim/virtual_network.hpp"
 #include "ilegacysim/virtual_udp.hpp"
 #include "ilegacysim/xnu_scheduler.hpp"
 
@@ -284,6 +285,7 @@ struct KernelSharedState {
     std::array<std::byte, 16> ipv4_address{};
     std::array<std::byte, 16> ipv4_netmask{};
     std::array<std::byte, 16> ipv4_broadcast{};
+    std::array<std::byte, 16> ipv4_gateway{};
     std::array<std::byte, 28> ipv6_address{};
     std::array<std::byte, 28> ipv6_netmask{};
   };
@@ -405,6 +407,8 @@ struct KernelSharedState {
     enum class Kind {
       String,
       Data,
+      Boolean,
+      Number,
     };
 
     Kind kind{Kind::Data};
@@ -414,15 +418,21 @@ struct KernelSharedState {
     std::string class_name;
     std::vector<std::string> conforms_to;
     std::map<std::string, IOKitRegistryProperty> properties;
+    std::string registry_path;
+    std::uint32_t parent_object{};
 
     IOKitService() = default;
     IOKitService(std::string service_class,
                  std::vector<std::string> service_conformance,
                  std::map<std::string, IOKitRegistryProperty>
-                     registry_properties = {})
+                     registry_properties = {},
+                 std::string service_registry_path = {},
+                 std::uint32_t service_parent_object = 0)
         : class_name(std::move(service_class)),
           conforms_to(std::move(service_conformance)),
-          properties(std::move(registry_properties)) {}
+          properties(std::move(registry_properties)),
+          registry_path(std::move(service_registry_path)),
+          parent_object(service_parent_object) {}
   };
   struct IOKitConnection {
     std::uint32_t service_port{};
@@ -547,8 +557,7 @@ struct KernelSharedState {
         0,
         darwin::network::default_ethernet_mtu,
         darwin::network::interface_type_ethernet,
-        {std::byte{0x02}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
-         std::byte{0x00}, std::byte{0x01}},
+        virtual_network::interface_mac_address,
         6}},
   };
   std::uint32_t next_kernel_event_identifier{1};
@@ -661,6 +670,9 @@ struct KernelSharedState {
   std::uint32_t baseband_service{};
   bsd::baseband_device::State baseband_device_state;
   std::uint32_t mobile_framebuffer_service{};
+  bool wifi_service_available{};
+  std::uint32_t wifi_service{};
+  std::uint32_t wifi_interface_service{};
   std::vector<IOKitNotification> iokit_notifications;
   VirtualClock clock;
   std::uint32_t next_socket_pair{1};

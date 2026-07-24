@@ -4,6 +4,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -233,13 +234,23 @@ private:
 
 Cpu::Cpu(
     std::size_t processor_id, AddressSpace& memory, Dynarmic::ExclusiveMonitor& monitor)
-    : processor_id_{processor_id}, monitor_{&monitor},
+    : Cpu{
+          processor_id, processor_id, memory, monitor} {}
+
+Cpu::Cpu(
+    std::size_t processor_id,
+    std::size_t exclusive_processor_id,
+    AddressSpace& memory,
+    Dynarmic::ExclusiveMonitor& monitor)
+    : processor_id_{processor_id},
+      exclusive_processor_id_{exclusive_processor_id},
+      monitor_{&monitor},
       callbacks_{std::make_unique<Callbacks>(memory)} {}
 
 void Cpu::ensure_jit() {
     if (jit_) return;
     Dynarmic::A32::UserConfig config{callbacks_.get()};
-    config.processor_id = processor_id_;
+    config.processor_id = exclusive_processor_id_;
     config.global_monitor = monitor_;
     config.arch_version = Dynarmic::A32::ArchVersion::v6K;
     config.always_little_endian = true;
@@ -326,19 +337,62 @@ void Cpu::set_memory_write_watchpoint(
 void Cpu::set_debug_breakpoints_enabled(bool enabled) {
     callbacks_->set_debug_breakpoints_enabled(enabled);
 }
+void Cpu::clear_exclusive_state() {
+    ensure_jit();
+    // The local state gates STREX. The next LDREX overwrites this serialized
+    // processor's single global slot, so clearing the local state is enough
+    // and avoids taking the global monitor lock on every context switch.
+    jit_->ClearExclusiveState();
+}
 
 CpuCluster::CpuCluster(std::size_t processor_count, AddressSpace& memory)
-    : monitor_{processor_count} {
-    if (processor_count == 0) {
-        throw std::invalid_argument{"processor_count must be at least one"};
+    : CpuCluster{processor_count, processor_count, memory} {}
+
+CpuCluster::CpuCluster(
+    std::size_t initial_processor_count,
+    std::size_t maximum_processor_count,
+    AddressSpace& memory)
+    : CpuCluster{
+          initial_processor_count, maximum_processor_count, memory, false} {}
+
+CpuCluster::CpuCluster(
+    std::size_t initial_processor_count,
+    std::size_t maximum_processor_count,
+    AddressSpace& memory,
+    bool serialized_execution)
+    : memory_{&memory},
+      maximum_processor_count_{maximum_processor_count},
+      serialized_execution_{serialized_execution},
+      monitor_{serialized_execution ? 1U : maximum_processor_count} {
+    if (initial_processor_count == 0) {
+        throw std::invalid_argument{
+            "initial_processor_count must be at least one"};
     }
-    cpus_.reserve(processor_count);
-    for (std::size_t id = 0; id < processor_count; ++id) {
-        cpus_.push_back(std::make_unique<Cpu>(id, memory, monitor_));
+    if (maximum_processor_count < initial_processor_count) {
+        throw std::invalid_argument{
+            "maximum_processor_count must cover the initial processors"};
+    }
+    cpus_.reserve(maximum_processor_count);
+    while (cpus_.size() < initial_processor_count) {
+        static_cast<void>(add_cpu());
     }
 }
 
+std::optional<std::size_t> CpuCluster::add_cpu() {
+    if (cpus_.size() >= capacity()) {
+        return std::nullopt;
+    }
+    const auto id = cpus_.size();
+    cpus_.push_back(std::unique_ptr<Cpu>{new Cpu{
+        id, serialized_execution_ ? 0U : id, *memory_, monitor_}});
+    return id;
+}
+
 std::vector<CpuRunResult> CpuCluster::run_parallel(std::uint64_t ticks_per_cpu) {
+    if (serialized_execution_ && cpus_.size() > 1) {
+        throw std::logic_error{
+            "serialized CPU contexts cannot execute in parallel"};
+    }
     std::vector<CpuRunResult> results(cpus_.size());
     std::vector<std::thread> workers;
     workers.reserve(cpus_.size());

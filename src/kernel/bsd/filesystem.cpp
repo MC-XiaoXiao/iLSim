@@ -2,6 +2,7 @@
 
 #include "ilegacysim/baseband_device.hpp"
 #include "ilegacysim/darwin_abi.hpp"
+#include "ilegacysim/darwin_bpf_abi.hpp"
 #include "ilegacysim/darwin_kqueue_abi.hpp"
 #include "ilegacysim/darwin_network_abi.hpp"
 #include "ilegacysim/darwin_resource_abi.hpp"
@@ -180,6 +181,34 @@ void CompatibilityKernel::dispatch_bsd_filesystem(Cpu &cpu,
       bsd_error(cpu, darwin::error::device_busy);
       return;
     }
+    if (const auto minor = darwin::bpf::device_minor(*path)) {
+      const auto fd = allocate_file_descriptor();
+      if (!fd) {
+        bsd_error(cpu, 24); // EMFILE
+        return;
+      }
+      virtual_descriptors_.emplace(*fd, darwin::bpf::descriptor_kind);
+      auto state = std::make_shared<darwin::bpf::DescriptorState>();
+      state->minor = *minor;
+      bpf_descriptors_.emplace(*fd, std::move(state));
+      file_status_flags_[*fd] = flags;
+      descriptor_flags_[*fd] = 0;
+      bsd_success(cpu, *fd);
+      return;
+    }
+    if (*path == darwin::network::apple80211_driver::event_device_path) {
+      const auto fd = allocate_file_descriptor();
+      if (!fd) {
+        bsd_error(cpu, 24); // EMFILE
+        return;
+      }
+      virtual_descriptors_.emplace(
+          *fd, darwin::network::apple80211_driver::event_descriptor_kind);
+      file_status_flags_[*fd] = flags;
+      descriptor_flags_[*fd] = 0;
+      bsd_success(cpu, *fd);
+      return;
+    }
     if (*path == "/dev/random" || *path == "/dev/urandom" ||
         *path == "/dev/srandom" || *path == "/dev/console" ||
         bsd::baseband_device::is_path(*path)) {
@@ -328,11 +357,14 @@ void CompatibilityKernel::dispatch_bsd_filesystem(Cpu &cpu,
     regular_file_open_descriptions_.erase(fd);
     file_status_flags_.erase(fd);
     virtual_block_descriptors_.erase(fd);
+    bpf_descriptors_.erase(fd);
     descriptor_flags_.erase(fd);
     host_sockets_.erase(fd);
+    pending_wifi_driver_events_.erase(fd);
     virtual_udp_sockets_.erase(fd);
     kernel_control_endpoints_.erase(fd);
     system_event_filters_.erase(fd);
+    apple80211_scan_delivered_.erase(fd);
     system_event_next_identifiers_.erase(fd);
     route_socket_states_.erase(fd);
     // This may destroy the final listening open description. Its queued
@@ -432,7 +464,13 @@ void CompatibilityKernel::dispatch_bsd_filesystem(Cpu &cpu,
     if (*path == "/dev/console" || *path == "/dev/random" ||
         *path == "/dev/urandom" || *path == "/dev/disk0s1" ||
         *path == "/dev/disk0s2" || *path == "/dev/rdisk0s1" ||
-        *path == "/dev/rdisk0s2" || bsd::baseband_device::is_path(*path)) {
+        *path == "/dev/rdisk0s2" ||
+        *path == darwin::network::apple80211_driver::event_device_path ||
+        bsd::baseband_device::is_path(*path)) {
+      bsd_success(cpu, 0);
+      return;
+    }
+    if (darwin::bpf::device_minor(*path)) {
       bsd_success(cpu, 0);
       return;
     }
@@ -991,6 +1029,7 @@ void CompatibilityKernel::dispatch_bsd_filesystem(Cpu &cpu,
       add_virtual("console", 2);
       add_virtual("random", 2);
       add_virtual("urandom", 2);
+      add_virtual("bpf0", 2);
       add_virtual(std::string{bsd::baseband_device::directory_name}, 2);
       std::ostringstream directory_trace;
       directory_trace << "[vfs] virtual /dev enumeration entries="
@@ -1595,6 +1634,14 @@ void CompatibilityKernel::dispatch_bsd_filesystem(Cpu &cpu,
       }
       return;
     }
+    if (const auto minor = darwin::bpf::device_minor(*path)) {
+      if (!write_guest_device_stat(registers[1], 32U + *minor, true)) {
+        bsd_error(cpu, bsd_support::bad_address);
+      } else {
+        bsd_success(cpu, 0);
+      }
+      return;
+    }
     if (*path == "/dev/disk0s1" || *path == "/dev/disk0s2" ||
         *path == "/dev/rdisk0s1" || *path == "/dev/rdisk0s2") {
       const auto minor = path->ends_with("s1") ? 1U : 2U;
@@ -1639,15 +1686,32 @@ void CompatibilityKernel::dispatch_bsd_filesystem(Cpu &cpu,
       }
       return;
     }
+    if (const auto bpf = bpf_descriptors_.find(descriptor);
+        bpf != bpf_descriptors_.end()) {
+      if (!write_guest_device_stat(registers[1],
+                                   32U + bpf->second->minor, true)) {
+        bsd_error(cpu, bsd_support::bad_address);
+      } else {
+        bsd_success(cpu, 0);
+      }
+      return;
+    }
     if (const auto device = virtual_descriptors_.find(descriptor);
         device != virtual_descriptors_.end() &&
         (device->second == "random" || device->second == "console" ||
+         device->second ==
+             darwin::network::apple80211_driver::event_descriptor_kind ||
          device->second == bsd::baseband_device::descriptor_kind)) {
       constexpr std::uint32_t random_device_minor = 0;
       constexpr std::uint32_t console_device_minor = 1;
+      constexpr std::uint32_t wifi_event_device_minor = 2;
       const auto minor = device->second == "random" ? random_device_minor
                          : device->second == "console"
                              ? console_device_minor
+                         : device->second ==
+                                   darwin::network::apple80211_driver::
+                                       event_descriptor_kind
+                             ? wifi_event_device_minor
                              : bsd::baseband_device::device_minor;
       if (!write_guest_device_stat(registers[1], minor, true)) {
         bsd_error(cpu, bsd_support::bad_address);

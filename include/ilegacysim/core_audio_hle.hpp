@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -74,6 +75,8 @@ private:
     std::uint32_t output_buffers{};
     std::uint32_t output_samples{};
     std::uint32_t output_sample_bytes{};
+    std::vector<std::byte> zero_output_samples;
+    std::vector<std::byte> captured_output_samples;
     std::uint32_t stack{};
     std::uint64_t next_deadline{};
     std::uint64_t sample_time{};

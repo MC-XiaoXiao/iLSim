@@ -364,11 +364,11 @@ CoreAudioHle::take_due_io_proc(std::uint64_t now) {
     return std::nullopt;
   }
 
-  std::vector<std::byte> silence(registration.output_sample_bytes);
   const auto stack_pointer = registration.stack + callback_stack_size -
                              callback_stack_argument_space;
   const auto memory_ready =
-      registration.memory->copy_in(registration.output_samples, silence) &&
+      registration.memory->copy_in(registration.output_samples,
+                                   registration.zero_output_samples) &&
       registration.memory->write32(registration.output_buffers, 1U) &&
       registration.memory->write32(registration.output_buffers + 4U,
                                    device_channel_count(device->identifier)) &&
@@ -463,35 +463,50 @@ void CoreAudioHle::complete_io_proc(UserlandHleCall &call,
   std::uint32_t peak = 0;
   float applied_gain = 1.0F;
   if (device != nullptr && byte_count != 0) {
-    if (const auto bytes =
-            call.memory().read_bytes(registration.output_samples, byte_count)) {
-      AudioBuffer buffer;
-      buffer.sample_rate = static_cast<std::uint32_t>(
-          std::llround(device_sample_rate(device->identifier)));
-      buffer.channel_count =
-          static_cast<std::uint16_t>(
-              device_channel_count(device->identifier));
-      buffer.streaming = true;
-      buffer.samples.reserve(bytes->size() / sizeof(std::int16_t));
-      for (std::size_t offset = 0; offset < bytes->size();
-           offset += sizeof(std::int16_t)) {
-        const auto encoded = static_cast<std::uint16_t>(
-            std::to_integer<std::uint16_t>((*bytes)[offset]) |
-            static_cast<std::uint16_t>(
-                std::to_integer<std::uint16_t>((*bytes)[offset + 1U]) << 8U));
-        const auto sample = std::bit_cast<std::int16_t>(encoded);
-        buffer.samples.push_back(sample);
-        peak = std::max(
-            peak, sample == std::numeric_limits<std::int16_t>::min()
-                      ? 32768U
-                      : static_cast<std::uint32_t>(
-                            std::abs(static_cast<int>(sample))));
-      }
+    auto bytes = std::span{registration.captured_output_samples}.first(
+        byte_count);
+    if (call.memory().copy_out(registration.output_samples, bytes)) {
+      const auto audible =
+          std::any_of(bytes.begin(), bytes.end(),
+                      [](std::byte value) { return value != std::byte{}; });
       applied_gain = device_output_gain(registration.device);
-      if (service_ && service_->service_source_playing()) {
-        result.status = AudioPlayStatus::Queued;
-      } else if (service_) {
-        result = service_->queue_pcm(std::move(buffer), applied_gain);
+      const auto service_source_active =
+          service_ && service_->service_source_playing();
+      if (!audible) {
+        // The hardware IOProc must keep running so a later sound can start,
+        // but an all-zero period has no host payload to convert or enqueue.
+        // Preserve the AudioService completion observation above while
+        // avoiding two allocations and two full sample scans on the common
+        // idle path.
+        if (service_)
+          result.status = AudioPlayStatus::Queued;
+      } else {
+        AudioBuffer buffer;
+        buffer.sample_rate = static_cast<std::uint32_t>(
+            std::llround(device_sample_rate(device->identifier)));
+        buffer.channel_count = static_cast<std::uint16_t>(
+            device_channel_count(device->identifier));
+        buffer.streaming = true;
+        buffer.samples.reserve(bytes.size() / sizeof(std::int16_t));
+        for (std::size_t offset = 0; offset < bytes.size();
+             offset += sizeof(std::int16_t)) {
+          const auto encoded = static_cast<std::uint16_t>(
+              std::to_integer<std::uint16_t>(bytes[offset]) |
+              static_cast<std::uint16_t>(
+                  std::to_integer<std::uint16_t>(bytes[offset + 1U]) << 8U));
+          const auto sample = std::bit_cast<std::int16_t>(encoded);
+          buffer.samples.push_back(sample);
+          peak = std::max(
+              peak, sample == std::numeric_limits<std::int16_t>::min()
+                        ? 32768U
+                        : static_cast<std::uint32_t>(
+                              std::abs(static_cast<int>(sample))));
+        }
+        if (service_source_active) {
+          result.status = AudioPlayStatus::Queued;
+        } else if (service_) {
+          result = service_->queue_pcm(std::move(buffer), applied_gain);
+        }
       }
     }
   }
@@ -963,6 +978,8 @@ void CoreAudioHle::start_io(UserlandHleCall &call) {
       state.output_sample_bytes != sample_bytes) {
     state.output_samples = call.allocate_data(sample_bytes, 16U);
     state.output_sample_bytes = sample_bytes;
+    state.zero_output_samples.assign(sample_bytes, std::byte{});
+    state.captured_output_samples.resize(sample_bytes);
   }
   if (state.stack == 0)
     state.stack = call.allocate_data(callback_stack_size, 16U);

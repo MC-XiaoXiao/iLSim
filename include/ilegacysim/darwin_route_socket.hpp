@@ -113,6 +113,9 @@ struct InterfaceRouteUpdate {
     std::string interface_name, std::uint16_t interface_index,
     std::span<const std::byte> address, std::span<const std::byte> netmask,
     std::uint32_t flags);
+[[nodiscard]] std::optional<Entry> make_default_gateway_route(
+    std::string interface_name, std::uint16_t interface_index,
+    std::span<const std::byte> gateway);
 
 // XNU broadcasts the result on PF_ROUTE after filling the sender, DONE flag,
 // and errno fields.  Keeping this separate also makes future route listeners
@@ -134,9 +137,14 @@ class Table {
 public:
     [[nodiscard]] ApplyResult apply(std::uint8_t command, Entry entry);
     [[nodiscard]] std::optional<Entry> lookup(const Entry& query) const;
+    [[nodiscard]] std::optional<Entry> lookup_bound_interface(
+        const Entry& query) const;
     [[nodiscard]] InterfaceRouteUpdate replace_interface_routes(
         std::string_view interface_name, std::uint8_t family,
         std::span<const Entry> replacements);
+    [[nodiscard]] std::vector<Entry> remove_interface_routes(
+        std::string_view interface_name, std::uint16_t interface_index,
+        std::uint8_t family);
     [[nodiscard]] std::vector<Entry> snapshot() const;
 
 private:

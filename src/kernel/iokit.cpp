@@ -21,6 +21,7 @@
 #include "ilegacysim/kernel_shared_state.hpp"
 #include "ilegacysim/mig_wire_abi.hpp"
 #include "ilegacysim/output.hpp"
+#include "ilegacysim/wifi_state.hpp"
 
 #include "iokit/power.hpp"
 #include "mach/support.hpp"
@@ -35,16 +36,48 @@ constexpr std::uint32_t mach_ndr_little_endian = 0x00000001U;
 constexpr std::uint32_t mig_reply_id_delta = 100;
 constexpr std::string_view apple_h1clcd_class{"AppleH1CLCD"};
 constexpr std::string_view mobile_framebuffer_class{"IOMobileFramebuffer"};
+constexpr std::string_view io80211_controller_class{"IO80211Controller"};
+constexpr std::string_view io80211_interface_class{"IO80211Interface"};
+constexpr std::string_view io_ethernet_interface_class{"IOEthernetInterface"};
+constexpr std::string_view io_network_interface_class{"IONetworkInterface"};
+constexpr std::string_view io_network_stack_class{"IONetworkStack"};
+constexpr std::string_view wifi_bus_class{"AppleARMIODevice"};
+constexpr std::string_view bsd_name_property{"BSD Name"};
+constexpr std::string_view interface_name_prefix_property{
+    "IOInterfaceNamePrefix"};
+constexpr std::string_view interface_unit_property{"IOInterfaceUnit"};
+constexpr std::string_view interface_type_property{"IOInterfaceType"};
+constexpr std::string_view network_root_type_property{"IONetworkRootType"};
+constexpr std::string_view builtin_interface_property{"IOBuiltin"};
+constexpr std::string_view primary_interface_property{"IOPrimaryInterface"};
+constexpr std::string_view mac_address_property{"IOMACAddress"};
+constexpr std::string_view local_mac_address_property{"local-mac-address"};
+constexpr std::string_view sdio_device_name{"sdio"};
 constexpr std::size_t maximum_matching_trace_bytes = 256;
+constexpr std::uint32_t io_service_matching_type = 100;
+constexpr std::uint32_t io_bsd_name_matching_type = 101;
+constexpr std::uint32_t io_of_path_matching_type = 102;
 
 namespace device_mig = xnu792::mig::device;
 
 constexpr const auto &matching_services_matching =
     device_mig::io_service_get_matching_services_arguments[1];
+constexpr const auto &make_matching_arguments =
+    device_mig::io_make_matching_arguments;
+constexpr const auto &registry_entry_from_path =
+    device_mig::io_registry_entry_from_path_arguments[1];
+constexpr const auto &registry_entry_path =
+    device_mig::io_registry_entry_get_path_arguments[2];
+constexpr const auto &object_class_name =
+    device_mig::io_object_get_class_arguments[1];
+constexpr const auto &registry_entry_name =
+    device_mig::io_registry_entry_get_name_arguments[1];
 constexpr const auto &registry_property_name =
     device_mig::io_registry_entry_get_property_arguments[1];
 constexpr const auto &registry_property_value =
     device_mig::io_registry_entry_get_property_arguments[2];
+constexpr const auto &recursive_registry_property =
+    device_mig::io_registry_entry_get_property_recursively_arguments;
 constexpr const auto &notification_type =
     device_mig::io_service_add_notification_arguments[1];
 constexpr const auto &notification_matching =
@@ -263,6 +296,47 @@ std::string xml_escape(std::span<const std::byte> value) {
   return escaped;
 }
 
+std::optional<std::string>
+serialized_matching_string(std::span<const std::byte> matching,
+                           std::string_view key) {
+  std::string text;
+  text.reserve(matching.size());
+  for (const auto byte : matching) {
+    const auto character =
+        static_cast<char>(std::to_integer<unsigned char>(byte));
+    if (character == '\0')
+      break;
+    text.push_back(character);
+  }
+
+  const auto key_marker = "<key>" + std::string{key} + "</key>";
+  const auto key_offset = text.find(key_marker);
+  if (key_offset == std::string::npos)
+    return std::nullopt;
+  const auto string_offset = text.find("<string", key_offset + key_marker.size());
+  if (string_offset == std::string::npos)
+    return std::nullopt;
+  const auto value_offset = text.find('>', string_offset);
+  if (value_offset == std::string::npos)
+    return std::nullopt;
+  const auto end_offset = text.find("</string>", value_offset + 1U);
+  if (end_offset == std::string::npos)
+    return std::nullopt;
+
+  std::string value{text.substr(value_offset + 1U,
+                                end_offset - value_offset - 1U)};
+  const std::array<std::pair<std::string_view, std::string_view>, 3>
+      replacements{{{"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"}}};
+  for (const auto &[encoded, decoded] : replacements) {
+    std::size_t offset = 0;
+    while ((offset = value.find(encoded, offset)) != std::string::npos) {
+      value.replace(offset, encoded.size(), decoded);
+      offset += decoded.size();
+    }
+  }
+  return value;
+}
+
 std::string base64_encode(std::span<const std::byte> value) {
   constexpr std::string_view alphabet{
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"};
@@ -296,11 +370,66 @@ std::vector<std::byte> serialize_property(
       KernelSharedState::IOKitRegistryProperty::Kind::String) {
     serialized = "<string ID=\"0\">" + xml_escape(property.value) +
                  "</string>";
+  } else if (property.kind ==
+             KernelSharedState::IOKitRegistryProperty::Kind::Boolean) {
+    serialized = !property.value.empty() && property.value.front() != std::byte{0}
+                     ? "<true/>"
+                     : "<false/>";
+  } else if (property.kind ==
+             KernelSharedState::IOKitRegistryProperty::Kind::Number) {
+    std::uint32_t value = 0;
+    for (std::size_t index = 0;
+         index < std::min(property.value.size(), sizeof(value)); ++index) {
+      value |= static_cast<std::uint32_t>(property.value[index])
+               << (index * 8U);
+    }
+    std::ostringstream stream;
+    stream << "<integer size=\"32\">0x" << std::hex << value << "</integer>";
+    serialized = stream.str();
   } else {
     serialized = "<data ID=\"0\">" + base64_encode(property.value) +
                  "</data>";
   }
   // Darwin 8 OSSerialize::getLength() includes its trailing NUL.
+  serialized.push_back('\0');
+  return bytes_from_string(serialized);
+}
+
+std::vector<std::byte> serialize_properties(
+    const std::map<std::string,
+                   KernelSharedState::IOKitRegistryProperty> &properties) {
+  std::string serialized{"<dict ID=\"0\">"};
+  std::size_t identifier = 1;
+  for (const auto &[name, property] : properties) {
+    serialized += "<key>" + xml_escape(bytes_from_string(name)) + "</key>";
+    if (property.kind ==
+        KernelSharedState::IOKitRegistryProperty::Kind::String) {
+      serialized += "<string ID=\"" + std::to_string(identifier++) + "\">" +
+                    xml_escape(property.value) + "</string>";
+    } else if (property.kind ==
+               KernelSharedState::IOKitRegistryProperty::Kind::Boolean) {
+      serialized +=
+          !property.value.empty() && property.value.front() != std::byte{0}
+              ? "<true/>"
+              : "<false/>";
+    } else if (property.kind ==
+               KernelSharedState::IOKitRegistryProperty::Kind::Number) {
+      std::uint32_t value = 0;
+      for (std::size_t index = 0;
+           index < std::min(property.value.size(), sizeof(value)); ++index) {
+        value |= static_cast<std::uint32_t>(property.value[index])
+                 << (index * 8U);
+      }
+      std::ostringstream stream;
+      stream << "<integer size=\"32\" ID=\"" << identifier++ << "\">0x"
+             << std::hex << value << "</integer>";
+      serialized += stream.str();
+    } else {
+      serialized += "<data ID=\"" + std::to_string(identifier++) + "\">" +
+                    base64_encode(property.value) + "</data>";
+    }
+  }
+  serialized += "</dict>";
   serialized.push_back('\0');
   return bytes_from_string(serialized);
 }
@@ -391,6 +520,154 @@ ensure_platform_expert_service_locked(KernelSharedState &shared_state) {
   return object;
 }
 
+std::uint32_t
+ensure_wifi_bus_service_locked(KernelSharedState &shared_state) {
+  const auto existing = std::find_if(
+      shared_state.iokit_services.begin(), shared_state.iokit_services.end(),
+      [](const auto &entry) {
+        return entry.second.class_name == wifi_bus_class;
+      });
+  if (existing != shared_state.iokit_services.end())
+    return existing->first;
+
+  const auto object = shared_state.allocate_mach_object();
+  static_cast<void>(shared_state.mach_port_objects.create(object));
+  shared_state.mach_queues.try_emplace(object);
+  KernelSharedState::IOKitService service{
+      std::string{wifi_bus_class}, {"IOService"}, {},
+      "IOService:/AppleARMIODevice"};
+  service.properties.emplace(
+      "name", KernelSharedState::IOKitRegistryProperty{
+                  KernelSharedState::IOKitRegistryProperty::Kind::String,
+                  bytes_from_string(sdio_device_name)});
+  service.properties.emplace(
+      std::string{local_mac_address_property},
+      KernelSharedState::IOKitRegistryProperty{
+          KernelSharedState::IOKitRegistryProperty::Kind::Data,
+          std::vector<std::byte>{wifi_interface_mac_address.begin(),
+                                 wifi_interface_mac_address.end()}});
+  shared_state.iokit_services.emplace(object, std::move(service));
+  return object;
+}
+
+std::uint32_t
+ensure_wifi_service_locked(KernelSharedState &shared_state) {
+  if (shared_state.wifi_service != 0)
+    return shared_state.wifi_service;
+
+  const auto bus_object = ensure_wifi_bus_service_locked(shared_state);
+  const auto object = shared_state.allocate_mach_object();
+  shared_state.wifi_service = object;
+  static_cast<void>(shared_state.mach_port_objects.create(object));
+  shared_state.mach_queues.try_emplace(object);
+
+  KernelSharedState::IOKitService service{
+      std::string{io80211_controller_class},
+      {"IOService"},
+      {},
+      "IOService:/AppleARMIODevice/IO80211Controller",
+      bus_object};
+  service.properties.emplace(
+      std::string{bsd_name_property},
+      KernelSharedState::IOKitRegistryProperty{
+          KernelSharedState::IOKitRegistryProperty::Kind::String,
+          bytes_from_string("en0")});
+  service.properties.emplace(
+      std::string{network_root_type_property},
+      KernelSharedState::IOKitRegistryProperty{
+          KernelSharedState::IOKitRegistryProperty::Kind::String,
+          bytes_from_string("airport")});
+  service.properties.emplace(
+      std::string{mac_address_property},
+      KernelSharedState::IOKitRegistryProperty{
+          KernelSharedState::IOKitRegistryProperty::Kind::Data,
+          std::vector<std::byte>{wifi_interface_mac_address.begin(),
+                                 wifi_interface_mac_address.end()}});
+  shared_state.iokit_services.emplace(object, std::move(service));
+  return object;
+}
+
+std::uint32_t
+ensure_network_stack_service_locked(KernelSharedState &shared_state) {
+  const auto existing = std::find_if(
+      shared_state.iokit_services.begin(), shared_state.iokit_services.end(),
+      [](const auto &entry) {
+        return entry.second.class_name == io_network_stack_class;
+      });
+  if (existing != shared_state.iokit_services.end())
+    return existing->first;
+
+  const auto object = shared_state.allocate_mach_object();
+  static_cast<void>(shared_state.mach_port_objects.create(object));
+  shared_state.mach_queues.try_emplace(object);
+  shared_state.iokit_services.emplace(
+      object, KernelSharedState::IOKitService{
+                  std::string{io_network_stack_class}, {"IOService"}, {},
+                  "IOService:/IONetworkStack"});
+  return object;
+}
+
+std::uint32_t
+ensure_wifi_interface_service_locked(KernelSharedState &shared_state) {
+  if (shared_state.wifi_interface_service != 0)
+    return shared_state.wifi_interface_service;
+
+  const auto controller_object = ensure_wifi_service_locked(shared_state);
+  const auto object = shared_state.allocate_mach_object();
+  shared_state.wifi_interface_service = object;
+  static_cast<void>(shared_state.mach_port_objects.create(object));
+  shared_state.mach_queues.try_emplace(object);
+
+  KernelSharedState::IOKitService service{
+      std::string{io80211_interface_class},
+      {std::string{io_ethernet_interface_class},
+       std::string{io_network_interface_class},
+       "IOService"},
+      {},
+      "IOService:/AppleARMIODevice/IO80211Controller/IO80211Interface",
+      controller_object};
+  service.properties.emplace(
+      std::string{bsd_name_property},
+      KernelSharedState::IOKitRegistryProperty{
+          KernelSharedState::IOKitRegistryProperty::Kind::String,
+          bytes_from_string("en0")});
+  service.properties.emplace(
+      std::string{interface_name_prefix_property},
+      KernelSharedState::IOKitRegistryProperty{
+          KernelSharedState::IOKitRegistryProperty::Kind::String,
+          bytes_from_string("en")});
+  service.properties.emplace(
+      std::string{interface_unit_property},
+      KernelSharedState::IOKitRegistryProperty{
+          KernelSharedState::IOKitRegistryProperty::Kind::Number,
+          {std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0}}});
+  service.properties.emplace(
+      std::string{interface_type_property},
+      KernelSharedState::IOKitRegistryProperty{
+          KernelSharedState::IOKitRegistryProperty::Kind::Number,
+          {std::byte{6}, std::byte{0}, std::byte{0}, std::byte{0}}});
+  service.properties.emplace(
+      std::string{network_root_type_property},
+      KernelSharedState::IOKitRegistryProperty{
+          KernelSharedState::IOKitRegistryProperty::Kind::String,
+          bytes_from_string("airport")});
+  const auto true_property = KernelSharedState::IOKitRegistryProperty{
+      KernelSharedState::IOKitRegistryProperty::Kind::Boolean,
+      {std::byte{1}}};
+  service.properties.emplace(std::string{builtin_interface_property},
+                             true_property);
+  service.properties.emplace(std::string{primary_interface_property},
+                             true_property);
+  service.properties.emplace(
+      std::string{mac_address_property},
+      KernelSharedState::IOKitRegistryProperty{
+          KernelSharedState::IOKitRegistryProperty::Kind::Data,
+          std::vector<std::byte>{wifi_interface_mac_address.begin(),
+                                 wifi_interface_mac_address.end()}});
+  shared_state.iokit_services.emplace(object, std::move(service));
+  return object;
+}
+
 std::uint32_t resolve_task_name_locked(const KernelSharedState &shared_state,
                                        std::uint32_t task, std::uint32_t name) {
   if (const auto object = shared_state.mach_namespaces.resolve(task, name)) {
@@ -414,12 +691,55 @@ std::uint32_t copyout_send_locked(KernelSharedState &shared_state,
 void populate_matching_services_locked(KernelSharedState &shared_state,
                                        std::span<const std::byte> matching,
                                        std::deque<std::uint32_t> &services) {
+  if (const auto bsd_name =
+          serialized_matching_string(matching, bsd_name_property)) {
+    if (shared_state.wifi_service_available) {
+      static_cast<void>(ensure_wifi_interface_service_locked(shared_state));
+    }
+    for (const auto &[object, service] : shared_state.iokit_services) {
+      const auto property =
+          service.properties.find(std::string{bsd_name_property});
+      if (property == service.properties.end() ||
+          property->second.kind !=
+              KernelSharedState::IOKitRegistryProperty::Kind::String) {
+        continue;
+      }
+      const auto &value = property->second.value;
+      if (value.size() == bsd_name->size() &&
+          std::equal(value.begin(), value.end(), bsd_name->begin(),
+                     [](std::byte byte, char character) {
+                       return std::to_integer<unsigned char>(byte) ==
+                              static_cast<unsigned char>(character);
+                     })) {
+        services.push_back(object);
+      }
+    }
+    return;
+  }
   if (contains_text(matching, platform_expert_class)) {
     services.push_back(ensure_platform_expert_service_locked(shared_state));
   }
   if (kernel_iokit::baseband::matches_service(matching)) {
     services.push_back(
         kernel_iokit::baseband::ensure_service_locked(shared_state));
+  }
+  if (shared_state.wifi_service_available &&
+      contains_text(matching, io80211_controller_class)) {
+    services.push_back(ensure_wifi_service_locked(shared_state));
+  }
+  if (shared_state.wifi_service_available &&
+      (contains_text(matching, io80211_interface_class) ||
+       contains_text(matching, io_ethernet_interface_class) ||
+       contains_text(matching, io_network_interface_class))) {
+    services.push_back(ensure_wifi_interface_service_locked(shared_state));
+  }
+  if (shared_state.wifi_service_available &&
+      contains_text(matching, io_network_stack_class)) {
+    services.push_back(ensure_network_stack_service_locked(shared_state));
+  }
+  if (shared_state.wifi_service_available &&
+      contains_text(matching, sdio_device_name)) {
+    services.push_back(ensure_wifi_bus_service_locked(shared_state));
   }
   // S5L8900/iPhone1,1 uses AppleH1CLCD. AppleMX31IPU belongs to a different
   // first-generation platform and intentionally remains unmatched.
@@ -490,6 +810,115 @@ handle_iokit_mach_request(AddressSpace &memory, Output &output,
               message_address, send_size, receive_size, remote_object,
               local_port)) {
     return display_result;
+  }
+  if (message_id ==
+      device_mig::id(device_mig::Routine::io_make_matching)) {
+    std::array<std::uint32_t, make_matching_arguments.size()> element_counts{};
+    element_counts[3] =
+        memory
+            .read32(message_address +
+                    make_matching_arguments[3].request_count_offset)
+            .value_or(make_matching_arguments[3].wire_size + 1U);
+    const auto request_layout = xnu792::mig::compute_wire_layout(
+        make_matching_arguments, xnu792::mig::WireLayoutSide::Request,
+        element_counts);
+    if (!request_layout || element_counts[3] == 0 ||
+        element_counts[3] > make_matching_arguments[3].wire_size ||
+        (*request_layout)[3].offset + element_counts[3] > send_size) {
+      return mach_rcv_invalid_data;
+    }
+    const auto type =
+        memory
+            .read32(message_address + (*request_layout)[1].offset)
+            .value_or(0);
+    const auto input_bytes =
+        memory.read_bytes(message_address + (*request_layout)[3].offset,
+                          element_counts[3]);
+    if (!input_bytes)
+      return mach_rcv_invalid_data;
+
+    std::span<const std::byte> input{*input_bytes};
+    if (const auto terminator =
+            std::find(input.begin(), input.end(), std::byte{0});
+        terminator != input.end()) {
+      input = input.first(static_cast<std::size_t>(
+          std::distance(input.begin(), terminator)));
+    }
+    std::string matching{"<dict ID=\"0\">"};
+    if (type == io_service_matching_type) {
+      matching +=
+          "<key>IOProviderClass</key><string ID=\"1\">IOService</string>";
+    } else if (type == io_bsd_name_matching_type) {
+      matching +=
+          "<key>IOProviderClass</key><string ID=\"1\">IOService</string>"
+          "<key>BSD Name</key><string ID=\"2\">" +
+          xml_escape(input) + "</string>";
+    } else if (type == io_of_path_matching_type) {
+      matching +=
+          "<key>IOPathMatch</key><string ID=\"1\">IODeviceTree:" +
+          xml_escape(input) + "</string>";
+    } else {
+      constexpr std::uint32_t reply_size = 36U;
+      if (receive_size < reply_size)
+        return mach_rcv_invalid_data;
+      const std::array<std::uint32_t, reply_size / sizeof(std::uint32_t)>
+          reply{mach_reply_bits,
+                reply_size,
+                local_port,
+                0,
+                0,
+                message_id + mig_reply_id_delta,
+                mach_ndr_native,
+                mach_ndr_little_endian,
+                iokit_abi::unsupported};
+      return write_reply(memory, message_address, reply);
+    }
+    matching += "</dict>";
+    matching.push_back('\0');
+    if (matching.size() > make_matching_arguments[4].wire_size)
+      return mach_rcv_invalid_data;
+
+    const auto matching_count = static_cast<std::uint32_t>(matching.size());
+    element_counts.fill(0);
+    element_counts[4] = matching_count;
+    const auto reply_layout = xnu792::mig::compute_wire_layout(
+        make_matching_arguments, xnu792::mig::WireLayoutSide::Reply,
+        element_counts);
+    if (!reply_layout)
+      return mach_rcv_invalid_data;
+    const auto reply_size =
+        (*reply_layout)[4].offset + align_mig_field(matching_count);
+    if (reply_size > receive_size)
+      return mach_rcv_invalid_data;
+    const std::vector<std::byte> cleared_reply(reply_size);
+    if (!memory.copy_in(message_address, cleared_reply))
+      return mach_rcv_invalid_data;
+    const auto type_word =
+        8U | (8U << 8U) |
+        (static_cast<std::uint32_t>(make_matching_arguments[4].wire_size)
+         << 16U) |
+        (1U << 28U);
+    const std::array<std::uint32_t, 11> reply{
+        mach_reply_bits,
+        reply_size,
+        local_port,
+        0,
+        0,
+        message_id + mig_reply_id_delta,
+        mach_ndr_native,
+        mach_ndr_little_endian,
+        iokit_abi::success,
+        type_word,
+        matching_count};
+    if (write_reply(memory, message_address, reply) != 0 ||
+        !memory.copy_in(
+            message_address + (*reply_layout)[4].offset,
+            std::span<const std::byte>{
+                reinterpret_cast<const std::byte *>(matching.data()),
+                matching.size()})) {
+      return mach_rcv_invalid_data;
+    }
+    return 0;
   }
   if (message_id == static_cast<std::uint32_t>(
                         iokit_abi::Message::ServiceGetMatchingServices)) {
@@ -603,6 +1032,7 @@ handle_iokit_mach_request(AddressSpace &memory, Output &output,
 
     std::uint32_t iterator_object = 0;
     std::uint32_t iterator_name = 0;
+    std::size_t matching_service_count = 0;
     {
       std::lock_guard mach_lock{shared_state.mach_mutex};
       const auto notification_object = resolve_task_name_locked(
@@ -617,6 +1047,7 @@ handle_iokit_mach_request(AddressSpace &memory, Output &output,
       static_cast<void>(inserted);
       populate_matching_services_locked(shared_state, *matching_bytes,
                                         iterator->second);
+      matching_service_count = iterator->second.size();
       std::string type;
       type.reserve(type_bytes->size());
       for (const auto byte : *type_bytes) {
@@ -634,7 +1065,9 @@ handle_iokit_mach_request(AddressSpace &memory, Output &output,
     output.write("[iokit] notification pid=" + std::to_string(process.pid) +
                  " port=" + std::to_string(notification_port) +
                  " iterator-name=" + std::to_string(iterator_name) +
-                 " iterator-object=" + std::to_string(iterator_object) + "\n");
+                 " iterator-object=" + std::to_string(iterator_object) +
+                 " matches=" + std::to_string(matching_service_count) +
+                 " matching-hex=" + matching_hex(*matching_bytes) + "\n");
     return write_port_reply(memory, message_address, local_port, message_id,
                             iterator_name);
   }
@@ -656,29 +1089,327 @@ handle_iokit_mach_request(AddressSpace &memory, Output &output,
             copyout_send_locked(shared_state, process.pid, object_port);
       }
     }
+    output.write("[iokit] iterator-next pid=" +
+                 std::to_string(process.pid) + " iterator-object=" +
+                 std::to_string(remote_object) + " service-object=" +
+                 std::to_string(object_port) + "\n");
     return write_port_reply(memory, message_address, local_port, message_id,
                             object_name);
+  }
+
+  if (message_id ==
+          device_mig::id(device_mig::Routine::io_object_get_class) ||
+      message_id ==
+          device_mig::id(device_mig::Routine::io_registry_entry_get_name)) {
+    std::string name;
+    {
+      std::lock_guard mach_lock{shared_state.mach_mutex};
+      if (const auto service = shared_state.iokit_services.find(remote_object);
+          service != shared_state.iokit_services.end()) {
+        name = service->second.class_name;
+      }
+    }
+    if (name.empty())
+      return mach_rcv_invalid_data;
+    name.push_back('\0');
+    const auto &argument =
+        message_id == device_mig::id(device_mig::Routine::io_object_get_class)
+            ? object_class_name
+            : registry_entry_name;
+    const auto name_size = static_cast<std::uint32_t>(name.size());
+    const auto reply_size = static_cast<std::uint32_t>(
+        argument.reply_offset +
+        ((name_size + sizeof(std::uint32_t) - 1U) &
+         ~(sizeof(std::uint32_t) - 1U)));
+    if (receive_size < reply_size)
+      return mach_rcv_invalid_data;
+    const auto type_word =
+        8U | (8U << 8U) |
+        (static_cast<std::uint32_t>(argument.wire_size) << 16U) |
+        (1U << 28U);
+    const std::array<std::uint32_t, 11> reply{
+        mach_reply_bits,
+        reply_size,
+        local_port,
+        0,
+        0,
+        message_id + mig_reply_id_delta,
+        mach_ndr_native,
+        mach_ndr_little_endian,
+        iokit_abi::success,
+        type_word,
+        name_size,
+    };
+    if (write_reply(memory, message_address, reply) != 0 ||
+        !memory.copy_in(
+            message_address + argument.reply_offset,
+            std::span<const std::byte>{
+                reinterpret_cast<const std::byte *>(name.data()),
+                name.size()})) {
+      return mach_rcv_invalid_data;
+    }
+    return 0;
+  }
+
+  if (message_id ==
+      device_mig::id(device_mig::Routine::io_object_conforms_to)) {
+    constexpr const auto &class_argument =
+        device_mig::io_object_conforms_to_arguments[1];
+    constexpr std::uint32_t reply_size = 40U;
+    if (receive_size < reply_size)
+      return mach_rcv_invalid_data;
+    const auto class_count =
+        memory
+            .read32(message_address + class_argument.request_count_offset)
+            .value_or(0);
+    const auto class_bytes =
+        class_count != 0 && class_count <= class_argument.wire_size &&
+                class_argument.request_offset + class_count <= send_size
+            ? memory.read_bytes(
+                  message_address + class_argument.request_offset, class_count)
+            : std::nullopt;
+    if (!class_bytes)
+      return mach_rcv_invalid_data;
+    std::string class_name;
+    class_name.reserve(class_bytes->size());
+    for (const auto byte : *class_bytes)
+      class_name.push_back(
+          static_cast<char>(std::to_integer<unsigned char>(byte)));
+    if (!class_name.empty() && class_name.back() == '\0')
+      class_name.pop_back();
+
+    bool conforms = false;
+    {
+      std::lock_guard mach_lock{shared_state.mach_mutex};
+      if (const auto service = shared_state.iokit_services.find(remote_object);
+          service != shared_state.iokit_services.end()) {
+        conforms = service->second.class_name == class_name ||
+                   std::find(service->second.conforms_to.begin(),
+                             service->second.conforms_to.end(),
+                             class_name) != service->second.conforms_to.end();
+      }
+    }
+    const std::array<std::uint32_t, reply_size / sizeof(std::uint32_t)> reply{
+        mach_reply_bits,
+        reply_size,
+        local_port,
+        0,
+        0,
+        message_id + mig_reply_id_delta,
+        mach_ndr_native,
+        mach_ndr_little_endian,
+        iokit_abi::success,
+        conforms ? 1U : 0U,
+    };
+    output.write("[iokit] conforms pid=" + std::to_string(process.pid) +
+                 " service-object=" + std::to_string(remote_object) +
+                 " class=" + class_name +
+                 " result=" + std::to_string(conforms) + "\n");
+    return write_reply(memory, message_address, reply);
   }
 
   if (message_id ==
       static_cast<std::uint32_t>(iokit_abi::Message::RegistryEntryFromPath)) {
     if (receive_size < 40)
       return mach_rcv_invalid_data;
-    std::uint32_t options_object = 0;
-    std::uint32_t options_name = 0;
+    const auto path_count =
+        memory
+            .read32(message_address +
+                    registry_entry_from_path.request_count_offset)
+            .value_or(0);
+    const auto path_bytes =
+        path_count != 0 && path_count <= registry_entry_from_path.wire_size &&
+                registry_entry_from_path.request_offset + path_count <=
+                    send_size
+            ? memory.read_bytes(
+                  message_address + registry_entry_from_path.request_offset,
+                  path_count)
+            : std::nullopt;
+    if (!path_bytes)
+      return mach_rcv_invalid_data;
+    std::string path;
+    path.reserve(path_bytes->size());
+    for (const auto byte : *path_bytes)
+      path.push_back(static_cast<char>(std::to_integer<unsigned char>(byte)));
+    if (!path.empty() && path.back() == '\0')
+      path.pop_back();
+
+    std::uint32_t entry_object = 0;
+    std::uint32_t entry_name = 0;
     {
       std::lock_guard mach_lock{shared_state.mach_mutex};
-      options_object = resolve_task_name_locked(
-          shared_state, process.pid, process.io_registry_options_port);
-      options_name =
-          copyout_send_locked(shared_state, process.pid, options_object);
+      const auto service = std::find_if(
+          shared_state.iokit_services.begin(),
+          shared_state.iokit_services.end(), [&path](const auto &candidate) {
+            return candidate.second.registry_path == path;
+          });
+      entry_object =
+          service != shared_state.iokit_services.end()
+              ? service->first
+              : resolve_task_name_locked(shared_state, process.pid,
+                                         process.io_registry_options_port);
+      entry_name =
+          copyout_send_locked(shared_state, process.pid, entry_object);
     }
     return write_port_reply(memory, message_address, local_port, message_id,
-                            options_name);
+                            entry_name);
+  }
+
+  if (message_id ==
+      device_mig::id(device_mig::Routine::io_registry_entry_get_path)) {
+    std::string path;
+    {
+      std::lock_guard mach_lock{shared_state.mach_mutex};
+      if (const auto service = shared_state.iokit_services.find(remote_object);
+          service != shared_state.iokit_services.end()) {
+        path = service->second.registry_path;
+      }
+    }
+    if (path.empty())
+      return mach_rcv_invalid_data;
+    path.push_back('\0');
+    const auto path_size = static_cast<std::uint32_t>(path.size());
+    const auto reply_size = static_cast<std::uint32_t>(
+        registry_entry_path.reply_offset +
+        ((path_size + sizeof(std::uint32_t) - 1U) &
+         ~(sizeof(std::uint32_t) - 1U)));
+    if (receive_size < reply_size)
+      return mach_rcv_invalid_data;
+    const std::array<std::uint32_t, 11> reply{
+        mach_reply_bits,
+        reply_size,
+        local_port,
+        0,
+        0,
+        message_id + mig_reply_id_delta,
+        mach_ndr_native,
+        mach_ndr_little_endian,
+        iokit_abi::success,
+        8U | (8U << 8U) |
+            (static_cast<std::uint32_t>(registry_entry_path.wire_size)
+             << 16U) |
+            (1U << 28U),
+        path_size,
+    };
+    if (write_reply(memory, message_address, reply) != 0 ||
+        !memory.copy_in(
+            message_address + registry_entry_path.reply_offset,
+            std::span<const std::byte>{
+                reinterpret_cast<const std::byte *>(path.data()),
+                path.size()})) {
+      return mach_rcv_invalid_data;
+    }
+    output.write("[iokit] path pid=" + std::to_string(process.pid) +
+                 " service-object=" + std::to_string(remote_object) +
+                 " path=" + path.substr(0, path.size() - 1U) + "\n");
+    return 0;
+  }
+
+  if (message_id ==
+          device_mig::id(
+              device_mig::Routine::io_registry_entry_get_parent_iterator) ||
+      message_id ==
+          device_mig::id(
+              device_mig::Routine::io_registry_entry_get_child_iterator)) {
+    if (receive_size < 40U)
+      return mach_rcv_invalid_data;
+    std::uint32_t iterator_object = 0;
+    std::uint32_t iterator_name = 0;
+    {
+      std::lock_guard mach_lock{shared_state.mach_mutex};
+      iterator_object = shared_state.allocate_mach_object();
+      static_cast<void>(shared_state.mach_port_objects.create(iterator_object));
+      auto [iterator, inserted] =
+          shared_state.iokit_iterators.try_emplace(iterator_object);
+      static_cast<void>(inserted);
+      if (message_id ==
+          device_mig::id(
+              device_mig::Routine::io_registry_entry_get_parent_iterator)) {
+        if (const auto service =
+                shared_state.iokit_services.find(remote_object);
+            service != shared_state.iokit_services.end() &&
+            service->second.parent_object != 0) {
+          iterator->second.push_back(service->second.parent_object);
+        }
+      } else {
+        for (const auto &[object, service] : shared_state.iokit_services) {
+          if (service.parent_object == remote_object)
+            iterator->second.push_back(object);
+        }
+      }
+      iterator_name =
+          copyout_send_locked(shared_state, process.pid, iterator_object);
+    }
+    return write_port_reply(memory, message_address, local_port, message_id,
+                            iterator_name);
+  }
+
+  if (message_id == device_mig::id(
+                        device_mig::Routine::
+                            io_registry_entry_get_properties)) {
+    constexpr std::uint32_t property_reply_size = 52U;
+    if (receive_size < property_reply_size)
+      return mach_rcv_invalid_data;
+
+    std::optional<std::vector<std::byte>> serialized;
+    std::size_t property_count = 0;
+    {
+      std::lock_guard mach_lock{shared_state.mach_mutex};
+      if (const auto service = shared_state.iokit_services.find(remote_object);
+          service != shared_state.iokit_services.end()) {
+        serialized = serialize_properties(service->second.properties);
+        property_count = service->second.properties.size();
+      }
+    }
+    if (!serialized)
+      return mach_rcv_invalid_data;
+
+    const auto serialized_size =
+        static_cast<std::uint32_t>(serialized->size());
+    const auto mapped_size =
+        (serialized_size + AddressSpace::page_size - 1U) &
+        ~(AddressSpace::page_size - 1U);
+    const auto region = mach_support::find_free_guest_region(
+        memory, mach_support::ool_results_base, mapped_size);
+    if (!region ||
+        !memory.map(*region, mapped_size,
+                    MemoryPermission::Read | MemoryPermission::Write) ||
+        !memory.copy_in(*region, *serialized)) {
+      if (region)
+        static_cast<void>(memory.unmap(*region, mapped_size));
+      return mach_rcv_invalid_data;
+    }
+    const std::array<std::uint32_t,
+                     property_reply_size / sizeof(std::uint32_t)>
+        reply{darwin::mig_wire::message_bits(
+                  darwin::mig_wire::disposition_move_send_once, 0, true),
+              property_reply_size,
+              local_port,
+              0,
+              0,
+              message_id + mig_reply_id_delta,
+              1,
+              *region,
+              serialized_size,
+              darwin::mig_wire::ool_descriptor_metadata(
+                  false, darwin::mig_wire::ool_copy_physical),
+              mach_ndr_native,
+              mach_ndr_little_endian,
+              serialized_size};
+    const auto result = write_reply(memory, message_address, reply);
+    if (result != 0)
+      static_cast<void>(memory.unmap(*region, mapped_size));
+    output.write("[iokit] properties pid=" + std::to_string(process.pid) +
+                 " service-object=" + std::to_string(remote_object) +
+                 " count=" + std::to_string(property_count) + "\n");
+    return result;
   }
 
   if (message_id == static_cast<std::uint32_t>(
-                        iokit_abi::Message::RegistryEntryGetProperty)) {
+                        iokit_abi::Message::RegistryEntryGetProperty) ||
+      message_id == device_mig::id(
+                        device_mig::Routine::
+                            io_registry_entry_get_property_recursively)) {
     constexpr std::uint32_t simple_reply_size = 36U;
     constexpr std::uint32_t property_reply_size =
         registry_property_value.reply_count_offset +
@@ -686,18 +1417,51 @@ handle_iokit_mach_request(AddressSpace &memory, Output &output,
     if (receive_size < simple_reply_size)
       return mach_rcv_invalid_data;
 
-    const auto name_count =
-        memory
-            .read32(message_address +
-                    registry_property_name.request_count_offset)
-            .value_or(0);
-    const auto name_bytes =
-        name_count != 0 && name_count <= registry_property_name.wire_size &&
-                registry_property_name.request_offset + name_count <= send_size
-            ? memory.read_bytes(
-                  message_address + registry_property_name.request_offset,
-                  name_count)
-            : std::nullopt;
+    std::optional<std::vector<std::byte>> name_bytes;
+    if (message_id == static_cast<std::uint32_t>(
+                          iokit_abi::Message::RegistryEntryGetProperty)) {
+      const auto name_count =
+          memory
+              .read32(message_address +
+                      registry_property_name.request_count_offset)
+              .value_or(0);
+      if (name_count != 0 && name_count <= registry_property_name.wire_size &&
+          registry_property_name.request_offset + name_count <= send_size) {
+        name_bytes = memory.read_bytes(
+            message_address + registry_property_name.request_offset,
+            name_count);
+      }
+    } else {
+      std::array<std::uint32_t,
+                 recursive_registry_property.size()> element_counts{};
+      element_counts[1] =
+          memory
+              .read32(message_address +
+                      recursive_registry_property[1].request_count_offset)
+              .value_or(0);
+      const auto plane_layout = xnu792::mig::compute_wire_layout(
+          recursive_registry_property,
+          xnu792::mig::WireLayoutSide::Request, element_counts);
+      if (!plane_layout)
+        return mach_rcv_invalid_data;
+      element_counts[2] =
+          memory
+              .read32(message_address + (*plane_layout)[2].count_offset)
+              .value_or(0);
+      const auto layout = xnu792::mig::compute_wire_layout(
+          recursive_registry_property,
+          xnu792::mig::WireLayoutSide::Request, element_counts);
+      if (!layout || element_counts[1] == 0 ||
+          element_counts[1] > recursive_registry_property[1].wire_size ||
+          element_counts[2] == 0 ||
+          element_counts[2] > recursive_registry_property[2].wire_size ||
+          (*layout)[3].offset + recursive_registry_property[3].wire_size >
+              send_size) {
+        return mach_rcv_invalid_data;
+      }
+      name_bytes = memory.read_bytes(
+          message_address + (*layout)[2].offset, element_counts[2]);
+    }
     if (!name_bytes)
       return mach_rcv_invalid_data;
 
@@ -786,7 +1550,9 @@ handle_iokit_mach_request(AddressSpace &memory, Output &output,
   }
 
   if (message_id == static_cast<std::uint32_t>(
-                        iokit_abi::Message::RegistryEntrySetProperties)) {
+                        iokit_abi::Message::RegistryEntrySetProperties) ||
+      message_id ==
+          device_mig::id(device_mig::Routine::io_connect_set_properties)) {
     if (receive_size < 40U)
       return mach_rcv_invalid_data;
     const auto descriptor_count =
@@ -805,8 +1571,31 @@ handle_iokit_mach_request(AddressSpace &memory, Output &output,
     const auto data = descriptor_count == 1 && data_size <= 64U * 1024U
                           ? memory.read_bytes(data_address, data_size)
                           : std::nullopt;
-    const auto result = data ? iokit_abi::success : iokit_abi::bad_argument;
-    if (data)
+    bool network_stack_connection = false;
+    if (message_id ==
+        device_mig::id(device_mig::Routine::io_connect_set_properties)) {
+      std::lock_guard mach_lock{shared_state.mach_mutex};
+      const auto connection =
+          shared_state.iokit_connections.find(remote_object);
+      if (connection != shared_state.iokit_connections.end()) {
+        const auto service =
+            shared_state.iokit_services.find(
+                connection->second.service_port);
+        network_stack_connection =
+            service != shared_state.iokit_services.end() &&
+            service->second.class_name == io_network_stack_class;
+      }
+    }
+    const auto accepted =
+        data && (message_id !=
+                     device_mig::id(
+                         device_mig::Routine::io_connect_set_properties) ||
+                 network_stack_connection);
+    const auto result =
+        accepted ? iokit_abi::success : iokit_abi::bad_argument;
+    if (data && message_id == static_cast<std::uint32_t>(
+                                  iokit_abi::Message::
+                                      RegistryEntrySetProperties))
       shared_state.nvram_serialized = *data;
     const std::array<std::uint32_t, 10> reply{
         18,          40,          local_port, 0,      0, message_id + 100,
@@ -913,13 +1702,19 @@ handle_iokit_mach_request(AddressSpace &memory, Output &output,
     }
     std::uint32_t connection_object = 0;
     std::uint32_t connection_name = 0;
+    bool supported_service = false;
     bool display_service = false;
     {
       std::lock_guard mach_lock{shared_state.mach_mutex};
       display_service =
           remote_object == shared_state.mobile_framebuffer_service &&
           shared_state.iokit_services.contains(remote_object);
-      if (display_service) {
+      const auto service = shared_state.iokit_services.find(remote_object);
+      const auto network_stack_service =
+          service != shared_state.iokit_services.end() &&
+          service->second.class_name == io_network_stack_class;
+      supported_service = display_service || network_stack_service;
+      if (supported_service) {
         connection_object = shared_state.allocate_mach_object();
         static_cast<void>(
             shared_state.mach_port_objects.create(connection_object));
@@ -933,7 +1728,7 @@ handle_iokit_mach_request(AddressSpace &memory, Output &output,
       }
     }
     const auto result =
-        display_service ? iokit_abi::success : iokit_abi::unsupported;
+        supported_service ? iokit_abi::success : iokit_abi::unsupported;
     const std::array<std::uint32_t, reply_word_count> reply{
         0x80000012U,      reply_size,  local_port,      0, 0,
         message_id + 100, 1,           connection_name, 0, 0x00110000U,
@@ -943,7 +1738,8 @@ handle_iokit_mach_request(AddressSpace &memory, Output &output,
                  " service-object=" + std::to_string(remote_object) +
                  " connection-name=" + std::to_string(connection_name) +
                  " connection-object=" + std::to_string(connection_object) +
-                 " result=" + (display_service ? "success" : "unsupported") +
+                 " result=" +
+                 (supported_service ? "success" : "unsupported") +
                  "\n");
     return write_reply(memory, message_address, reply);
   }
@@ -1029,6 +1825,9 @@ handle_iokit_mach_request(AddressSpace &memory, Output &output,
     return write_reply(memory, message_address, reply);
   }
 
+  output.write("[iokit] unhandled pid=" + std::to_string(process.pid) +
+               " id=" + std::to_string(message_id) + " remote-object=" +
+               std::to_string(remote_object) + "\n");
   return std::nullopt;
 }
 

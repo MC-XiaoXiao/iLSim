@@ -9,9 +9,11 @@ add_subdirectory(vm)
 
 target_sources(ilegacysim_kernel PRIVATE
     dispatch.cpp
+    aio.cpp
     process.cpp
     filesystem.cpp
     descriptor_memory.cpp
+    bpf.cpp
     socket.cpp
     events.cpp
     support.cpp)

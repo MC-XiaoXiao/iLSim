@@ -24,6 +24,7 @@
 #include "ilegacysim/apple80211_hle.hpp"
 #include "ilegacysim/core_surface_hle.hpp"
 #include "ilegacysim/cpu.hpp"
+#include "ilegacysim/darwin_bpf_abi.hpp"
 #include "ilegacysim/darwin_notify_state_hle.hpp"
 #include "ilegacysim/display.hpp"
 #include "ilegacysim/device_profile.hpp"
@@ -92,6 +93,7 @@ public:
 
   [[nodiscard]] ProcessContext &process() { return process_; }
   [[nodiscard]] const ProcessContext &process() const { return process_; }
+  void exit_process(std::uint32_t status, std::uint32_t signal = 0);
   void set_halt_on_unknown(bool value) { halt_on_unknown_ = value; }
   void set_thread_create_handler(ThreadCreateHandler handler) {
     thread_create_handler_ = std::move(handler);
@@ -170,6 +172,9 @@ public:
   // display. Most processes have no scanout surface and return immediately.
   bool refresh_display_scanout();
   bool set_virtual_processor_count(std::size_t processor_count);
+  void set_preferred_wifi_networks(std::vector<std::string> ssids) {
+    wifi_state_->set_preferred_networks(std::move(ssids));
+  }
   void set_host_network_policy(HostNetworkPolicy policy);
   [[nodiscard]] WifiSnapshot wifi_snapshot() const {
     return wifi_state_->snapshot();
@@ -187,7 +192,8 @@ public:
   void inherit_process_state(const CompatibilityKernel &parent,
                              std::uint32_t child_pid);
   void prepare_exec(std::size_t processor_id);
-  void install_main_image_hle(Cpu &cpu);
+  void install_main_image_hle(Cpu &cpu,
+                              std::string_view mapped_guest_path = {});
   void set_process_image(std::string_view guest_path);
   void set_process_arguments(const std::vector<std::string> &arguments,
                              const std::vector<std::string> &environment);
@@ -218,8 +224,15 @@ private:
     std::uint32_t identifier{};
   };
 
+  struct AioCompletion {
+    std::uint32_t descriptor{};
+    std::int32_t result{};
+    std::uint32_t error{};
+  };
+
   void dispatch_arm_fast_trap(Cpu &cpu);
   void dispatch_bsd(Cpu &cpu, std::uint32_t number);
+  void dispatch_bsd_aio(Cpu &cpu, std::uint32_t number);
   void dispatch_bsd_process(Cpu &cpu, std::uint32_t number);
   void release_process_mach_rights();
   [[nodiscard]] bool dispatch_bsd_process_credentials(Cpu &cpu,
@@ -242,6 +255,7 @@ private:
   [[nodiscard]] bool dispatch_bsd_debug(Cpu &cpu, std::uint32_t number);
   void dispatch_bsd_socket(Cpu &cpu, std::uint32_t number);
   void dispatch_bsd_events(Cpu &cpu, std::uint32_t number);
+  [[nodiscard]] bool ioctl_bpf_device(Cpu &cpu, std::uint32_t fd);
   [[nodiscard]] bool create_kernel_control_socket(Cpu &cpu);
   [[nodiscard]] bool connect_kernel_control_socket(Cpu &cpu);
   [[nodiscard]] bool ioctl_kernel_control_socket(Cpu &cpu);
@@ -331,6 +345,11 @@ private:
                               std::uint32_t message_address);
   bool send_socket_message(Cpu &cpu, std::uint32_t fd,
                            std::uint32_t message_address);
+  bool receive_bpf_bytes(Cpu &cpu, std::uint32_t fd, std::uint32_t address,
+                         std::uint32_t size);
+  bool write_bpf_bytes(Cpu &cpu, std::uint32_t fd, std::uint32_t address,
+                       std::uint32_t size);
+  [[nodiscard]] bool bpf_descriptor_readable(std::uint32_t fd) const;
   bool receive_socket_bytes(Cpu &cpu, std::uint32_t fd, std::uint32_t address,
                             std::uint32_t size,
                             std::uint32_t source_address = 0,
@@ -348,7 +367,9 @@ private:
                              const WifiSnapshot &after);
   void post_network_event(std::string_view interface_name,
                           std::uint32_t event_subclass,
-                          std::uint32_t event_code);
+                          std::uint32_t event_code,
+                          std::optional<darwin::network::InterfaceSnapshot>
+                              address_snapshot = std::nullopt);
   void post_data_link_event(std::string_view interface_name,
                             std::uint32_t event_code);
   [[nodiscard]] bool
@@ -388,6 +409,8 @@ private:
                          std::optional<std::uint64_t> timeout_interval,
                          bool bsd_result);
   void schedule_due_audio_io(std::uint64_t deadline);
+  void inject_wifi_driver_event(std::uint32_t descriptor,
+                                std::uint32_t event);
   void reap_stopped_audio_threads();
 
   AddressSpace &memory_;
@@ -426,8 +449,12 @@ private:
   std::map<std::uint32_t, std::uint64_t> file_offsets_;
   std::map<std::uint32_t, std::uint32_t> file_status_flags_;
   std::map<std::uint32_t, std::uint32_t> descriptor_flags_;
+  std::map<std::uint32_t, AioCompletion> aio_completions_;
   std::map<std::uint32_t, std::string> virtual_descriptors_;
+  std::map<std::uint32_t, std::shared_ptr<darwin::bpf::DescriptorState>>
+      bpf_descriptors_;
   std::map<std::uint32_t, std::shared_ptr<HostSocket>> host_sockets_;
+  std::map<std::uint32_t, std::uint16_t> pending_wifi_driver_events_;
   std::map<std::uint32_t, std::shared_ptr<bsd::VirtualUdpSocket>>
       virtual_udp_sockets_;
   std::map<std::uint32_t, std::shared_ptr<bsd::kernel_control::Endpoint>>
@@ -441,6 +468,7 @@ private:
       socket_options_;
   std::map<std::uint32_t, std::uint32_t> duplicated_descriptors_;
   std::map<std::uint32_t, std::array<std::uint32_t, 3>> system_event_filters_;
+  std::set<std::uint32_t> apple80211_scan_delivered_;
   std::map<std::uint32_t, std::uint32_t> system_event_next_identifiers_;
   std::map<std::uint32_t, std::shared_ptr<KernelSharedState::RouteSocketState>>
       route_socket_states_;

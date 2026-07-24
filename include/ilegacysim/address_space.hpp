@@ -46,6 +46,8 @@ public:
   bool protect(std::uint32_t address, std::uint32_t size,
                MemoryPermission permissions);
   bool copy_in(std::uint32_t address, std::span<const std::byte> data);
+  [[nodiscard]] bool copy_out(std::uint32_t address,
+                              std::span<std::byte> data) const;
   // Installs page-aligned immutable file backing. A guest write automatically
   // detaches that page, providing MAP_PRIVATE/shared-region COW semantics.
   bool map_file(std::uint32_t address, std::uint32_t size,

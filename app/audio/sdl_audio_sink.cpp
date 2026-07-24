@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <list>
 #include <limits>
 #include <mutex>
 #include <utility>
@@ -17,70 +18,142 @@
 namespace ilegacysim {
 
 struct SdlAudioSink::Impl {
-  mutable std::mutex mutex;
+  mutable std::mutex control_mutex;
+  mutable std::mutex queue_mutex;
   std::string error;
 #if defined(ILEGACYSIM_HAS_SDL2)
+  struct QueuedChunk {
+    std::vector<std::int16_t> samples;
+    std::size_t next_sample{};
+  };
+
   SDL_AudioDeviceID device{};
   SDL_AudioSpec format{};
   SDL_AudioStream *streaming_converter{};
   std::uint32_t streaming_sample_rate{};
   std::uint16_t streaming_channel_count{};
   bool owns_audio_subsystem{};
-  std::vector<std::int16_t> queued_samples;
-  std::size_t next_sample{};
+  bool device_started{};
+  std::list<QueuedChunk> queued_chunks;
+  // The callback only splices completed nodes here. Their storage is released
+  // later by a producer/control call, outside the real-time callback.
+  std::list<QueuedChunk> retired_chunks;
+  std::size_t queued_sample_count{};
+  std::size_t output_channel_count{1U};
+  // CoreAudio produces one hardware period at a time. Keep one period of
+  // device lead at the start of a streaming run so the independently timed
+  // host callback does not race the producer's first adjacent buffers.
+  std::size_t lead_silence_sample_count{};
+  bool streaming_needs_lead{true};
   std::size_t fade_frames_remaining{};
   std::size_t fade_frames_total{};
   float gain{1.0F};
+
+  void retire_all_locked() {
+    retired_chunks.splice(retired_chunks.end(), queued_chunks);
+    queued_sample_count = 0;
+    lead_silence_sample_count = 0;
+    fade_frames_remaining = 0;
+    fade_frames_total = 0;
+  }
+
+  void trim_pending_samples_locked(std::size_t sample_count) {
+    sample_count = std::min(sample_count, queued_sample_count);
+    auto keep = sample_count;
+    for (auto chunk = queued_chunks.begin(); chunk != queued_chunks.end();) {
+      const auto available = chunk->samples.size() - chunk->next_sample;
+      if (keep >= available) {
+        keep -= available;
+        ++chunk;
+        continue;
+      }
+      if (keep != 0) {
+        chunk->samples.resize(chunk->next_sample + keep);
+        ++chunk;
+      }
+      retired_chunks.splice(
+          retired_chunks.end(), queued_chunks, chunk, queued_chunks.end());
+      break;
+    }
+    queued_sample_count = sample_count;
+  }
 
   static void consume(void *userdata, Uint8 *output, int byte_count) {
     if (userdata == nullptr || output == nullptr || byte_count <= 0)
       return;
     std::memset(output, 0, static_cast<std::size_t>(byte_count));
     auto &state = *static_cast<Impl *>(userdata);
-    std::lock_guard lock{state.mutex};
+    std::lock_guard lock{state.queue_mutex};
     const auto output_samples =
         static_cast<std::size_t>(byte_count) / sizeof(std::int16_t);
-    const auto available = state.queued_samples.size() - state.next_sample;
-    const auto count = std::min(output_samples, available);
     auto *samples = reinterpret_cast<std::int16_t *>(output);
-    const auto channels =
-        std::max<std::size_t>(1U, state.format.channels);
-    const auto fade_frames =
-        std::min(state.fade_frames_remaining, count / channels);
-    const auto fade_samples = fade_frames * channels;
-    for (std::size_t frame = 0; frame < fade_frames; ++frame) {
-      const auto remaining = state.fade_frames_remaining - frame;
-      const auto envelope =
-          state.fade_frames_total > 1U
-              ? static_cast<float>(remaining - 1U) /
-                    static_cast<float>(state.fade_frames_total - 1U)
-              : 0.0F;
-      for (std::size_t channel = 0; channel < channels; ++channel) {
-        const auto index = frame * channels + channel;
-        const auto scaled = std::lround(
-            static_cast<float>(
-                state.queued_samples[state.next_sample + index]) *
-            state.gain * envelope);
-        samples[index] = static_cast<std::int16_t>(std::clamp<long>(
-            scaled, std::numeric_limits<std::int16_t>::min(),
-            std::numeric_limits<std::int16_t>::max()));
+    const auto channels = state.output_channel_count;
+    auto output_offset = std::size_t{};
+    const auto lead_samples =
+        std::min(output_samples, state.lead_silence_sample_count);
+    state.lead_silence_sample_count -= lead_samples;
+    output_offset += lead_samples;
+    while (output_offset < output_samples && !state.queued_chunks.empty()) {
+      auto &chunk = state.queued_chunks.front();
+      const auto available = chunk.samples.size() - chunk.next_sample;
+      const auto count = std::min(output_samples - output_offset, available);
+      auto copied = std::size_t{};
+
+      const auto fade_frames =
+          std::min(state.fade_frames_remaining, count / channels);
+      const auto fade_samples = fade_frames * channels;
+      for (std::size_t frame = 0; frame < fade_frames; ++frame) {
+        const auto remaining = state.fade_frames_remaining - frame;
+        const auto envelope =
+            state.fade_frames_total > 1U
+                ? static_cast<float>(remaining - 1U) /
+                      static_cast<float>(state.fade_frames_total - 1U)
+                : 0.0F;
+        for (std::size_t channel = 0; channel < channels; ++channel) {
+          const auto index = frame * channels + channel;
+          const auto scaled = std::lround(
+              static_cast<float>(
+                  chunk.samples[chunk.next_sample + index]) *
+              state.gain * envelope);
+          samples[output_offset + index] =
+              static_cast<std::int16_t>(std::clamp<long>(
+                  scaled, std::numeric_limits<std::int16_t>::min(),
+                  std::numeric_limits<std::int16_t>::max()));
+        }
+      }
+      copied += fade_samples;
+      state.fade_frames_remaining -= fade_frames;
+      if (state.fade_frames_remaining == 0)
+        state.fade_frames_total = 0;
+
+      if (state.gain == 1.0F) {
+        std::memcpy(
+            samples + output_offset + copied,
+            chunk.samples.data() + chunk.next_sample + copied,
+            (count - copied) * sizeof(std::int16_t));
+      } else {
+        for (; copied < count; ++copied) {
+          const auto scaled = std::lround(
+              static_cast<float>(
+                  chunk.samples[chunk.next_sample + copied]) *
+              state.gain);
+          samples[output_offset + copied] =
+              static_cast<std::int16_t>(std::clamp<long>(
+                  scaled, std::numeric_limits<std::int16_t>::min(),
+                  std::numeric_limits<std::int16_t>::max()));
+        }
+      }
+
+      chunk.next_sample += count;
+      state.queued_sample_count -= count;
+      output_offset += count;
+      if (chunk.next_sample == chunk.samples.size()) {
+        state.retired_chunks.splice(
+            state.retired_chunks.end(), state.queued_chunks,
+            state.queued_chunks.begin());
       }
     }
-    state.fade_frames_remaining -= fade_frames;
-    if (state.fade_frames_remaining == 0)
-      state.fade_frames_total = 0;
-    for (std::size_t index = fade_samples; index < count; ++index) {
-      const auto scaled = std::lround(
-          static_cast<float>(state.queued_samples[state.next_sample + index]) *
-          state.gain);
-      samples[index] = static_cast<std::int16_t>(std::clamp<long>(
-          scaled, std::numeric_limits<std::int16_t>::min(),
-          std::numeric_limits<std::int16_t>::max()));
-    }
-    state.next_sample += count;
-    if (state.next_sample == state.queued_samples.size()) {
-      state.queued_samples.clear();
-      state.next_sample = 0;
+    if (state.queued_chunks.empty()) {
       state.fade_frames_remaining = 0;
       state.fade_frames_total = 0;
     }
@@ -96,7 +169,7 @@ SdlAudioSink::~SdlAudioSink() {
   SDL_AudioStream *streaming_converter = nullptr;
   bool owns_audio_subsystem = false;
   {
-    std::lock_guard lock{impl_->mutex};
+    std::lock_guard lock{impl_->control_mutex};
     device = std::exchange(impl_->device, 0);
     streaming_converter =
         std::exchange(impl_->streaming_converter, nullptr);
@@ -121,13 +194,12 @@ bool SdlAudioSink::available() {
 
 bool SdlAudioSink::play(const AudioBuffer &buffer) {
 #if defined(ILEGACYSIM_HAS_SDL2)
-  std::unique_lock lock{impl_->mutex};
+  std::unique_lock control_lock{impl_->control_mutex};
   if (buffer.sample_rate == 0 || buffer.channel_count == 0 ||
       buffer.samples.empty()) {
     impl_->error = "invalid empty audio buffer";
     return false;
   }
-  bool resume = false;
   if (impl_->device == 0) {
     if ((SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO) == 0U) {
       if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
@@ -137,7 +209,7 @@ bool SdlAudioSink::play(const AudioBuffer &buffer) {
       impl_->owns_audio_subsystem = true;
     }
     SDL_AudioSpec requested{};
-    requested.freq = 48000;
+    requested.freq = 44100;
     requested.format = AUDIO_S16SYS;
     requested.channels = 2;
     requested.samples = 1024;
@@ -149,7 +221,11 @@ bool SdlAudioSink::play(const AudioBuffer &buffer) {
       impl_->error = SDL_GetError();
       return false;
     }
-    resume = true;
+    {
+      std::lock_guard queue_lock{impl_->queue_mutex};
+      impl_->output_channel_count =
+          std::max<std::size_t>(1U, impl_->format.channels);
+    }
   }
 
   SDL_AudioStream *owned_stream = nullptr;
@@ -204,8 +280,11 @@ bool SdlAudioSink::play(const AudioBuffer &buffer) {
     impl_->error.clear();
     return true;
   }
-  if (converted_size % static_cast<int>(sizeof(std::int16_t)) != 0) {
-    impl_->error = "audio conversion is not 16-bit aligned";
+  const auto output_frame_bytes =
+      sizeof(std::int16_t) *
+      std::max<std::size_t>(1U, impl_->format.channels);
+  if (converted_size % static_cast<int>(output_frame_bytes) != 0) {
+    impl_->error = "audio conversion is not frame-aligned";
     if (owned_stream != nullptr)
       SDL_FreeAudioStream(owned_stream);
     return false;
@@ -220,23 +299,40 @@ bool SdlAudioSink::play(const AudioBuffer &buffer) {
     impl_->error = SDL_GetError();
     return false;
   }
-  if (impl_->next_sample != 0) {
-    impl_->queued_samples.erase(
-        impl_->queued_samples.begin(),
-        impl_->queued_samples.begin() +
-            static_cast<std::ptrdiff_t>(impl_->next_sample));
-    impl_->next_sample = 0;
+
+  std::list<Impl::QueuedChunk> incoming;
+  incoming.push_back({std::move(converted), 0});
+  std::list<Impl::QueuedChunk> retired;
+  bool start_device = false;
+  {
+    std::lock_guard queue_lock{impl_->queue_mutex};
+    retired.splice(retired.end(), impl_->retired_chunks);
+    if (buffer.streaming && impl_->streaming_needs_lead) {
+      // A queued fade or other predecessor already provides device lead.
+      // Prepending global silence in that case would put the delay before the
+      // older samples and reverse the intended stop/replacement ordering.
+      if (impl_->queued_sample_count == 0 &&
+          impl_->lead_silence_sample_count == 0) {
+        impl_->lead_silence_sample_count =
+            static_cast<std::size_t>(impl_->format.samples) *
+            impl_->output_channel_count;
+      }
+      impl_->streaming_needs_lead = false;
+    }
+    impl_->queued_sample_count += incoming.front().samples.size();
+    impl_->queued_chunks.splice(
+        impl_->queued_chunks.end(), incoming, incoming.begin());
+    if (!impl_->device_started) {
+      impl_->device_started = true;
+      start_device = true;
+    }
   }
-  impl_->queued_samples.insert(impl_->queued_samples.end(), converted.begin(),
-                               converted.end());
-  const auto device = impl_->device;
   impl_->error.clear();
-  lock.unlock();
-  if (resume)
-    SDL_PauseAudioDevice(device, 0);
+  if (start_device)
+    SDL_PauseAudioDevice(impl_->device, 0);
   return true;
 #else
-  std::lock_guard lock{impl_->mutex};
+  std::lock_guard lock{impl_->control_mutex};
   static_cast<void>(buffer);
   impl_->error = "SDL2 audio support was not built";
   return false;
@@ -244,17 +340,17 @@ bool SdlAudioSink::play(const AudioBuffer &buffer) {
 }
 
 bool SdlAudioSink::has_pending_audio() const {
-  std::lock_guard lock{impl_->mutex};
 #if defined(ILEGACYSIM_HAS_SDL2)
-  return impl_->next_sample < impl_->queued_samples.size();
+  std::lock_guard lock{impl_->queue_mutex};
+  return impl_->queued_sample_count != 0;
 #else
   return false;
 #endif
 }
 
 void SdlAudioSink::set_gain(float gain) {
-  std::lock_guard lock{impl_->mutex};
 #if defined(ILEGACYSIM_HAS_SDL2)
+  std::lock_guard lock{impl_->queue_mutex};
   impl_->gain = std::clamp(gain, 0.0F, 1.0F);
 #else
   static_cast<void>(gain);
@@ -262,45 +358,50 @@ void SdlAudioSink::set_gain(float gain) {
 }
 
 void SdlAudioSink::stop(AudioStopMode mode) {
-  std::lock_guard lock{impl_->mutex};
 #if defined(ILEGACYSIM_HAS_SDL2)
+  std::unique_lock control_lock{impl_->control_mutex};
   if (impl_->streaming_converter != nullptr)
     SDL_AudioStreamClear(impl_->streaming_converter);
-  if (mode == AudioStopMode::FadeOut && impl_->device != 0 &&
-      impl_->next_sample < impl_->queued_samples.size()) {
-    const auto channels =
-        std::max<std::size_t>(1U, impl_->format.channels);
-    if (impl_->fade_frames_remaining != 0) {
-      impl_->queued_samples.resize(
-          impl_->next_sample + impl_->fade_frames_remaining * channels);
-      return;
+  std::list<Impl::QueuedChunk> retired;
+  {
+    std::lock_guard queue_lock{impl_->queue_mutex};
+    retired.splice(retired.end(), impl_->retired_chunks);
+    impl_->lead_silence_sample_count = 0;
+    impl_->streaming_needs_lead = true;
+    if (mode == AudioStopMode::FadeOut && impl_->device != 0 &&
+        impl_->queued_sample_count != 0) {
+      const auto channels = impl_->output_channel_count;
+      if (impl_->fade_frames_remaining != 0) {
+        impl_->trim_pending_samples_locked(
+            impl_->fade_frames_remaining * channels);
+        retired.splice(retired.end(), impl_->retired_chunks);
+        return;
+      }
+      constexpr std::size_t fade_duration_milliseconds = 40;
+      const auto available_frames =
+          impl_->queued_sample_count / channels;
+      const auto requested_frames =
+          static_cast<std::size_t>(impl_->format.freq) *
+          fade_duration_milliseconds / 1000U;
+      const auto fade_frames = std::min(available_frames, requested_frames);
+      if (fade_frames != 0) {
+        impl_->trim_pending_samples_locked(fade_frames * channels);
+        impl_->fade_frames_remaining = fade_frames;
+        impl_->fade_frames_total = fade_frames;
+        retired.splice(retired.end(), impl_->retired_chunks);
+        return;
+      }
     }
-    constexpr std::size_t fade_duration_milliseconds = 40;
-    const auto available_frames =
-        (impl_->queued_samples.size() - impl_->next_sample) / channels;
-    const auto requested_frames =
-        static_cast<std::size_t>(impl_->format.freq) *
-        fade_duration_milliseconds / 1000U;
-    const auto fade_frames = std::min(available_frames, requested_frames);
-    if (fade_frames != 0) {
-      impl_->queued_samples.resize(impl_->next_sample +
-                                   fade_frames * channels);
-      impl_->fade_frames_remaining = fade_frames;
-      impl_->fade_frames_total = fade_frames;
-      return;
-    }
+    impl_->retire_all_locked();
+    retired.splice(retired.end(), impl_->retired_chunks);
   }
-  impl_->queued_samples.clear();
-  impl_->next_sample = 0;
-  impl_->fade_frames_remaining = 0;
-  impl_->fade_frames_total = 0;
 #else
   static_cast<void>(mode);
 #endif
 }
 
 std::string SdlAudioSink::last_error() const {
-  std::lock_guard lock{impl_->mutex};
+  std::lock_guard lock{impl_->control_mutex};
   return impl_->error;
 }
 

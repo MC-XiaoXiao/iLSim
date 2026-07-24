@@ -10,11 +10,12 @@ namespace {
 
 std::vector<VirtualAccessPoint> default_access_points() {
     return {{
-        "iLegacySim",
+        std::string{virtual_network::access_point_ssid},
         {std::byte{0x02}, std::byte{0x1a}, std::byte{0x54},
          std::byte{0x3a}, std::byte{0x00}, std::byte{0x01}},
-        6,
-        -42,
+        virtual_network::access_point_channel,
+        -32,
+        54,
         WifiSecurity::Open,
     }};
 }
@@ -31,6 +32,7 @@ WifiSnapshot WifiState::snapshot() const {
     WifiSnapshot result;
     result.link_state = link_state_;
     result.powered = link_state_ != WifiLinkState::PoweredOff;
+    result.airplane_mode = airplane_mode_;
     if (associated_index_ && *associated_index_ < access_points_.size()) {
         result.associated_access_point = access_points_[*associated_index_];
     }
@@ -50,6 +52,20 @@ std::vector<VirtualAccessPoint> WifiState::scan() {
     return result;
 }
 
+void WifiState::set_preferred_networks(std::vector<std::string> ssids) {
+    std::lock_guard lock{mutex_};
+    preferred_networks_.clear();
+    preferred_networks_.reserve(ssids.size());
+    for (auto& ssid : ssids) {
+        if (ssid.empty() ||
+            std::find(preferred_networks_.begin(), preferred_networks_.end(),
+                      ssid) != preferred_networks_.end()) {
+            continue;
+        }
+        preferred_networks_.push_back(std::move(ssid));
+    }
+}
+
 bool WifiState::set_power(bool powered) {
     std::lock_guard lock{mutex_};
     if (!powered) {
@@ -59,13 +75,39 @@ bool WifiState::set_power(bool powered) {
         ipv4_.reset();
         return changed;
     }
+    if (airplane_mode_) return false;
     if (link_state_ != WifiLinkState::PoweredOff) return false;
     link_state_ = WifiLinkState::Idle;
+    static_cast<void>(auto_join_locked());
     return true;
+}
+
+bool WifiState::set_airplane_mode(bool enabled) {
+    std::lock_guard lock{mutex_};
+    const auto changed = airplane_mode_ != enabled;
+    if (!changed) return false;
+    if (enabled) {
+        powered_before_airplane_mode_ =
+            link_state_ != WifiLinkState::PoweredOff;
+    }
+    airplane_mode_ = enabled;
+    if (enabled) {
+        link_state_ = WifiLinkState::PoweredOff;
+        associated_index_.reset();
+        ipv4_.reset();
+    } else if (powered_before_airplane_mode_) {
+        link_state_ = WifiLinkState::Idle;
+        static_cast<void>(auto_join_locked());
+    }
+    return changed;
 }
 
 bool WifiState::associate(std::string_view ssid) {
     std::lock_guard lock{mutex_};
+    return associate_locked(ssid, true);
+}
+
+bool WifiState::associate_locked(std::string_view ssid, bool remember) {
     if (link_state_ == WifiLinkState::PoweredOff) return false;
     const auto found = std::find_if(
         access_points_.begin(), access_points_.end(),
@@ -73,6 +115,11 @@ bool WifiState::associate(std::string_view ssid) {
             return ssid.empty() || access_point.ssid == ssid;
         });
     if (found == access_points_.end()) return false;
+    if (remember &&
+        std::find(preferred_networks_.begin(), preferred_networks_.end(),
+                  found->ssid) == preferred_networks_.end()) {
+        preferred_networks_.push_back(found->ssid);
+    }
     associated_index_ = static_cast<std::size_t>(
         std::distance(access_points_.begin(), found));
     link_state_ = WifiLinkState::Associated;
@@ -82,6 +129,13 @@ bool WifiState::associate(std::string_view ssid) {
     ipv4_ = default_ipv4_configuration();
     link_state_ = WifiLinkState::Configured;
     return true;
+}
+
+bool WifiState::auto_join_locked() {
+    for (const auto& ssid : preferred_networks_) {
+        if (associate_locked(ssid, false)) return true;
+    }
+    return false;
 }
 
 bool WifiState::disassociate() {

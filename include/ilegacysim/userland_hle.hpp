@@ -138,6 +138,9 @@ public:
   // guest code; only its thread's final return is handled here.
   [[nodiscard]] std::optional<std::uint32_t>
   prepare_thread_callback_return(Cpu &cpu);
+  [[nodiscard]] std::optional<std::uint32_t>
+  prepare_one_shot_return(Cpu &cpu, std::uint32_t return_address,
+                          Handler completion);
   [[nodiscard]] bool bind_thread_callback(std::size_t processor,
                                           Handler completion);
   void unbind_thread_callback(std::size_t processor);
